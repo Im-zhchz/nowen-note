@@ -838,22 +838,43 @@ export class BackupManager {
       type = "db-only";
       formatVersion = 1;
 
-      // 只读打开临时文件，数一下行数，让列表 UI 正常展示
-      const tmp = path.join(os.tmpdir(), `nowen-ingest-probe-${Date.now()}-${crypto.randomBytes(4).toString("hex")}.db`);
+      // 只读打开临时文件，数一下行数，让列表 UI 正常展示。
+      // 临时文件放 backupDir 而非 os.tmpdir()：Windows 下后者含中文用户名 /
+      // 被 AV 实时扫描时 better-sqlite3 readonly 打开会偶发 SQLITE_CANTOPEN，
+      // 而 backupDir 是管理员已确认可写、路径稳定的目录。
+      this.ensureDir();
+      const tmp = path.join(
+        this.backupDir,
+        `.nowen-ingest-probe-${Date.now()}-${crypto.randomBytes(4).toString("hex")}.db`,
+      );
       fs.writeFileSync(tmp, bytes);
       try {
         const Database = (await import("better-sqlite3")).default;
-        const probe = new Database(tmp, { readonly: true });
+        let probe: InstanceType<typeof Database> | null = null;
         try {
-          // 有些 .bak 可能不是本项目 schema，表不存在时静默为 0，不阻塞导入
+          probe = new Database(tmp, { readonly: true });
+        } catch (e) {
+          // 打不开也不要硬失败——导入阶段不需要行数统计。透传警告、静默用 0。
+          // 主路径（落盘 + 生成 meta）仍会继续，避免"导入一份合法 .bak 却因
+          // 探测失败而报错"这种反直觉行为。
+          console.warn(
+            `[Backup] ingest probe open failed (tmp=${tmp}): ${
+              e instanceof Error ? e.message : String(e)
+            }`,
+          );
+        }
+        if (probe) {
           try {
-            noteCount = (probe.prepare("SELECT COUNT(*) as c FROM notes").get() as { c: number }).c;
-          } catch { noteCount = 0; }
-          try {
-            notebookCount = (probe.prepare("SELECT COUNT(*) as c FROM notebooks").get() as { c: number }).c;
-          } catch { notebookCount = 0; }
-        } finally {
-          probe.close();
+            // 有些 .bak 可能不是本项目 schema，表不存在时静默为 0，不阻塞导入
+            try {
+              noteCount = (probe.prepare("SELECT COUNT(*) as c FROM notes").get() as { c: number }).c;
+            } catch { noteCount = 0; }
+            try {
+              notebookCount = (probe.prepare("SELECT COUNT(*) as c FROM notebooks").get() as { c: number }).c;
+            } catch { notebookCount = 0; }
+          } finally {
+            probe.close();
+          }
         }
       } finally {
         try { fs.unlinkSync(tmp); } catch { /* ignore */ }
@@ -992,12 +1013,35 @@ export class BackupManager {
 
     if (dryRun) {
       // 干跑：从 zip 内 .db 临时打开，统计每张表 N 行
-      const tmpDb = path.join(os.tmpdir(), `nowen-dryrun-${Date.now()}.db`);
+      //
+      // 这里刻意不用 os.tmpdir()：
+      //   - Windows 下 `os.tmpdir()` 解析为 `C:\Users\<用户名>\AppData\Local\Temp`，
+      //     中文用户名 / 含空格的路径在 better-sqlite3 原生层偶发打不开，
+      //     症状为 `SQLITE_CANTOPEN: unable to open database file`；
+      //   - 且 Windows Defender 会对 Temp 目录实时扫描，刚 writeFileSync 的文件
+      //     可能短暂被 AV 进程独占，readonly 打开时抢不到 share-read；
+      //   - 相比之下 backupDir 是管理员显式确认可写、路径稳定（ENV/DB 持久化值）
+      //     的目录，副作用小、不会被不相关工具扫描。
+      // 文件名加 crypto 随机串避免两次并发 dryRun 撞名。
+      const tmpDb = path.join(
+        this.backupDir,
+        `.nowen-dryrun-${Date.now()}-${crypto.randomBytes(4).toString("hex")}.db`,
+      );
       fs.writeFileSync(tmpDb, await dbFile.async("nodebuffer"));
       try {
         // 用 better-sqlite3 直接打开（独立连接）
         const Database = (await import("better-sqlite3")).default;
-        const tmp = new Database(tmpDb, { readonly: true });
+        let tmp: InstanceType<typeof Database>;
+        try {
+          tmp = new Database(tmpDb, { readonly: true });
+        } catch (e) {
+          // 透传 SQLite 错误 + 临时路径，管理员可凭此定位 AV / 权限 / 路径问题
+          throw new Error(
+            `预览恢复失败：无法打开 zip 内的数据库快照（tmp=${tmpDb}）：${
+              e instanceof Error ? e.message : String(e)
+            }`,
+          );
+        }
         const tables = listAllTables(tmp as unknown as ReturnType<typeof getDb>);
         const cur = getDb();
         const list = tables.map((name) => {
@@ -1034,8 +1078,19 @@ export class BackupManager {
 
     // ===== 实际恢复 =====
     // 1) DB：解 zip 内 db.sqlite 到临时文件 → 走 data-file 替换流程
+    //
+    // 也放在 backupDir 而非 os.tmpdir()：
+    //   - 与 dryRun 同理避免 Windows 下路径 / AV 造成的 CANTOPEN；
+    //   - 下一步 `fs.renameSync(tmpDb, curDbPath)` 要求源和目标 **同卷**，否则
+    //     Windows 会报 EXDEV（跨卷 rename 不可原子）。把 tmp 放 backupDir 时，
+    //     若 backupDir 与 dataDir 同卷则走 rename；不同卷（常见于用户把备份
+    //     挂到独立卷的最佳实践）则 rename 会失败——因此下面的替换逻辑也改成
+    //     rename 失败时自动降级 copy+unlink，保持跨卷也能工作。
     const { getDbPath, closeDb } = await import("../db/schema.js");
-    const tmpDb = path.join(os.tmpdir(), `nowen-restore-${Date.now()}.db`);
+    const tmpDb = path.join(
+      this.backupDir,
+      `.nowen-restore-${Date.now()}-${crypto.randomBytes(4).toString("hex")}.db`,
+    );
     fs.writeFileSync(tmpDb, await dbFile.async("nodebuffer"));
 
     const curDbPath = getDbPath();
@@ -1050,7 +1105,20 @@ export class BackupManager {
     // 等几十 ms 让 OS 释放 .db 句柄（Windows 上必要）
     await new Promise((r) => setTimeout(r, 100));
     try {
-      fs.renameSync(tmpDb, curDbPath);
+      // rename 是原子的，但要求同卷。跨卷（backupDir 挂在独立卷是推荐做法）
+      // 会抛 EXDEV，此时降级为 copy + unlink；copy 失败才 throw。
+      try {
+        fs.renameSync(tmpDb, curDbPath);
+      } catch (renameErr) {
+        const code = (renameErr as NodeJS.ErrnoException)?.code;
+        if (code === "EXDEV" || code === "EPERM") {
+          // EXDEV：跨卷；EPERM：Windows 下目标被占用时偶发（closeDb 后罕见，兜底一下）
+          fs.copyFileSync(tmpDb, curDbPath);
+          try { fs.unlinkSync(tmpDb); } catch { /* ignore tmp 清理失败 */ }
+        } else {
+          throw renameErr;
+        }
+      }
       // 清理 wal/shm，否则替换后 SQLite 会拿旧 wal 拼新 db 导致坏页
       for (const sfx of ["-wal", "-shm"]) {
         const p = curDbPath + sfx;
@@ -1071,6 +1139,8 @@ export class BackupManager {
           /* ignore */
         }
       }
+      // tmpDb 可能还在 backupDir 里，顺手清理避免残留
+      try { if (fs.existsSync(tmpDb)) fs.unlinkSync(tmpDb); } catch { /* ignore */ }
       throw new Error(`数据库文件替换失败: ${e instanceof Error ? e.message : String(e)}`);
     }
 
