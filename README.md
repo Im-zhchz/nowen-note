@@ -647,6 +647,7 @@ docker run -d \
 
 #### 数据管理
 - **分区浏览**：设置页「数据管理」采用二级 Tab 分栏——导出 / 导入 / 数据库 / 备份 / 危险区，按需切换，避免一屏功能过长难以定位
+- **备份发送邮箱**：每份备份可一键作为附件发送到指定邮箱，实现"本地 + 邮箱"双端落地；发送时可选择**附件格式**——直接发当前备份，或由后端现场新建一份 `.zip`（全量）/ `.bak`（仅数据库）再发送，对应不同体积与恢复完整度诉求。管理员在「备份 → 邮件通道（SMTP）」自行配置出口（密码 AES-GCM 加密落库，永不明文回传），支持一键发送测试邮件验证。📖 [QQ / 163 / Gmail / Outlook 详细配置教程](./docs/backup-email-smtp.md)
 - **单笔记导出**：笔记列表右键支持导出为 Markdown / HTML / **PDF** / **SVG 图片**
   - PDF：Electron 桌面端走 `webContents.printToPDF` 直出**矢量 PDF**（文字可选、中文完美）；Web 端通过 `html2canvas + jsPDF` 动态加载并**直接下载 PDF 文件**（A4 自动分页、2x DPI），不再依赖系统打印对话框
   - SVG：把笔记包进 `<foreignObject>` 导出为矢量图，保留完整样式、无损缩放
@@ -1350,7 +1351,7 @@ All NAS platforms with Docker support follow the same general steps:
 
 #### Data Management
 - **Sectioned layout**: The "Data Management" settings panel is organized into sub-tabs — Export / Import / Database / Backup / Danger Zone — so you can jump straight to what you need instead of scrolling through a long wall of features
-- **Email a backup**: Any backup can be sent as an email attachment in one click, so every snapshot also lands in your inbox. Admins configure the outgoing SMTP channel under "Backup → Email channel (SMTP)" (password stored AES-GCM encrypted, never returned in plaintext); a built-in "send test email" button verifies the pipeline before real use
+- **Email a backup**: Any backup can be sent as an email attachment in one click, so every snapshot also lands in your inbox. In the send dialog you can pick the **attachment format** — send the current backup as-is, or have the server freshly pack a new `.zip` (full) / `.bak` (database-only) and send that. Admins configure the outgoing SMTP channel under "Backup → Email channel (SMTP)" (password stored AES-GCM encrypted, never returned in plaintext); a built-in "send test email" button verifies the pipeline before real use. 📖 [Step-by-step guide for QQ / 163 / Gmail / Outlook (Chinese)](./docs/backup-email-smtp.md)
 - **Single-note export**: Right-click on the note list to export as Markdown / HTML / **PDF** / **SVG image**
   - PDF: On Electron desktop, rendered through `webContents.printToPDF` for a true **vector PDF** (selectable text, perfect CJK rendering); on the Web, `html2canvas + jsPDF` are dynamically loaded to **download the PDF file directly** (A4 with auto pagination, 2x DPI), no system print dialog required
   - SVG: Wraps the note into an SVG `<foreignObject>` for a vector image with full styling preserved and lossless scaling

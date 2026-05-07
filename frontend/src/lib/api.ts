@@ -1795,21 +1795,39 @@ export const api = {
      *   - 必须先在 /api/email/smtp 配好 SMTP 并 enabled=true；
      *   - 附件上限 25 MB，超限后端返回 413 + ATTACHMENT_TOO_LARGE。
      *
+     * 附件格式选择（createNew）：
+     *   - 不传 / "current"：直接发送 URL 里指定的 filename 备份；
+     *   - "full"   ：后端现场生成一份新的 .zip 全量备份再发送（会留在备份列表中）；
+     *   - "db-only"：后端现场生成一份新的 .bak 数据库快照再发送（会留在备份列表中）。
+     *
+     * 这样用户不用手动先"创建 → 再发送"，在一步操作内就能完成
+     * "归档 + 投递邮箱"，同时保留可追溯的本地副本。
+     *
      * 设计注记：
      *   - note 只是一行可选备注，附加在邮件正文固定模板之后，
      *     不允许前端自定义 subject/html —— 避免把本站当钓鱼跳板；
      *   - 后端会返回 SMTP 末次响应文本（lastResponse），前端可直接 toast 展示，
-     *     定位"被服务商拒收"这类问题特别高效。
+     *     定位"被服务商拒收"这类问题特别高效；
+     *   - 成功响应额外带 filename/generatedNew，让前端知道真正发出去的是哪份备份。
      */
-    sendEmail: (filename: string, to: string, sudoToken?: string, note?: string) =>
-      request<{ success: boolean; lastResponse?: string; size?: number }>(
-        `/backups/${encodeURIComponent(filename)}/send-email`,
-        {
-          method: "POST",
-          body: JSON.stringify({ to, note }),
-          sudoToken,
-        },
-      ),
+    sendEmail: (
+      filename: string,
+      to: string,
+      sudoToken?: string,
+      note?: string,
+      createNew?: "current" | "full" | "db-only",
+    ) =>
+      request<{
+        success: boolean;
+        lastResponse?: string;
+        size?: number;
+        filename?: string;
+        generatedNew?: boolean;
+      }>(`/backups/${encodeURIComponent(filename)}/send-email`, {
+        method: "POST",
+        body: JSON.stringify({ to, note, createNew }),
+        sudoToken,
+      }),
   },
 
   // ============================================================

@@ -254,7 +254,20 @@ backupsRouter.post("/auto", async (c) => {
 
 // ===== POST /api/backups/:filename/send-email =====
 //
-// body: { to: string, note?: string }
+// body: {
+//   to: string;
+//   note?: string;
+//   // 附件格式可选项：
+//   //   - 不传 / "current"：直接发当前 :filename 备份本身；
+//   //   - "full"   ：现场 createBackup({type:"full"})  产出新 .zip 再发送；
+//   //   - "db-only"：现场 createBackup({type:"db-only"}) 产出新 .bak 再发送；
+//   // 这样用户能在"发送邮箱"对话框选择附件形式——
+//   //   · .zip  = 全量备份（数据库 + 附件 + 字体 + 插件 + JWT 密钥），体积大
+//   //   · .bak  = SQLite 纯数据库快照，体积小、恢复快但丢附件
+//   // 现场生成的备份会像普通备份一样留在备份列表中，形成"一次操作 = 一条归档 + 一封邮件"，
+//   // 与"发送后就消失"相比更符合灾备语义。
+//   createNew?: "current" | "full" | "db-only";
+// }
 //
 // 安全与设计：
 //  - 备份文件是全库 dump，**必须** admin + sudo；没有 sudo 就允许一键发信等同于
@@ -268,8 +281,12 @@ backupsRouter.post("/:filename/send-email", async (c) => {
   const denied = requireBackupSudo(c);
   if (denied) return denied;
 
-  const filename = c.req.param("filename");
-  const body = (await c.req.json().catch(() => ({}))) as { to?: string; note?: string };
+  const filenameParam = c.req.param("filename");
+  const body = (await c.req.json().catch(() => ({}))) as {
+    to?: string;
+    note?: string;
+    createNew?: "current" | "full" | "db-only";
+  };
   const to = (body.to || "").trim();
   if (!to || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(to)) {
     return c.json({ error: "收件人邮箱格式不合法" }, 400);
@@ -285,6 +302,27 @@ backupsRouter.post("/:filename/send-email", async (c) => {
   }
 
   const manager = getBackupManager();
+
+  // 决定实际要发送的备份文件：
+  //   - createNew=full/db-only：现场生成一份新备份（会留在备份列表里，与手动点
+  //     "创建备份"等效），然后发送它；
+  //   - 其他情况：发送 URL 里指定的 :filename 备份。
+  let filename = filenameParam;
+  let generatedNew = false;
+  if (body.createNew === "full" || body.createNew === "db-only") {
+    try {
+      const info = await manager.createBackup({
+        type: body.createNew,
+        description: `邮件发送：${to}`,
+      });
+      filename = info.filename;
+      generatedNew = true;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return c.json({ error: `生成备份失败: ${msg}` }, 500);
+    }
+  }
+
   const filePath = manager.getBackupPath(filename);
   if (!filePath || !fs.existsSync(filePath)) {
     return c.json({ error: "备份文件不存在" }, 404);
@@ -336,7 +374,15 @@ backupsRouter.post("/:filename/send-email", async (c) => {
   if (!result.success) {
     return c.json({ success: false, error: result.error }, 502);
   }
-  return c.json({ success: true, lastResponse: result.lastResponse, size: stat.size });
+  return c.json({
+    success: true,
+    lastResponse: result.lastResponse,
+    size: stat.size,
+    // 当 createNew 请求时，前端需要知道"真正发送的是哪个文件"，用来展示
+    // "已生成新备份 xxx 并发送到 xxx@xxx" 的反馈，并顺便让前端 refresh 备份列表。
+    filename,
+    generatedNew,
+  });
 });
 
 export default backupsRouter;

@@ -1945,6 +1945,7 @@ function BackupSection() {
           onClose={() => setSendEmailTarget(null)}
           askPassword={askPassword}
           sudoTokenRef={sudoTokenRef}
+          onSent={reload}
         />
       )}
 
@@ -2614,17 +2615,31 @@ function BackupSendEmailDialog(props: {
   onClose: () => void;
   askPassword: () => Promise<string | null>;
   sudoTokenRef: React.MutableRefObject<string | null>;
+  /** 发送成功（尤其在 createNew 情况下）后触发，用于让上层刷新备份列表。 */
+  onSent?: () => void;
 }) {
   const { t } = useTranslation();
-  const { target, defaultTo, onClose, askPassword, sudoTokenRef } = props;
+  const { target, defaultTo, onClose, askPassword, sudoTokenRef, onSent } = props;
   const [to, setTo] = useState(defaultTo);
   const [note, setNote] = useState("");
   const [sending, setSending] = useState(false);
   const [msg, setMsg] = useState<{ type: "ok" | "err"; text: string } | null>(null);
 
+  // 附件格式：
+  //   - "current"：直接发当前这条备份（zip 或 .bak，取决于 target.type）
+  //   - "full"   ：请求后端现场新建一份 .zip 全量备份再发送
+  //   - "db-only"：请求后端现场新建一份 .bak 数据库快照再发送
+  // 说明：当用户选了一个"生成"选项，但所选格式恰好等于当前备份格式时，
+  //      前端不做聪明降级——后端照单生成，这样用户能拿到一份"新时间戳"的备份，
+  //      并与邮件投递时间一致，符合"每次发送 = 一次独立归档"的预期。
+  type SendFormat = "current" | "full" | "db-only";
+  const [format, setFormat] = useState<SendFormat>("current");
+
   // 前端硬拦截上限（与后端 EMAIL_ATTACHMENT_LIMIT 保持一致，25MB）
   const ATTACH_LIMIT = 25 * 1024 * 1024;
-  const tooLarge = target.size > ATTACH_LIMIT;
+  // 只有"发送当前备份"时才能预知大小；选"生成新备份"时大小未知，
+  // 超限由后端 413 再拦，不在前端硬拒——避免阻塞合理的小库全量备份。
+  const tooLarge = format === "current" && target.size > ATTACH_LIMIT;
 
   const emailValid = /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(to.trim());
 
@@ -2634,7 +2649,14 @@ function BackupSendEmailDialog(props: {
     setMsg(null);
     try {
       const out = await withSudo(
-        (tk) => api.backup.sendEmail(target.filename, to.trim(), tk, note.trim() || undefined),
+        (tk) =>
+          api.backup.sendEmail(
+            target.filename,
+            to.trim(),
+            tk,
+            note.trim() || undefined,
+            format, // "current" | "full" | "db-only"
+          ),
         askPassword,
         sudoTokenRef.current,
       );
@@ -2644,13 +2666,22 @@ function BackupSendEmailDialog(props: {
         return;
       }
       sudoTokenRef.current = out.sudoToken;
+      const sentName = out.result.filename || target.filename;
       setMsg({
         type: "ok",
-        text: t("dataManager.backup.sendEmailSuccess", {
-          to: to.trim(),
-          resp: out.result.lastResponse || "",
-        }),
+        text: out.result.generatedNew
+          ? t("dataManager.backup.sendEmailGeneratedSuccess", {
+              filename: sentName,
+              to: to.trim(),
+              resp: out.result.lastResponse || "",
+            })
+          : t("dataManager.backup.sendEmailSuccess", {
+              to: to.trim(),
+              resp: out.result.lastResponse || "",
+            }),
       });
+      // 生成了新备份时，通知上层刷新列表；发送当前备份时不需要
+      if (out.result.generatedNew && onSent) onSent();
     } catch (err: any) {
       setMsg({
         type: "err",
@@ -2705,7 +2736,66 @@ function BackupSendEmailDialog(props: {
               </div>
             </div>
 
-            {/* 超大提示 */}
+            {/* 附件格式选择
+                 - 当前备份：直接发 target 本身；
+                 - full(.zip)：数据库 + 附件 + 字体 + 插件 + 密钥，真正"全家桶"；
+                 - db-only(.bak)：仅 SQLite 快照，附件会丢，但体积最小最适合邮件。
+                "生成"两项会在后端顺手落成一条新备份，相当于"邮件发送 = 一次归档"。*/}
+            <div>
+              <label className="block text-xs font-medium text-zinc-700 dark:text-zinc-300 mb-1">
+                {t("dataManager.backup.sendEmailFormat")}
+              </label>
+              <div className="grid grid-cols-1 gap-1.5">
+                {([
+                  {
+                    val: "current" as const,
+                    label: t("dataManager.backup.sendEmailFormatCurrent", {
+                      type: target.type,
+                      size: fmtBytes(target.size),
+                    }),
+                    hint: t("dataManager.backup.sendEmailFormatCurrentHint"),
+                  },
+                  {
+                    val: "full" as const,
+                    label: t("dataManager.backup.sendEmailFormatFull"),
+                    hint: t("dataManager.backup.sendEmailFormatFullHint"),
+                  },
+                  {
+                    val: "db-only" as const,
+                    label: t("dataManager.backup.sendEmailFormatDbOnly"),
+                    hint: t("dataManager.backup.sendEmailFormatDbOnlyHint"),
+                  },
+                ]).map((opt) => (
+                  <label
+                    key={opt.val}
+                    className={`flex items-start gap-2 p-2 rounded-lg border cursor-pointer transition ${
+                      format === opt.val
+                        ? "border-sky-400 dark:border-sky-500/60 bg-sky-50 dark:bg-sky-500/10"
+                        : "border-zinc-200 dark:border-zinc-800 hover:bg-zinc-50 dark:hover:bg-zinc-800/40"
+                    }`}
+                  >
+                    <input
+                      type="radio"
+                      name="send-email-format"
+                      value={opt.val}
+                      checked={format === opt.val}
+                      onChange={() => setFormat(opt.val)}
+                      className="mt-0.5 accent-sky-600"
+                    />
+                    <span className="flex-1 min-w-0">
+                      <span className="block text-xs font-medium text-zinc-800 dark:text-zinc-200">
+                        {opt.label}
+                      </span>
+                      <span className="block text-[11px] text-zinc-500 dark:text-zinc-400 leading-snug">
+                        {opt.hint}
+                      </span>
+                    </span>
+                  </label>
+                ))}
+              </div>
+            </div>
+
+            {/* 超大提示（仅"发送当前备份"时按 target.size 预判） */}
             {tooLarge && (
               <div className="flex items-start gap-2 p-2.5 rounded-lg bg-red-50 dark:bg-red-500/10 border border-red-200 dark:border-red-700/40 text-red-700 dark:text-red-300 text-xs leading-relaxed">
                 <AlertTriangle className="w-3.5 h-3.5 mt-0.5 shrink-0" />

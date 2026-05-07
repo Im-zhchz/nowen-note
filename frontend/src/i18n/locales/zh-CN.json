@@ -724,7 +724,16 @@
       "sendEmailBtn": "发送",
       "sendEmailTooLarge": "备份超过 25MB 邮件附件上限，请改用「下载」后手动发送。",
       "sendEmailSuccess": "已发送到 {{to}}：{{resp}}",
-      "sendEmailFailed": "发送失败：{{error}}"
+      "sendEmailGeneratedSuccess": "已新建备份 {{filename}} 并发送到 {{to}}：{{resp}}",
+      "sendEmailFailed": "发送失败：{{error}}",
+
+      "sendEmailFormat": "附件格式",
+      "sendEmailFormatCurrent": "直接发送当前备份（{{type}} · {{size}}）",
+      "sendEmailFormatCurrentHint": "不会新建文件，发送速度最快；附件大小 = 当前备份大小。",
+      "sendEmailFormatFull": "新建并发送 .zip 全量备份",
+      "sendEmailFormatFullHint": "立即打包「数据库 + 附件 + 字体 + 插件 + JWT 密钥」为 .zip 发送，并保留为一条新备份；体积最大，恢复最完整。",
+      "sendEmailFormatDbOnly": "新建并发送 .bak 数据库快照",
+      "sendEmailFormatDbOnlyHint": "仅打包 SQLite 数据库快照（.bak），不含附件/字体/插件；体积最小，最适合邮件传输。"
     },
     "smtp": {
       "title": "邮件通道（SMTP）",

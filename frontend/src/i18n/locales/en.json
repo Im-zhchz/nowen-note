@@ -717,7 +717,16 @@
       "sendEmailBtn": "Send",
       "sendEmailTooLarge": "Backup exceeds the 25MB email attachment limit. Please use \"Download\" and send it manually.",
       "sendEmailSuccess": "Sent to {{to}}: {{resp}}",
-      "sendEmailFailed": "Send failed: {{error}}"
+      "sendEmailGeneratedSuccess": "Created new backup {{filename}} and sent to {{to}}: {{resp}}",
+      "sendEmailFailed": "Send failed: {{error}}",
+
+      "sendEmailFormat": "Attachment format",
+      "sendEmailFormatCurrent": "Send the current backup ({{type}} · {{size}})",
+      "sendEmailFormatCurrentHint": "Fastest — no new file is created; attachment size equals the current backup size.",
+      "sendEmailFormatFull": "Create & send a new .zip full backup",
+      "sendEmailFormatFullHint": "Packs database + attachments + fonts + plugins + JWT secret into .zip, sends it, and keeps it as a new backup entry. Largest size, fullest restore.",
+      "sendEmailFormatDbOnly": "Create & send a new .bak database snapshot",
+      "sendEmailFormatDbOnlyHint": "SQLite snapshot only (.bak) — no attachments/fonts/plugins. Smallest size, best suited for email."
     },
     "smtp": {
       "title": "Email channel (SMTP)",
