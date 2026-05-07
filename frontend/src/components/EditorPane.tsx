@@ -426,6 +426,10 @@ export default function EditorPane() {
 
   const { presenceUsers, isConnected, setEditing: rtSetEditing } = useRealtimeNote({
     noteId: activeNote?.id ?? null,
+    // 显式传入 selfUserId：EditorPane 里已有 selfUser（localStorage 缓存 + /api/me），
+    // 直接传下去能消除 hook 内部"selfUserId 为 null 窗口期"导致的误提示
+    // （自己编辑时弹 "XX 正在编辑 / XX 更新了笔记"）。
+    selfUserId: selfUser?.userId ?? null,
     onRemoteUpdate: (msg) => {
       // 只对当前激活笔记生效；注意闭包里用 activeNoteRef 拿最新值
       const cur = activeNoteRef.current;
