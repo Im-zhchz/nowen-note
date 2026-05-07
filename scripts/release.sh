@@ -1318,6 +1318,47 @@ if [ "$HAS_PC" = "1" ]; then
         fi
     fi
 
+    # ---- 前置：确保 frontend 依赖齐全 ----
+    # 背景：同 backend，frontend/node_modules 缺包时 `npm run build:frontend`
+    #   里的 `tsc -b` 会在各种 import 上直接 TS2307；之前在 Linux 上就被
+    #   html2canvas / jspdf / marked / @mhaberler/capacitor-zeroconf-nsd /
+    #   @aparajita/capacitor-secure-storage / @aparajita/capacitor-biometric-auth
+    #   这一串依赖绊住过。
+    # 策略：与 backend 同款——挑几个代表性依赖做白名单体检，缺任一个就
+    #   在 frontend/ 跑一次 npm install；齐全则放行不拖慢正常环境。
+    if [ "$DRY_RUN" = "1" ]; then
+        echo "  (dry-run) 检查 frontend/node_modules 关键依赖"
+    else
+        _FRONTEND_DEPS_OK=1
+        if [ ! -d "${REPO_ROOT}/frontend/node_modules" ]; then
+            _FRONTEND_DEPS_OK=0
+        else
+            # 选型说明：
+            #   - react / vite / typescript：基石，缺任一个都是环境未初始化
+            #   - marked / html2canvas / jspdf：历史上掉过坑的导出/导入依赖
+            #   - @aparajita/capacitor-secure-storage / @aparajita/capacitor-biometric-auth
+            #     / @mhaberler/capacitor-zeroconf-nsd：带 scope 的 Capacitor 插件，
+            #     新机器 / 切分支时常缺
+            for _dep in \
+                react vite typescript \
+                marked html2canvas jspdf \
+                "@aparajita/capacitor-secure-storage" \
+                "@aparajita/capacitor-biometric-auth" \
+                "@mhaberler/capacitor-zeroconf-nsd"; do
+                if [ ! -d "${REPO_ROOT}/frontend/node_modules/${_dep}" ]; then
+                    warn "frontend 依赖缺失: ${_dep}"
+                    _FRONTEND_DEPS_OK=0
+                fi
+            done
+        fi
+        if [ "$_FRONTEND_DEPS_OK" = "0" ]; then
+            info "frontend 依赖不完整，自动执行 ${C_GREEN}npm install${C_RESET}（避免 tsc TS2307 报错）"
+            ( cd "${REPO_ROOT}/frontend" && run_argv npm install )
+        else
+            info "frontend 依赖检查通过"
+        fi
+    fi
+
     # 统一先跑 rebuild:native + build:all（safe-build.mjs 内部也是这三步，这里拆开以便非 Windows 分支复用）
     if [ "$UNAME_S_PC" = "Linux" ] || [ "$UNAME_S_PC" = "Darwin" ]; then
         # 输出目录：在 Linux/macOS 上不做 tmpdir 切换，默认 dist-electron/
