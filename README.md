@@ -1350,6 +1350,7 @@ All NAS platforms with Docker support follow the same general steps:
 
 #### Data Management
 - **Sectioned layout**: The "Data Management" settings panel is organized into sub-tabs — Export / Import / Database / Backup / Danger Zone — so you can jump straight to what you need instead of scrolling through a long wall of features
+- **Email a backup**: Any backup can be sent as an email attachment in one click, so every snapshot also lands in your inbox. Admins configure the outgoing SMTP channel under "Backup → Email channel (SMTP)" (password stored AES-GCM encrypted, never returned in plaintext); a built-in "send test email" button verifies the pipeline before real use
 - **Single-note export**: Right-click on the note list to export as Markdown / HTML / **PDF** / **SVG image**
   - PDF: On Electron desktop, rendered through `webContents.printToPDF` for a true **vector PDF** (selectable text, perfect CJK rendering); on the Web, `html2canvas + jsPDF` are dynamically loaded to **download the PDF file directly** (A4 with auto pagination, 2x DPI), no system print dialog required
   - SVG: Wraps the note into an SVG `<foreignObject>` for a vector image with full styling preserved and lossless scaling

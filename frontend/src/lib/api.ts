@@ -1787,6 +1787,92 @@ export const api = {
         body: JSON.stringify({ path: dirPath, dryRun }),
         sudoToken: dryRun ? undefined : sudoToken,
       }),
+
+    /**
+     * 将一份备份作为附件发送到指定邮箱（管理员 + sudo）。
+     *
+     * 前置条件：
+     *   - 必须先在 /api/email/smtp 配好 SMTP 并 enabled=true；
+     *   - 附件上限 25 MB，超限后端返回 413 + ATTACHMENT_TOO_LARGE。
+     *
+     * 设计注记：
+     *   - note 只是一行可选备注，附加在邮件正文固定模板之后，
+     *     不允许前端自定义 subject/html —— 避免把本站当钓鱼跳板；
+     *   - 后端会返回 SMTP 末次响应文本（lastResponse），前端可直接 toast 展示，
+     *     定位"被服务商拒收"这类问题特别高效。
+     */
+    sendEmail: (filename: string, to: string, sudoToken?: string, note?: string) =>
+      request<{ success: boolean; lastResponse?: string; size?: number }>(
+        `/backups/${encodeURIComponent(filename)}/send-email`,
+        {
+          method: "POST",
+          body: JSON.stringify({ to, note }),
+          sudoToken,
+        },
+      ),
+  },
+
+  // ============================================================
+  // 邮件服务（SMTP）配置 —— 管理员专属
+  // ------------------------------------------------------------
+  // 配套 backup.sendEmail 使用：先 GET 拉现状、PUT 写入、POST /test 验证。
+  // 所有接口都走 requireAdmin，非管理员会直接收到 403，前端应根据 /api/me
+  // 的 role 字段提前隐藏入口以避免无意义的 403。
+  // ============================================================
+  email: {
+    /** 读取当前 SMTP 配置（密码永远不返回明文，只给 hasPassword 标记） */
+    getSmtp: () =>
+      request<{
+        enabled: boolean;
+        host: string;
+        port: number;
+        secure: boolean;
+        username: string;
+        fromName: string;
+        fromEmail: string;
+        hasPassword: boolean;
+        updatedAt: string | null;
+      }>("/email/smtp"),
+
+    /**
+     * 写入 SMTP 配置（管理员 + sudo）。
+     *
+     * password 字段：
+     *   - undefined：保持旧密码不变（用于"只改 host/port" 场景）
+     *   - ""       ：显式清空旧密码
+     *   - 非空串    ：覆盖为新密码（后端 AES-GCM 加密后落库）
+     */
+    putSmtp: (
+      input: {
+        enabled: boolean;
+        host: string;
+        port: number;
+        secure: boolean;
+        username: string;
+        password?: string;
+        fromName: string;
+        fromEmail: string;
+      },
+      sudoToken?: string,
+    ) =>
+      request<{
+        enabled: boolean;
+        host: string;
+        port: number;
+        secure: boolean;
+        username: string;
+        fromName: string;
+        fromEmail: string;
+        hasPassword: boolean;
+        updatedAt: string | null;
+      }>("/email/smtp", { method: "PUT", body: JSON.stringify(input), sudoToken }),
+
+    /** 发送测试邮件，返回 success + SMTP 末次响应 */
+    testSmtp: (to: string, sudoToken?: string) =>
+      request<{ success: boolean; lastResponse?: string; error?: string }>(
+        "/email/smtp/test",
+        { method: "POST", body: JSON.stringify({ to }), sudoToken },
+      ),
   },
 
   // ============================================================

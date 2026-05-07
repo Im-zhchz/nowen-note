@@ -27,10 +27,12 @@
 import { Hono } from "hono";
 import type { Context } from "hono";
 import fs from "fs";
+import path from "path";
 import { getBackupManager } from "../services/backup.js";
 import { requireAdmin } from "../middleware/acl.js";
 import { getDb } from "../db/schema.js";
 import { verifySudoFromRequest } from "../lib/auth-security.js";
+import { sendMail, EMAIL_ATTACHMENT_LIMIT, readSmtpConfig } from "../services/email.js";
 
 const backupsRouter = new Hono();
 
@@ -248,6 +250,93 @@ backupsRouter.post("/auto", async (c) => {
     enabled: true,
     intervalHours: interval,
   });
+});
+
+// ===== POST /api/backups/:filename/send-email =====
+//
+// body: { to: string, note?: string }
+//
+// 安全与设计：
+//  - 备份文件是全库 dump，**必须** admin + sudo；没有 sudo 就允许一键发信等同于
+//    把整库甩给邮箱账号，与 create/delete 一致强度；
+//  - 不允许自定义 subject / body 附带任意 HTML——避免管理员账号被劫持后，攻击者
+//    把服务器当成钓鱼邮件跳板。正文走固定模板，管理员只能补一行可选 note；
+//  - 附件硬上限 25 MB：这是多数邮箱服务商（Gmail/Outlook/QQ 邮箱）的附件上限，
+//    更大只会被拒收并撑内存；前端文案会引导管理员"超限请下载后手动发送"；
+//  - SMTP 必须先在 /api/email/smtp 配好并 enabled=true，否则直接 412 Precondition Failed。
+backupsRouter.post("/:filename/send-email", async (c) => {
+  const denied = requireBackupSudo(c);
+  if (denied) return denied;
+
+  const filename = c.req.param("filename");
+  const body = (await c.req.json().catch(() => ({}))) as { to?: string; note?: string };
+  const to = (body.to || "").trim();
+  if (!to || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(to)) {
+    return c.json({ error: "收件人邮箱格式不合法" }, 400);
+  }
+
+  // 前置检查：SMTP 是否已启用且密码已填
+  const smtp = readSmtpConfig();
+  if (!smtp.enabled || !smtp.host || !smtp.username || !smtp.password) {
+    return c.json(
+      { error: "SMTP 未配置或未启用，请先在「备份 → 邮件通道」中完成配置", code: "SMTP_NOT_READY" },
+      412,
+    );
+  }
+
+  const manager = getBackupManager();
+  const filePath = manager.getBackupPath(filename);
+  if (!filePath || !fs.existsSync(filePath)) {
+    return c.json({ error: "备份文件不存在" }, 404);
+  }
+
+  const stat = fs.statSync(filePath);
+  if (stat.size > EMAIL_ATTACHMENT_LIMIT) {
+    return c.json(
+      {
+        error: `备份文件 ${(stat.size / 1024 / 1024).toFixed(1)} MB 超过邮件附件 25MB 上限，请改用「下载」后手动发送`,
+        code: "ATTACHMENT_TOO_LARGE",
+      },
+      413,
+    );
+  }
+
+  const content = fs.readFileSync(filePath);
+  const ext = path.extname(filename).toLowerCase();
+  const contentType =
+    ext === ".zip" ? "application/zip" : ext === ".bak" ? "application/octet-stream" : "application/octet-stream";
+
+  const note = (body.note || "").toString().slice(0, 500); // 限制附加备注长度，防滥用
+  const sizeMB = (stat.size / 1024 / 1024).toFixed(2);
+  const lines = [
+    `这是一封由 nowen-note 自动发送的数据备份邮件。`,
+    ``,
+    `备份文件：${filename}`,
+    `大小：${sizeMB} MB`,
+    `发送时间：${new Date().toLocaleString()}`,
+  ];
+  if (note) {
+    lines.push(``, `管理员备注：`, note);
+  }
+  lines.push(
+    ``,
+    `安全提醒：`,
+    `- 备份文件包含完整数据库快照，请妥善保管；`,
+    `- 收到后建议立即将附件归档至离线存储介质；`,
+    `- 如非本人操作请立即登录系统检查邮件配置及登录记录。`,
+  );
+
+  const result = await sendMail({
+    to,
+    subject: `[nowen-note] 数据备份 ${filename}`,
+    text: lines.join("\n"),
+    attachments: [{ filename, content, contentType }],
+  });
+
+  if (!result.success) {
+    return c.json({ success: false, error: result.error }, 502);
+  }
+  return c.json({ success: true, lastResponse: result.lastResponse, size: stat.size });
 });
 
 export default backupsRouter;
