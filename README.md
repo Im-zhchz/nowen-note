@@ -1004,6 +1004,14 @@ node scripts/migrate-tiptap-to-md.mjs --apply
 | `/api/icloud` | ✓ | iCloud 备忘录导入 |
 | `/api/me` | ✓ | 当前用户信息 |
 
+### 支持作者
+
+如果这个项目对你有帮助，欢迎扫码请作者喝杯咖啡 ☕ / 买个键盘 ⌨️ / 修个 Bug 🐛：
+
+<p align="center">
+  <img src="./weixin.jpg" alt="微信赞赏码" width="320" />
+</p>
+
 ### 开源协议
 
 本项目采用 [GNU General Public License v3.0](./LICENSE)（GPL-3.0）开源协议发布。
@@ -1706,6 +1714,14 @@ The script only modifies the `notes.content` field; `contentText` is untouched s
 | `/api/oppocloud` | ✓ | OPPO Cloud notes import |
 | `/api/icloud` | ✓ | iCloud notes import |
 | `/api/me` | ✓ | Current user info |
+
+### Support the Author
+
+If this project helps you, consider buying the author a coffee ☕ / a keyboard ⌨️ / a bug fix 🐛 via WeChat:
+
+<p align="center">
+  <img src="./weixin.jpg" alt="WeChat Reward QR" width="320" />
+</p>
 
 ### License
 
