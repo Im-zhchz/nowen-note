@@ -424,6 +424,38 @@ export default function EditorPane() {
   /** 远程删除横幅 */
   const [remoteDelete, setRemoteDelete] = useState<{ actorUserId?: string; trashed?: boolean } | null>(null);
 
+  // ---------------------------------------------------------------------------
+  // 当前登录用户信息
+  // ---------------------------------------------------------------------------
+  // selfUser 同时服务于两处：
+  //   1) useRealtimeNote 的 selfUserId（过滤"自己的"presence / note:updated 回声）
+  //   2) Phase 3 Y.js CRDT 的 awareness（显示本人名字与颜色）
+  // 因此必须在 useRealtimeNote 之前声明，避免暂时性死区（TDZ）报错。
+  /** 当前登录用户信息，用于 awareness 显示本人名字与颜色 */
+  const [selfUser, setSelfUser] = useState<{ userId: string; username: string } | null>(() => {
+    try {
+      const cachedId = localStorage.getItem("nowen-self-userid");
+      const cachedName = localStorage.getItem("nowen-self-username");
+      if (cachedId && cachedName) return { userId: cachedId, username: cachedName };
+    } catch {}
+    return null;
+  });
+  useEffect(() => {
+    if (selfUser) return;
+    let cancelled = false;
+    api.getMe()
+      .then((me: any) => {
+        if (cancelled || !me?.id) return;
+        try {
+          localStorage.setItem("nowen-self-userid", me.id);
+          localStorage.setItem("nowen-self-username", me.username || me.id);
+        } catch {}
+        setSelfUser({ userId: me.id, username: me.username || me.id });
+      })
+      .catch(() => { /* 未登录/网络失败静默 */ });
+    return () => { cancelled = true; };
+  }, [selfUser]);
+
   const { presenceUsers, isConnected, setEditing: rtSetEditing } = useRealtimeNote({
     noteId: activeNote?.id ?? null,
     // 显式传入 selfUserId：EditorPane 里已有 selfUser（localStorage 缓存 + /api/me），
@@ -450,30 +482,6 @@ export default function EditorPane() {
   // ---------------------------------------------------------------------------
   // Phase 3: Y.js CRDT 协同
   // ---------------------------------------------------------------------------
-  /** 当前登录用户信息，用于 awareness 显示本人名字与颜色 */
-  const [selfUser, setSelfUser] = useState<{ userId: string; username: string } | null>(() => {
-    try {
-      const cachedId = localStorage.getItem("nowen-self-userid");
-      const cachedName = localStorage.getItem("nowen-self-username");
-      if (cachedId && cachedName) return { userId: cachedId, username: cachedName };
-    } catch {}
-    return null;
-  });
-  useEffect(() => {
-    if (selfUser) return;
-    let cancelled = false;
-    api.getMe()
-      .then((me: any) => {
-        if (cancelled || !me?.id) return;
-        try {
-          localStorage.setItem("nowen-self-userid", me.id);
-          localStorage.setItem("nowen-self-username", me.username || me.id);
-        } catch {}
-        setSelfUser({ userId: me.id, username: me.username || me.id });
-      })
-      .catch(() => { /* 未登录/网络失败静默 */ });
-    return () => { cancelled = true; };
-  }, [selfUser]);
 
   /**
    * Phase 3 启用条件：
