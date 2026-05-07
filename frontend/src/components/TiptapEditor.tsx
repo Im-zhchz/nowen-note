@@ -21,7 +21,7 @@ import { api } from "@/lib/api";
 import {
   Bold, Italic, Underline as UnderlineIcon, Strikethrough,
   List, ListOrdered, Heading1, Heading2, Heading3,
-  Quote, ImagePlus, CheckSquare, Highlighter, Minus, Undo, Redo,
+  Quote, ImagePlus, Paperclip, CheckSquare, Highlighter, Minus, Undo, Redo,
   FileCode, Sparkles, X, ZoomIn, ZoomOut, RotateCcw,
   Table2, Indent, Outdent, AlignLeft, AlignCenter, AlignRight, Trash2,
   FileType, Check, AlertCircle, Info, ArrowUp
@@ -838,6 +838,48 @@ export default forwardRef<NoteEditorHandle, TiptapEditorProps>(function TiptapEd
             }
           }
 
+          // 1b) 非图片文件粘贴（剪贴板里来自资源管理器的复制）：当作附件上传
+          //     用 clipboardData.files 比 items 更直观；它已剔除 string 类型项。
+          const pastedFiles = Array.from(event.clipboardData?.files || []);
+          if (pastedFiles.length > 0) {
+            const currentNote = noteRef.current;
+            if (currentNote?.id) {
+              showPasteToast("converting", t("tiptap.attachmentUploading"));
+              const insertAttachmentToView = (filename: string, url: string, size: number) => {
+                const html = buildAttachmentLinkHtml(filename, url, size);
+                const dom = document.createElement("div");
+                dom.innerHTML = html;
+                const slice = ProseMirrorDOMParser
+                  .fromSchema(view.state.schema)
+                  .parseSlice(dom);
+                view.dispatch(view.state.tr.replaceSelection(slice));
+              };
+              const insertImageToView = (src: string) => {
+                const node = view.state.schema.nodes.image?.create({ src });
+                if (node) view.dispatch(view.state.tr.replaceSelectionWith(node));
+              };
+              const uploadAll = async () => {
+                for (const file of pastedFiles) {
+                  try {
+                    const res = await api.attachments.upload(currentNote.id, file);
+                    if (res.category === "image") {
+                      insertImageToView(res.url);
+                    } else {
+                      insertAttachmentToView(res.filename, res.url, res.size);
+                    }
+                  } catch (err) {
+                    console.error("Paste attachment upload failed:", err);
+                  }
+                }
+                showPasteToast("success", t("tiptap.attachmentUploaded"));
+              };
+              uploadAll();
+              return true;
+            }
+          }
+
+
+
           const text = event.clipboardData?.getData("text/plain") || "";
           const html = event.clipboardData?.getData("text/html") || "";
 
@@ -962,6 +1004,68 @@ export default forwardRef<NoteEditorHandle, TiptapEditorProps>(function TiptapEd
           } catch {}
           return true;
         }
+      },
+      /**
+       * 拖拽文件到编辑器：任意类型都走 /api/attachments 上传。
+       *   - 图片 → setImage；
+       *   - 非图片 → 插入附件链接。
+       * 只在有 dataTransfer.files 时接管；其它情况（从编辑器内拖动节点）让 Tiptap/PM 默认处理。
+       *
+       * 注意：ProseMirror 会在拖拽过程中把当前光标放到鼠标释放位置，所以这里直接
+       * replaceSelection 就会落在期望位置。
+       */
+      handleDrop: (view, event, _slice, moved) => {
+        if (moved) return false; // 编辑器内部移动节点，不拦截
+        const dt = (event as DragEvent).dataTransfer;
+        const files = dt ? Array.from(dt.files || []) : [];
+        if (files.length === 0) return false;
+        event.preventDefault();
+
+        const currentNote = noteRef.current;
+        if (!currentNote?.id) return true;
+
+        // 把落点换算到 PM 坐标，并把光标移过去，这样 replaceSelection 插在拖放位置。
+        try {
+          const coords = view.posAtCoords({ left: (event as DragEvent).clientX, top: (event as DragEvent).clientY });
+          if (coords) {
+            const tr = view.state.tr.setSelection(TextSelection.create(view.state.doc, coords.pos));
+            view.dispatch(tr);
+          }
+        } catch {
+          /* ignore */
+        }
+
+        const insertAttachmentToView = (filename: string, url: string, size: number) => {
+          const html = buildAttachmentLinkHtml(filename, url, size);
+          const dom = document.createElement("div");
+          dom.innerHTML = html;
+          const slice = ProseMirrorDOMParser
+            .fromSchema(view.state.schema)
+            .parseSlice(dom);
+          view.dispatch(view.state.tr.replaceSelection(slice));
+        };
+        const insertImageToView = (src: string) => {
+          const node = view.state.schema.nodes.image?.create({ src });
+          if (node) view.dispatch(view.state.tr.replaceSelectionWith(node));
+        };
+
+        showPasteToast("converting", t("tiptap.attachmentUploading"));
+        (async () => {
+          for (const file of files) {
+            try {
+              const res = await api.attachments.upload(currentNote.id, file);
+              if (res.category === "image") {
+                insertImageToView(res.url);
+              } else {
+                insertAttachmentToView(res.filename, res.url, res.size);
+              }
+            } catch (err) {
+              console.error("Drop attachment upload failed:", err);
+            }
+          }
+          showPasteToast("success", t("tiptap.attachmentUploaded"));
+        })();
+        return true;
       },
     },
     onUpdate: ({ editor }) => {
@@ -1505,6 +1609,67 @@ export default forwardRef<NoteEditorHandle, TiptapEditorProps>(function TiptapEd
   }, [editor, t]);
 
   /**
+   * 任意格式附件上传 → 在编辑器当前位置插入：
+   *   - 图片（image/*）：当作 <img> 插入，与 handleImageUpload 一致路径
+   *   - 其它：插入一段「附件链接」HTML：
+   *       <a href="/api/attachments/<id>" download="<原文件名>"
+   *          data-attachment="1" data-size="<bytes>">📎 文件名 (大小)</a>
+   *     - data-attachment / data-size 用于将来识别 / 二次渲染（如换图标）；
+   *     - download 属性 + 后端 Content-Disposition 双保险触发下载；
+   *     - 链接由 StarterKit 默认 Link mark 承载（v3 starter-kit 默认含 link），
+   *       即便没有 link mark 也能作为普通 <a> 文本节点存活下来。
+   *
+   * 与 handleImageUpload 解耦的好处：
+   *   - 工具栏可以同时存在「插入图片」（仅图片文件 picker）和「插入附件」（任意），
+   *     两个入口语义清晰；
+   *   - 粘贴 / 拖拽路径只调本函数即可（已自动按 mime 分流）。
+   */
+  const handleAttachmentUpload = useCallback(() => {
+    if (!editor) return;
+    const input = document.createElement("input");
+    input.type = "file";
+    // 不设 accept：放开任意格式
+    input.onchange = () => {
+      const file = input.files?.[0];
+      if (!file) return;
+      uploadAndInsertAttachment(file);
+    };
+    input.click();
+
+    function uploadAndInsertAttachment(file: File) {
+      const currentNote = noteRef.current;
+      if (!currentNote?.id) {
+        toast.error(t("tiptap.attachmentUploadFailed") || "Attachment upload failed");
+        return;
+      }
+      toast.info(t("tiptap.attachmentUploading") || "Uploading attachment...");
+      api.attachments
+        .upload(currentNote.id, file)
+        .then((res) => {
+          if (res.category === "image") {
+            // 图片：与 handleImageUpload 一致，走 setImage
+            editor.chain().focus().setImage({ src: res.url }).run();
+          } else {
+            const html = buildAttachmentLinkHtml(res.filename, res.url, res.size);
+            editor.chain().focus().insertContent(html).run();
+          }
+          toast.success(t("tiptap.attachmentUploaded") || "Attachment uploaded");
+        })
+        .catch((err: any) => {
+          console.error("Attachment upload failed:", err);
+          const msg = String(err?.message || "");
+          if (/最大|max\s+\d+\s*MB/i.test(msg)) {
+            toast.error(t("tiptap.attachmentTooLarge") || "File too large");
+          } else {
+            toast.error(t("tiptap.attachmentUploadFailed") || "Attachment upload failed");
+          }
+        });
+    }
+  }, [editor, t]);
+
+
+
+  /**
    * 严格作用于当前选区的代码块切换：
    *   - 光标在代码块内：取消代码块（转为段落），与默认 toggleCodeBlock 一致
    *   - 无选区：将光标所在的整个块切换为代码块（与默认行为一致）
@@ -1810,6 +1975,9 @@ export default forwardRef<NoteEditorHandle, TiptapEditorProps>(function TiptapEd
         </ToolbarButton>
         <ToolbarButton onClick={handleImageUpload} title={t('tiptap.insertImage')}>
           <ImagePlus size={iconSize} />
+        </ToolbarButton>
+        <ToolbarButton onClick={handleAttachmentUpload} title={t('tiptap.insertAttachment')}>
+          <Paperclip size={iconSize} />
         </ToolbarButton>
         <ToolbarButton
           onClick={() => editor.chain().focus().insertTable({ rows: 3, cols: 3, withHeaderRow: true }).run()}
@@ -2316,6 +2484,50 @@ export default forwardRef<NoteEditorHandle, TiptapEditorProps>(function TiptapEd
     </div>
   );
 });
+
+/**
+ * 把附件信息渲染成一段「可粘附进 Tiptap 内容」的 HTML 链接。
+ *
+ * 形态：
+ *   <a href="/api/attachments/<id>" download="<filename>"
+ *      data-attachment="1" data-size="<bytes>"
+ *      target="_blank" rel="noopener noreferrer">📎 filename (大小)</a>
+ *
+ * 设计点：
+ *   - 用相对 URL：与图片一致，避免把 lite 模式下的远端 host 写进 notes.content；
+ *     渲染端 / 分享页可以由 resolveAttachmentUrl 自动补 origin。
+ *   - download 属性 + 后端 Content-Disposition 双保险，浏览器点击触发下载。
+ *   - data-attachment="1" 给将来"换成自定义节点视图"留个抓手（识别一段链接是否
+ *     源自附件上传），不影响导出/分享/SSR。
+ *   - filename 通过 escapeHtml 双重转义；data-size 是纯数字。
+ */
+function buildAttachmentLinkHtml(filename: string, url: string, size: number): string {
+  const safeName = escapeHtml(filename || "attachment");
+  const safeUrl = escapeHtml(url);
+  const sizeLabel = formatBytes(size);
+  // 加 \u00a0(NBSP) + 一个普通空格，避免后续 typing 紧贴链接末尾导致光标卡在 mark 边界
+  return `<a href="${safeUrl}" download="${safeName}" data-attachment="1" data-size="${size}" target="_blank" rel="noopener noreferrer">📎 ${safeName} (${sizeLabel})</a>&nbsp;`;
+}
+
+function escapeHtml(s: string): string {
+  return String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes < 0) return "";
+  if (bytes < 1024) return `${bytes} B`;
+  const kb = bytes / 1024;
+  if (kb < 1024) return `${kb.toFixed(kb < 10 ? 1 : 0)} KB`;
+  const mb = kb / 1024;
+  if (mb < 1024) return `${mb.toFixed(mb < 10 ? 1 : 0)} MB`;
+  const gb = mb / 1024;
+  return `${gb.toFixed(gb < 10 ? 2 : 1)} GB`;
+}
 
 /**
  * 检测粘贴的多行纯文本是否看起来像代码/命令，而非中文自然语言段落。

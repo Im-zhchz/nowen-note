@@ -877,11 +877,16 @@ export const api = {
   deleteFont: (id: string) => request(`/fonts/${id}`, { method: "DELETE" }),
   getFontFileUrl: (id: string) => `${getBaseUrl()}/fonts/file/${id}`,
 
-  // ========== Attachments（图片/附件走文件，不再内联 base64）==========
+  // ========== Attachments（图片/任意格式附件走文件，不再内联 base64）==========
   //
-  // 统一把编辑器里的图片从 data:image;base64,... 迁到 /api/attachments/<id>。
-  // 粘贴、拖拽、点"插入图片"按钮都应走 uploadAttachment；导入（importService）
-  // 在解析到本地图片时也走这里把字节落盘。
+  // 统一把编辑器里的二进制内容从 data:image;base64,... 迁到 /api/attachments/<id>。
+  // 粘贴、拖拽、点"插入图片/插入附件"按钮都应走 uploadAttachment；导入
+  // （importService）在解析到本地图片时也走这里把字节落盘。
+  //
+  // 后端不再限制 MIME（只黑掉极少数高危可执行类型），任何文件都能上传。
+  // 响应里多带一个 category: "image" | "file"，前端据此决定编辑器里：
+  //   - "image" → 插 <img>
+  //   - "file"  → 插「附件链接」（<a download="原文件名">📎 文件名 (大小)</a>）
   //
   // 返回的 url 是**相对 URL**（/api/attachments/<id>），浏览器直接用作 img.src
   // 能正确带上 Authorization（fetch）……不过 <img> 标签的 HTTP 请求不会带
@@ -890,11 +895,11 @@ export const api = {
   // 若以后部署到不同域 + cookie 鉴权不可用，需改造为签名 URL。
   attachments: {
     /**
-     * 上传一张图片附件。
+     * 上传一份附件（任意格式）。
      *
      * @param noteId 必须：绑定的笔记 ID，后端用它做 ACL 校验
      * @param file   File 对象（粘贴得到的 File、拖拽文件、或 input.files[0]）
-     * @returns      { id, url, mimeType, size, filename }
+     * @returns      { id, url, mimeType, size, filename, category }
      *
      * 注意：
      *   - 本调用绕过 request() 通用封装，因为 Content-Type 需要让浏览器自动
@@ -904,7 +909,14 @@ export const api = {
     upload: async (
       noteId: string,
       file: File,
-    ): Promise<{ id: string; url: string; mimeType: string; size: number; filename: string }> => {
+    ): Promise<{
+      id: string;
+      url: string;
+      mimeType: string;
+      size: number;
+      filename: string;
+      category: "image" | "file";
+    }> => {
       const token = getToken();
       const form = new FormData();
       form.append("file", file);
@@ -928,7 +940,7 @@ export const api = {
      */
     urlFor: (id: string): string => `${getBaseUrl()}/attachments/${id}`,
 
-    /** 删除一张附件。一般用于编辑器内显式删图 + 管理页。 */
+    /** 删除一份附件。一般用于编辑器内显式删除 + 管理页。 */
     remove: (id: string) =>
       request<{ success: boolean }>(`/attachments/${id}`, { method: "DELETE" }),
   },
