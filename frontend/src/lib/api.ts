@@ -1116,7 +1116,10 @@ export const api = {
       pageSize?: number;
     } = {}): Promise<FileListResponse> => {
       const qs = new URLSearchParams();
-      if (params.category && params.category !== "all") qs.set("category", params.category);
+      // 注意：FileCategory 已收窄为 "image" | "file"，不再含 "all"。
+      // 调用方（FileManager）自己维护 "all" | FileCategory 的 UI 过滤，
+      // 在传进来之前就会把 "all" 映射成 undefined，这里只需非空判断。
+      if (params.category) qs.set("category", params.category);
       if (params.mime) qs.set("mime", params.mime);
       if (params.notebookId) qs.set("notebookId", params.notebookId);
       if (params.q) qs.set("q", params.q);
