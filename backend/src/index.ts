@@ -17,6 +17,7 @@ import settingsRouter from "./routes/settings";
 import fontsRouter from "./routes/fonts";
 import attachmentsRouter, { handleDownloadAttachment } from "./routes/attachments";
 import taskAttachmentsRouter, { handleDownloadTaskAttachment } from "./routes/task-attachments";
+import filesRouter from "./routes/files";
 import micloudRouter from "./routes/micloud";
 import oppoCloudRouter from "./routes/oppocloud";
 import icloudRouter from "./routes/icloud";
