@@ -5,7 +5,7 @@ import {
   ChevronDown, PanelLeftClose, PanelLeft, ListTodo,
   Settings, LogOut, FilePlus, FolderPlus, Edit2, X, BrainCircuit,
   Bot, CalendarDays, Smile, GripVertical,
-  FolderInput, Check, Home, Download
+  FolderInput, Check, Home, Download, Inbox
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
