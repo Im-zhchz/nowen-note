@@ -653,6 +653,18 @@ export default forwardRef<NoteEditorHandle, TiptapEditorProps>(function TiptapEd
         codeBlock: false,
         code: false,
         heading: { levels: [1, 2, 3] },
+        // 链接：禁止点击自动打开（尤其是 mailto: / tel: 会唤起邮件/电话客户端
+        // 造成误触）。保留自动识别 URL、粘贴自动链接等能力；新窗口目标仍通过
+        // HTMLAttributes 指定，导出/分享页也沿用。
+        link: {
+          openOnClick: false,
+          autolink: true,
+          linkOnPaste: true,
+          HTMLAttributes: {
+            target: "_blank",
+            rel: "noopener noreferrer nofollow",
+          },
+        },
       }),
       Placeholder.configure({
         placeholder: t('tiptap.placeholder'),
@@ -698,7 +710,15 @@ export default forwardRef<NoteEditorHandle, TiptapEditorProps>(function TiptapEd
           return ReactNodeViewRenderer(ResizableImageView);
         },
       }).configure({
-        inline: false,
+        // inline: true —— 允许图片作为 inline 节点出现在 paragraph / listItem
+        // 内部，解决"在有序列表里插图后序号无法顺延"的问题：
+        //   若 inline:false，setImage 会把图片作为 block 插入 doc 顶层，
+        //   当前 listItem 被截断，后续新 li 在 OL 里等同新起一个 list，
+        //   视觉上表现为序号从 1 重新开始（或断开）。
+        // inline:true 后，图片直接以 <img> 形式留在当前 <li> 内，
+        // 列表结构完整保留，序号自然顺延。
+        // NodeView (ResizableImageView) 已用 display:inline-block，视觉兼容。
+        inline: true,
         allowBase64: true,
         HTMLAttributes: { class: "rounded-lg max-w-full mx-auto my-4 shadow-md" },
       }),
@@ -745,6 +765,44 @@ export default forwardRef<NoteEditorHandle, TiptapEditorProps>(function TiptapEd
     editorProps: {
       attributes: {
         class: "prose prose-sm max-w-none focus:outline-none min-h-[300px] px-1",
+      },
+      // 拦截 mailto: / tel: / sms: 链接的默认点击行为：
+      //   - 编辑态：虽然 Link 扩展已配置 openOnClick:false，但浏览器对
+      //     <a href="mailto:..."> 的原生点击仍可能被某些系统/浏览器拦截处理；
+      //     这里额外以 DOM 事件兜底，防止误触唤起邮件客户端。
+      //   - 只读态：extension-link 的 clickHandler 在 view.editable=false 时
+      //     直接 return false 放行浏览器默认行为，因此更需要在这里拦住。
+      // 其他协议（http/https、相对路径等）不处理，保持默认。
+      handleDOMEvents: {
+        click: (_view, event) => {
+          const target = event.target as HTMLElement | null;
+          const anchor = target?.closest?.("a") as HTMLAnchorElement | null;
+          if (!anchor) return false;
+          const href = anchor.getAttribute("href") || "";
+          if (/^(mailto:|tel:|sms:)/i.test(href)) {
+            event.preventDefault();
+            const plain = href.replace(/^(mailto:|tel:|sms:)/i, "").split("?")[0];
+            const label = /^mailto:/i.test(href)
+              ? "邮箱"
+              : /^tel:/i.test(href)
+              ? "电话"
+              : "号码";
+            try {
+              if (navigator.clipboard && window.isSecureContext) {
+                navigator.clipboard.writeText(plain).then(
+                  () => toast.success(`已复制${label}：${plain}`),
+                  () => toast.info(`${label}：${plain}`),
+                );
+              } else {
+                toast.info(`${label}：${plain}`);
+              }
+            } catch {
+              toast.info(`${label}：${plain}`);
+            }
+            return true;
+          }
+          return false;
+        },
       },
       // 在 heading / blockquote 等块级节点行首按 Backspace 时，
       // 统一把当前节点转为普通段落，避免某些导入/InputRule 后的
