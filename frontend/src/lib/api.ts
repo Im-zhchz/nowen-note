@@ -1090,6 +1090,74 @@ export const api = {
     urlFor: (id: string): string => `${getBaseUrl()}/diary/attachments/${id}`,
   },
 
+  // ========== Files（文件管理模块：统一查看/上传/删除附件资源）==========
+  //
+  // attachments 表承载编辑器里每一份二进制字节。文件管理模块是它的
+  // "聚合视图"——给用户一个图片/文件混排的浏览入口，并支持反向引用跳回
+  // 对应的笔记。为避免新增表/新增文件夹，后端直接从 attachments 聚合 +
+  // 扫描 notes.content 做反查；前端只要走下面这几个接口即可。
+  //
+  // 上传支持"无笔记归属"：后端会自动创建/复用一个 isArchived=1 的 holder
+  // note 兜底外键约束，用户看到的只是"未归档文件"。
+  //
+  files: {
+    /** 分类聚合统计。侧栏/顶栏展示"X 张图片 / Y 个文件"用。 */
+    stats: () => request<FileStats>("/files/stats"),
+
+    /** 分页列出文件。所有筛选字段可选；默认按 createdAt desc。 */
+    list: (params: {
+      category?: FileCategory;
+      mime?: string;
+      notebookId?: string;
+      q?: string;
+      sort?: FileSortKey;
+      order?: "asc" | "desc";
+      page?: number;
+      pageSize?: number;
+    } = {}): Promise<FileListResponse> => {
+      const qs = new URLSearchParams();
+      if (params.category && params.category !== "all") qs.set("category", params.category);
+      if (params.mime) qs.set("mime", params.mime);
+      if (params.notebookId) qs.set("notebookId", params.notebookId);
+      if (params.q) qs.set("q", params.q);
+      if (params.sort) qs.set("sort", params.sort);
+      if (params.order) qs.set("order", params.order);
+      if (typeof params.page === "number") qs.set("page", String(params.page));
+      if (typeof params.pageSize === "number") qs.set("pageSize", String(params.pageSize));
+      const s = qs.toString();
+      return request<FileListResponse>(`/files${s ? `?${s}` : ""}`);
+    },
+
+    /** 取单个文件详情，含反向引用的笔记列表。 */
+    get: (id: string) => request<FileDetail>(`/files/${id}`),
+
+    /** 删除单个附件（含磁盘文件）。会做 ACL 校验，被别的笔记引用也一并断链。 */
+    remove: (id: string) =>
+      request<{ success: boolean }>(`/files/${id}`, { method: "DELETE" }),
+
+    /**
+     * 上传一份文件到文件管理（无笔记归属时后端落到 holder note）。
+     * 用 FormData；不要手动设 Content-Type，交给浏览器注入 multipart boundary。
+     */
+    upload: async (file: File, opts: { noteId?: string; notebookId?: string } = {}): Promise<FileItem> => {
+      const token = getToken();
+      const form = new FormData();
+      form.append("file", file);
+      if (opts.noteId) form.append("noteId", opts.noteId);
+      if (opts.notebookId) form.append("notebookId", opts.notebookId);
+      const res = await fetch(`${getBaseUrl()}/files/upload`, {
+        method: "POST",
+        headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+        body: form,
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.error || `文件上传失败: ${res.status}`);
+      }
+      return res.json();
+    },
+  },
+
   // Shares (分享管理)
   createShare: (data: { noteId: string; permission?: string; password?: string; expiresAt?: string; maxViews?: number }) =>
     request<Share>("/shares", { method: "POST", body: JSON.stringify(data) }),
