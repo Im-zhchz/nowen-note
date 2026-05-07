@@ -750,7 +750,30 @@
       "testTitle": "Send test email",
       "testSend": "Send test",
       "testSuccess": "Test email sent to {{to}}: {{resp}}",
-      "testFailed": "Test failed: {{error}}"
+      "testFailed": "Test failed: {{error}}",
+
+      "guide": {
+        "title": "SMTP setup guide for common providers",
+        "subtitle": "QQ / 163 / Gmail / Outlook quick reference",
+        "intro": "Mainstream mailboxes no longer accept the regular login password for SMTP. You must first enable \"client auth code / app-specific password\" on the provider's site. The table below is a copy-ready reference; full click-by-click steps are in the linked docs.",
+        "colProvider": "Provider",
+        "colHost": "SMTP host",
+        "colPort": "Port",
+        "colTls": "Use TLS",
+        "colPass": "Password to use",
+        "tlsOn": "✅ Check (SSL)",
+        "tlsOff": "❌ Uncheck (STARTTLS)",
+        "tlsDepends": "Check for 465 / Uncheck for 587",
+        "passAuthCodeQQ": "16-char auth code generated via SMS in QQ Mail settings",
+        "passAuthCode163": "Auth code generated after enabling IMAP/SMTP in mailbox settings",
+        "passClientPass": "Client-specific password generated in the enterprise mail console",
+        "passAppPassword": "App Password generated after enabling 2-step verification",
+        "tipAuthCode": "Put the auth code / App Password in the password field, NOT your mailbox login password — otherwise you'll hit 535 Authentication Failed.",
+        "tipFromEqLogin": "The \"from email\" must equal the login account, otherwise Office 365 / Gmail will reject the mail (550 / 553).",
+        "tipPortTls": "Always check \"Use TLS\" for port 465; uncheck it for 587 (the server will upgrade via STARTTLS automatically).",
+        "tipAttachmentLimit": "Per-email attachment cap is 25MB. If your backup exceeds it, switch to \"create & send a new .bak snapshot\" or download it and send manually.",
+        "fullDocLink": "Open the full guide (GitHub docs: step-by-step for QQ / 163 / Gmail / Outlook, Chinese)"
+      }
     }
   },
   "tasks": {

@@ -757,7 +757,30 @@
       "testTitle": "发送测试邮件",
       "testSend": "发送测试",
       "testSuccess": "测试邮件已发送到 {{to}}：{{resp}}",
-      "testFailed": "测试失败：{{error}}"
+      "testFailed": "测试失败：{{error}}",
+
+      "guide": {
+        "title": "常见邮箱 SMTP 配置教程",
+        "subtitle": "QQ / 163 / Gmail / Outlook 速查",
+        "intro": "主流邮箱均不再支持直接用登录密码做 SMTP 认证，必须先在邮箱官网开启「客户端授权码 / 应用专用密码」。下表给出一键可抄的参数，完整点击路径见下方外链文档。",
+        "colProvider": "邮箱",
+        "colHost": "SMTP 服务器",
+        "colPort": "端口",
+        "colTls": "使用 TLS",
+        "colPass": "登录密码用什么",
+        "tlsOn": "✅ 勾选（SSL）",
+        "tlsOff": "❌ 不勾选（STARTTLS）",
+        "tlsDepends": "端口 465 勾选 / 587 不勾选",
+        "passAuthCodeQQ": "QQ 邮箱设置里发短信生成的 16 位授权码",
+        "passAuthCode163": "邮箱设置 → IMAP/SMTP 开启后生成的授权码",
+        "passClientPass": "企业邮箱后台生成的客户端专用密码",
+        "passAppPassword": "账户开启两步验证后生成的 App Password / 应用密码",
+        "tipAuthCode": "登录密码一栏填「授权码 / App Password」，绝不是邮箱登录密码；否则 99% 会 535 认证失败。",
+        "tipFromEqLogin": "发件人邮箱必须与登录账号相同，否则 Office 365 / Gmail 会拒收（550 / 553）。",
+        "tipPortTls": "端口 465 一定要勾「使用 TLS」；端口 587 请取消勾选，由 STARTTLS 自动升级为加密。",
+        "tipAttachmentLimit": "单封附件上限 25MB。若备份超限，请改选「新建并发送 .bak 数据库快照」或下载后手动发。",
+        "fullDocLink": "查看完整教程（GitHub 文档：QQ / 163 / Gmail / Outlook 逐家截屏步骤）"
+      }
     }
   },
   "tasks": {

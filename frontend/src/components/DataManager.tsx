@@ -7,6 +7,7 @@ import {
   Save, ShieldAlert, Clock, Server,
   Lock, Eye, EyeOff, X,
   Mail, Send, Settings as SettingsIcon, ChevronDown, ChevronRight,
+  BookOpen, ExternalLink,
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { exportAllNotes, ExportProgress } from "@/lib/exportService";
@@ -2888,6 +2889,131 @@ function BackupSendEmailDialog(props: {
 }
 
 // ============================================================================
+// SMTP 常见邮箱速查 / 教程入口（管理员）
+// ----------------------------------------------------------------------------
+// 为什么内置这块：
+//   - docs/backup-email-smtp.md 是完整文档，但"部署在内网 / 断网运维"的管理员
+//     点不到 GitHub；把最关键的速查表（主机/端口/TLS/密码来源）内联到前端，
+//     保证**不联网也能配通**常见的 QQ/163/Gmail/Outlook；
+//   - 同时给一个"查看完整教程"的外链（GitHub docs），能联网的用户一键跳走看
+//     详细点击路径、授权码生成步骤、故障排查；
+//   - 刻意做成默认折叠，避免老手每次看到一长串说明。
+// ============================================================================
+function SmtpProviderGuide() {
+  const { t, i18n } = useTranslation();
+  const [open, setOpen] = useState(false);
+
+  // 速查表按"中文环境优先本地邮箱，英文环境优先国际邮箱"的顺序排列，
+  // 让第一眼看到的就是当前用户最可能用的那家。
+  const zhFirst = i18n.language?.toLowerCase().startsWith("zh");
+  type Row = {
+    name: string;
+    host: string;
+    port: string;
+    tls: "on" | "off" | "465on-587off";
+    passNote: string; // 密码来源的一句话说明，已翻译
+  };
+  const cn: Row[] = [
+    { name: "QQ", host: "smtp.qq.com", port: "465", tls: "on", passNote: t("dataManager.smtp.guide.passAuthCodeQQ") },
+    { name: "163", host: "smtp.163.com", port: "465", tls: "on", passNote: t("dataManager.smtp.guide.passAuthCode163") },
+    { name: "126", host: "smtp.126.com", port: "465", tls: "on", passNote: t("dataManager.smtp.guide.passAuthCode163") },
+    { name: "exmail", host: "smtp.exmail.qq.com", port: "465", tls: "on", passNote: t("dataManager.smtp.guide.passClientPass") },
+  ];
+  const intl: Row[] = [
+    { name: "Gmail", host: "smtp.gmail.com", port: "465 / 587", tls: "465on-587off", passNote: t("dataManager.smtp.guide.passAppPassword") },
+    { name: "Outlook", host: "smtp.office365.com", port: "587", tls: "off", passNote: t("dataManager.smtp.guide.passAppPassword") },
+    { name: "Yahoo", host: "smtp.mail.yahoo.com", port: "465", tls: "on", passNote: t("dataManager.smtp.guide.passAppPassword") },
+  ];
+  const rows: Row[] = zhFirst ? [...cn, ...intl] : [...intl, ...cn];
+
+  const tlsLabel = (v: Row["tls"]) =>
+    v === "on"
+      ? t("dataManager.smtp.guide.tlsOn")
+      : v === "off"
+        ? t("dataManager.smtp.guide.tlsOff")
+        : t("dataManager.smtp.guide.tlsDepends");
+
+  const docUrl = "https://github.com/cropflre/nowen-note/blob/main/docs/backup-email-smtp.md";
+
+  return (
+    <div className="rounded-lg border border-sky-200/70 dark:border-sky-500/30 bg-sky-50/60 dark:bg-sky-500/5">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="w-full flex items-center gap-2 px-3 py-2 text-left"
+      >
+        {open ? (
+          <ChevronDown size={14} className="text-sky-600 dark:text-sky-400" />
+        ) : (
+          <ChevronRight size={14} className="text-sky-600 dark:text-sky-400" />
+        )}
+        <BookOpen size={14} className="text-sky-600 dark:text-sky-400" />
+        <span className="text-xs font-medium text-sky-800 dark:text-sky-200">
+          {t("dataManager.smtp.guide.title")}
+        </span>
+        <span className="ml-auto text-[11px] text-sky-700/70 dark:text-sky-300/70">
+          {t("dataManager.smtp.guide.subtitle")}
+        </span>
+      </button>
+
+      {open && (
+        <div className="px-3 pb-3 space-y-2.5">
+          {/* 顶部简述：先告诉用户"必须用授权码 / App Password" */}
+          <p className="text-[11px] leading-relaxed text-zinc-600 dark:text-zinc-400">
+            {t("dataManager.smtp.guide.intro")}
+          </p>
+
+          {/* 速查表 */}
+          <div className="overflow-x-auto rounded-md border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900/60">
+            <table className="w-full text-[11px]">
+              <thead className="bg-zinc-50 dark:bg-zinc-800/60 text-zinc-600 dark:text-zinc-400">
+                <tr>
+                  <th className="px-2 py-1.5 text-left font-medium">{t("dataManager.smtp.guide.colProvider")}</th>
+                  <th className="px-2 py-1.5 text-left font-medium">{t("dataManager.smtp.guide.colHost")}</th>
+                  <th className="px-2 py-1.5 text-left font-medium">{t("dataManager.smtp.guide.colPort")}</th>
+                  <th className="px-2 py-1.5 text-left font-medium">{t("dataManager.smtp.guide.colTls")}</th>
+                  <th className="px-2 py-1.5 text-left font-medium">{t("dataManager.smtp.guide.colPass")}</th>
+                </tr>
+              </thead>
+              <tbody className="text-zinc-700 dark:text-zinc-300">
+                {rows.map((r) => (
+                  <tr key={r.name} className="border-t border-zinc-100 dark:border-zinc-800">
+                    <td className="px-2 py-1.5 font-medium">{r.name}</td>
+                    <td className="px-2 py-1.5 font-mono">{r.host}</td>
+                    <td className="px-2 py-1.5 font-mono">{r.port}</td>
+                    <td className="px-2 py-1.5">{tlsLabel(r.tls)}</td>
+                    <td className="px-2 py-1.5">{r.passNote}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+          {/* 关键提醒 */}
+          <ul className="text-[11px] leading-relaxed text-zinc-600 dark:text-zinc-400 list-disc pl-4 space-y-0.5">
+            <li>{t("dataManager.smtp.guide.tipAuthCode")}</li>
+            <li>{t("dataManager.smtp.guide.tipFromEqLogin")}</li>
+            <li>{t("dataManager.smtp.guide.tipPortTls")}</li>
+            <li>{t("dataManager.smtp.guide.tipAttachmentLimit")}</li>
+          </ul>
+
+          {/* 外链：完整教程（需外网访问 GitHub） */}
+          <a
+            href={docUrl}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="inline-flex items-center gap-1.5 text-[11px] text-sky-700 dark:text-sky-300 hover:underline"
+          >
+            <ExternalLink size={12} />
+            {t("dataManager.smtp.guide.fullDocLink")}
+          </a>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ============================================================================
 // SMTP 邮件通道配置区（管理员）
 // ----------------------------------------------------------------------------
 // 设计要点：
@@ -3085,6 +3211,15 @@ function SmtpConfigSection(props: {
           <p className="text-xs text-zinc-500 dark:text-zinc-400 leading-relaxed">
             {t("dataManager.smtp.description")}
           </p>
+
+          {/* 常见邮箱 SMTP 配置教程入口
+              ——————————————————————————————————————————————
+              离线/内网环境：展开就能看到 QQ/163/Gmail/Outlook 的速查表与授权码要点，
+              无需联网也够用；有外网时还给一个指向 docs/backup-email-smtp.md 的
+              "完整教程"外链。刻意放在 description 下方、启用开关之上，
+              原则是"先教会，再让你配"，降低首次配置时的挫败感。 */}
+          <SmtpProviderGuide />
+
 
           {loading && !loaded ? (
             <div className="flex items-center gap-2 text-xs text-zinc-500 py-4 justify-center">
