@@ -527,6 +527,13 @@
   "dataManager": {
     "title": "数据管理",
     "description": "导入导出你的笔记数据，你的数据永远属于你自己",
+    "tabs": {
+      "export": "导出",
+      "import": "导入",
+      "database": "数据库",
+      "backup": "备份",
+      "danger": "危险区"
+    },
     "exportBackup": "导出备份",
     "exportDescription": "将所有笔记按笔记本分类导出为 Markdown 文件，打包成 ZIP 压缩包。含 YAML frontmatter 元数据，兼容 Obsidian、Typora 等工具。",
     "exporting": "正在导出...",

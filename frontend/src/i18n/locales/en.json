@@ -520,6 +520,13 @@
   "dataManager": {
     "title": "Data Management",
     "description": "Import and export your note data — your data belongs to you",
+    "tabs": {
+      "export": "Export",
+      "import": "Import",
+      "database": "Database",
+      "backup": "Backup",
+      "danger": "Danger Zone"
+    },
     "exportBackup": "Export Backup",
     "exportDescription": "Export all notes as Markdown files organized by notebooks into a ZIP archive. Includes YAML frontmatter metadata, compatible with Obsidian, Typora, etc.",
     "exporting": "Exporting...",

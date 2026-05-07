@@ -646,6 +646,7 @@ docker run -d \
 - 笔记本列表 & 笔记列表均支持右键操作
 
 #### 数据管理
+- **分区浏览**：设置页「数据管理」采用二级 Tab 分栏——导出 / 导入 / 数据库 / 备份 / 危险区，按需切换，避免一屏功能过长难以定位
 - **单笔记导出**：笔记列表右键支持导出为 Markdown / HTML / **PDF** / **SVG 图片**
   - PDF：Electron 桌面端走 `webContents.printToPDF` 直出**矢量 PDF**（文字可选、中文完美）；Web 端通过 `html2canvas + jsPDF` 动态加载并**直接下载 PDF 文件**（A4 自动分页、2x DPI），不再依赖系统打印对话框
   - SVG：把笔记包进 `<foreignObject>` 导出为矢量图，保留完整样式、无损缩放
@@ -1348,6 +1349,7 @@ All NAS platforms with Docker support follow the same general steps:
 - Available on both notebook tree and note list
 
 #### Data Management
+- **Sectioned layout**: The "Data Management" settings panel is organized into sub-tabs — Export / Import / Database / Backup / Danger Zone — so you can jump straight to what you need instead of scrolling through a long wall of features
 - **Single-note export**: Right-click on the note list to export as Markdown / HTML / **PDF** / **SVG image**
   - PDF: On Electron desktop, rendered through `webContents.printToPDF` for a true **vector PDF** (selectable text, perfect CJK rendering); on the Web, `html2canvas + jsPDF` are dynamically loaded to **download the PDF file directly** (A4 with auto pagination, 2x DPI), no system print dialog required
   - SVG: Wraps the note into an SVG `<foreignObject>` for a vector image with full styling preserved and lossless scaling

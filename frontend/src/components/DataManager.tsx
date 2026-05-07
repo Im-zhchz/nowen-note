@@ -25,6 +25,10 @@ export default function DataManager() {
   const { state } = useApp();
   const actions = useAppActions();
 
+  // 二级 Tab：把原本「一条长长的滚动页」拆成若干功能域，降低认知负担
+  type SubTab = "export" | "import" | "database" | "backup" | "danger";
+  const [activeSubTab, setActiveSubTab] = useState<SubTab>("export");
+
   // Export state
   const [exportProgress, setExportProgress] = useState<ExportProgress | null>(null);
   const [isExporting, setIsExporting] = useState(false);
@@ -194,12 +198,54 @@ export default function DataManager() {
     <div className="space-y-6">
       <div>
         <h3 className="text-lg font-bold text-zinc-900 dark:text-zinc-100 mb-1">{t('dataManager.title')}</h3>
-        <p className="text-sm text-zinc-500 dark:text-zinc-400 mb-6">
+        <p className="text-sm text-zinc-500 dark:text-zinc-400 mb-4">
           {t('dataManager.description')}
         </p>
+
+        {/* ===== 二级 Tab 切换 =====
+            功能分组过多时，一页顺序展示会拉出极长的滚动，新用户定位功能困难。
+            这里用"药丸式"二级 tab 把 5 个功能域（导出 / 导入 / 数据库 / 备份 / 危险区）
+            分开，点击切换；默认落在「导出」——最常用且相对安全。 */}
+        <div
+          role="tablist"
+          aria-label={t('dataManager.title')}
+          className="flex flex-wrap gap-1 p-1 rounded-lg bg-zinc-100/70 dark:bg-zinc-800/50 border border-zinc-200/60 dark:border-zinc-800"
+        >
+          {([
+            { id: "export",   icon: FolderDown,      label: t('dataManager.tabs.export'),   tone: "indigo"  },
+            { id: "import",   icon: FileUp,          label: t('dataManager.tabs.import'),   tone: "emerald" },
+            { id: "database", icon: Database,        label: t('dataManager.tabs.database'), tone: "sky"     },
+            { id: "backup",   icon: Save,            label: t('dataManager.tabs.backup'),   tone: "violet"  },
+            { id: "danger",   icon: AlertTriangle,   label: t('dataManager.tabs.danger'),   tone: "red"     },
+          ] as const).map((tab) => {
+            const active = activeSubTab === tab.id;
+            const Icon = tab.icon;
+            const activeToneClass =
+              tab.tone === "red"
+                ? "bg-white dark:bg-zinc-900 text-red-600 dark:text-red-400 shadow-sm"
+                : "bg-white dark:bg-zinc-900 text-zinc-900 dark:text-zinc-100 shadow-sm";
+            return (
+              <button
+                key={tab.id}
+                role="tab"
+                aria-selected={active}
+                onClick={() => setActiveSubTab(tab.id)}
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium transition-colors ${
+                  active
+                    ? activeToneClass
+                    : "text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100 hover:bg-white/60 dark:hover:bg-zinc-900/40"
+                }`}
+              >
+                <Icon size={14} className={active && tab.tone === "red" ? "text-red-500" : undefined} />
+                {tab.label}
+              </button>
+            );
+          })}
+        </div>
       </div>
 
       {/* ===== 导出区域 ===== */}
+      {activeSubTab === "export" && (
       <section>
         <div className="flex items-center gap-2 mb-3">
           <FolderDown size={18} className="text-indigo-500" />
@@ -287,8 +333,11 @@ export default function DataManager() {
           </button>
         </div>
       </section>
+      )}
 
-      {/* ===== 导入区域 ===== */}
+      {/* ===== 导入区域（含第三方导入入口） ===== */}
+      {activeSubTab === "import" && (
+      <>
       <section>
         <div className="flex items-center gap-2 mb-3">
           <FileUp size={18} className="text-emerald-500" />
@@ -519,14 +568,21 @@ export default function DataManager() {
 
       {/* ===== 有道云笔记导入 ===== */}
       <YoudaoImport />
+      </>
+      )}
 
       {/* ===== 数据库文件 (.data) 导出/导入/占用统计 ===== */}
+      {activeSubTab === "database" && (
       <DataFileSection />
+      )}
 
       {/* ===== 备份与灾备（B 系列） ===== */}
+      {activeSubTab === "backup" && (
       <BackupSection />
+      )}
 
       {/* ===== 危险区域 (Danger Zone) ===== */}
+      {activeSubTab === "danger" && (
       <section className="mt-8 pt-6 border-t-2 border-dashed border-red-300/50 dark:border-red-900/40">
         <div className="flex items-center gap-2 mb-2">
           <AlertTriangle size={18} className="text-red-500" />
@@ -653,6 +709,7 @@ export default function DataManager() {
           )}
         </AnimatePresence>
       </section>
+      )}
     </div>
   );
 }
