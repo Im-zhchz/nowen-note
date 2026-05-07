@@ -1150,6 +1150,7 @@ export default function Sidebar() {
     { icon: <ListTodo size={16} />, label: t('sidebar.tasks'), mode: "tasks", active: state.viewMode === "tasks" },
     { icon: <BrainCircuit size={16} />, label: t('sidebar.mindMaps'), mode: "mindmaps", active: state.viewMode === "mindmaps" },
     { icon: <Bot size={16} />, label: t('sidebar.aiChat'), mode: "ai-chat", active: state.viewMode === "ai-chat" },
+    { icon: <Inbox size={16} />, label: t('sidebar.fileManager'), mode: "files", active: state.viewMode === "files" },
 
     { icon: <Star size={16} />, label: t('sidebar.favorites'), mode: "favorites", active: state.viewMode === "favorites" },
     { icon: <Trash2 size={16} />, label: t('sidebar.trash'), mode: "trash", active: state.viewMode === "trash" },

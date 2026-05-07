@@ -378,6 +378,7 @@ app.route("/api/settings", settingsRouter);
 app.route("/api/fonts", fontsRouter);
 app.route("/api/attachments", attachmentsRouter);
 app.route("/api/task-attachments", taskAttachmentsRouter);
+app.route("/api/files", filesRouter);
 
 // 获取当前登录用户信息
 app.get("/api/me", (c) => {
