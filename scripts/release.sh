@@ -1289,6 +1289,35 @@ if [ "$HAS_PC" = "1" ]; then
 
     UNAME_S_PC="$(uname -s 2>/dev/null || echo unknown)"
 
+    # ---- 前置：确保 backend 依赖齐全 ----
+    # 背景：rebuild:native 只负责把原生模块从 Node ABI 切到 Electron ABI，
+    #   不会补装缺失的 npm 包；一旦 backend/node_modules 不完整（新机器 / 切过分支 /
+    #   手动删过 node_modules / lockfile 漂移），接下来 `npm run build:backend`
+    #   的 tsc 会直接 TS2307 "Cannot find module 'xxx'" 报错。
+    # 策略：检查几个关键依赖是否都存在；缺任何一个就在 backend/ 下跑一次 npm install。
+    # 覆盖：sqlite-vec（曾经因此失败过）、better-sqlite3、hono、jsonwebtoken。
+    if [ "$DRY_RUN" = "1" ]; then
+        echo "  (dry-run) 检查 backend/node_modules 关键依赖"
+    else
+        _BACKEND_DEPS_OK=1
+        if [ ! -d "${REPO_ROOT}/backend/node_modules" ]; then
+            _BACKEND_DEPS_OK=0
+        else
+            for _dep in sqlite-vec better-sqlite3 hono jsonwebtoken; do
+                if [ ! -d "${REPO_ROOT}/backend/node_modules/${_dep}" ]; then
+                    warn "backend 依赖缺失: ${_dep}"
+                    _BACKEND_DEPS_OK=0
+                fi
+            done
+        fi
+        if [ "$_BACKEND_DEPS_OK" = "0" ]; then
+            info "backend 依赖不完整，自动执行 ${C_GREEN}npm install${C_RESET}（避免 tsc TS2307 报错）"
+            ( cd "${REPO_ROOT}/backend" && run_argv npm install )
+        else
+            info "backend 依赖检查通过"
+        fi
+    fi
+
     # 统一先跑 rebuild:native + build:all（safe-build.mjs 内部也是这三步，这里拆开以便非 Windows 分支复用）
     if [ "$UNAME_S_PC" = "Linux" ] || [ "$UNAME_S_PC" = "Darwin" ]; then
         # 输出目录：在 Linux/macOS 上不做 tmpdir 切换，默认 dist-electron/
