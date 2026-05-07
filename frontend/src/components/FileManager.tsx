@@ -373,6 +373,41 @@ export default function FileManager() {
     }
   }, []);
 
+  // ---- 下载 ----
+  //
+  // 为什么不用 window.open / <a href> 直接打开 /api/attachments/<id>：
+  //   1. 图片、PDF 这类 MIME 浏览器会直接在当前 tab 里预览而不是下载；
+  //   2. 直接点 <a href download="x.png"> 在跨 origin 场景（App 客户端/独立前端域）
+  //      下 download 属性会被忽略，还是变成预览。
+  // 所以这里走 fetch → blob → createObjectURL → 临时 <a download> 触发，
+  // 兼容所有 MIME 且能保留用户上传时的原始 filename。
+  const [downloadingId, setDownloadingId] = useState<string | null>(null);
+  const downloadItem = useCallback(async (item: { id: string; filename: string; url: string }) => {
+    if (downloadingId === item.id) return;
+    setDownloadingId(item.id);
+    try {
+      const res = await fetch(resolveAttachmentUrl(item.url));
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const blob = await res.blob();
+      const objUrl = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = objUrl;
+      a.download = item.filename || `file-${item.id}`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      // 下一帧再 revoke，避免部分浏览器还没启动下载就被回收
+      setTimeout(() => URL.revokeObjectURL(objUrl), 1000);
+    } catch (err: any) {
+      console.error("[FileManager] download failed:", err);
+      toast.error(`下载失败: ${err?.message || "未知错误"}`);
+    } finally {
+      setDownloadingId((id) => (id === item.id ? null : id));
+    }
+  }, [downloadingId]);
+
+
+
   // 分页控件相关
   const pageCount = Math.max(1, Math.ceil(total / PAGE_SIZE));
 
@@ -531,7 +566,9 @@ export default function FileManager() {
                 items={items}
                 onOpen={openDetail}
                 onCopyUrl={copyUrl}
+                onDownload={downloadItem}
                 copiedId={copiedId}
+                downloadingId={downloadingId}
               />
             ) : (
               <ListView
@@ -539,7 +576,9 @@ export default function FileManager() {
                 onOpen={openDetail}
                 onCopyUrl={copyUrl}
                 onJumpToNote={jumpToNote}
+                onDownload={downloadItem}
                 copiedId={copiedId}
+                downloadingId={downloadingId}
               />
             )}
 
@@ -587,6 +626,8 @@ export default function FileManager() {
             onClose={closeDetail}
             onDelete={handleDelete}
             onJumpToNote={jumpToNote}
+            onDownload={downloadItem}
+            downloadingId={downloadingId}
           />
         )}
       </AnimatePresence>
@@ -627,12 +668,16 @@ function GridView({
   items,
   onOpen,
   onCopyUrl,
+  onDownload,
   copiedId,
+  downloadingId,
 }: {
   items: FileItem[];
   onOpen: (id: string) => void;
   onCopyUrl: (item: FileItem) => void;
+  onDownload: (item: FileItem) => void;
   copiedId: string | null;
+  downloadingId: string | null;
 }) {
   return (
     <div
@@ -640,7 +685,15 @@ function GridView({
       style={{ gridTemplateColumns: "repeat(auto-fill, minmax(140px, 1fr))" }}
     >
       {items.map((it) => (
-        <GridCard key={it.id} item={it} onOpen={onOpen} onCopyUrl={onCopyUrl} copiedId={copiedId} />
+        <GridCard
+          key={it.id}
+          item={it}
+          onOpen={onOpen}
+          onCopyUrl={onCopyUrl}
+          onDownload={onDownload}
+          copiedId={copiedId}
+          downloadingId={downloadingId}
+        />
       ))}
     </div>
   );
@@ -650,12 +703,16 @@ function GridCard({
   item,
   onOpen,
   onCopyUrl,
+  onDownload,
   copiedId,
+  downloadingId,
 }: {
   item: FileItem;
   onOpen: (id: string) => void;
   onCopyUrl: (item: FileItem) => void;
+  onDownload: (item: FileItem) => void;
   copiedId: string | null;
+  downloadingId: string | null;
 }) {
   const isImage = item.category === "image";
   return (
@@ -701,6 +758,17 @@ function GridCard({
       {/* hover 工具条 */}
       <div className="absolute top-1.5 right-1.5 flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
         <button
+          className="w-6 h-6 rounded-md bg-black/50 hover:bg-black/70 text-white flex items-center justify-center disabled:opacity-50"
+          onClick={(e) => {
+            e.stopPropagation();
+            onDownload(item);
+          }}
+          disabled={downloadingId === item.id}
+          title="下载"
+        >
+          {downloadingId === item.id ? <Loader2 size={12} className="animate-spin" /> : <Download size={12} />}
+        </button>
+        <button
           className="w-6 h-6 rounded-md bg-black/50 hover:bg-black/70 text-white flex items-center justify-center"
           onClick={(e) => {
             e.stopPropagation();
@@ -723,13 +791,17 @@ function ListView({
   onOpen,
   onCopyUrl,
   onJumpToNote,
+  onDownload,
   copiedId,
+  downloadingId,
 }: {
   items: FileItem[];
   onOpen: (id: string) => void;
   onCopyUrl: (item: FileItem) => void;
   onJumpToNote: (noteId: string) => void;
+  onDownload: (item: FileItem) => void;
   copiedId: string | null;
+  downloadingId: string | null;
 }) {
   return (
     <div className="rounded-lg border border-app-border bg-app-surface overflow-hidden">
@@ -742,7 +814,7 @@ function ListView({
             <th className="text-right font-normal px-3 py-2 w-20">大小</th>
             <th className="text-left font-normal px-3 py-2 hidden lg:table-cell w-40">来源笔记</th>
             <th className="text-left font-normal px-3 py-2 hidden sm:table-cell w-36">上传时间</th>
-            <th className="text-right font-normal px-3 py-2 w-20"></th>
+            <th className="text-right font-normal px-3 py-2 w-24"></th>
           </tr>
         </thead>
         <tbody>
@@ -788,16 +860,29 @@ function ListView({
               </td>
               <td className="px-3 py-2 text-tx-tertiary hidden sm:table-cell">{formatLocalTime(it.createdAt)}</td>
               <td className="px-3 py-2 text-right">
-                <button
-                  className="p-1 rounded hover:bg-app-hover text-tx-tertiary hover:text-tx-primary"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    onCopyUrl(it);
-                  }}
-                  title="复制链接"
-                >
-                  {copiedId === it.id ? <Check size={12} /> : <Copy size={12} />}
-                </button>
+                <div className="inline-flex items-center gap-0.5">
+                  <button
+                    className="p-1 rounded hover:bg-app-hover text-tx-tertiary hover:text-tx-primary disabled:opacity-50"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onDownload(it);
+                    }}
+                    disabled={downloadingId === it.id}
+                    title="下载"
+                  >
+                    {downloadingId === it.id ? <Loader2 size={12} className="animate-spin" /> : <Download size={12} />}
+                  </button>
+                  <button
+                    className="p-1 rounded hover:bg-app-hover text-tx-tertiary hover:text-tx-primary"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onCopyUrl(it);
+                    }}
+                    title="复制链接"
+                  >
+                    {copiedId === it.id ? <Check size={12} /> : <Copy size={12} />}
+                  </button>
+                </div>
               </td>
             </tr>
           ))}
@@ -816,12 +901,16 @@ function DetailDrawer({
   onClose,
   onDelete,
   onJumpToNote,
+  onDownload,
+  downloadingId,
 }: {
   detail: FileDetail | null;
   loading: boolean;
   onClose: () => void;
   onDelete: (id: string) => void;
   onJumpToNote: (noteId: string) => void;
+  onDownload: (item: { id: string; filename: string; url: string }) => void;
+  downloadingId: string | null;
 }) {
   return (
     <>
@@ -946,8 +1035,22 @@ function DetailDrawer({
                 )}
               </div>
 
-              {/* 删除按钮 */}
-              <div className="pt-3 border-t border-app-border">
+              {/* 操作按钮区：下载 + 删除 */}
+              <div className="pt-3 border-t border-app-border space-y-2">
+                <Button
+                  variant="default"
+                  size="sm"
+                  className="w-full"
+                  onClick={() => onDownload({ id: detail.id, filename: detail.filename, url: detail.url })}
+                  disabled={downloadingId === detail.id}
+                >
+                  {downloadingId === detail.id ? (
+                    <Loader2 size={14} className="mr-1 animate-spin" />
+                  ) : (
+                    <Download size={14} className="mr-1" />
+                  )}
+                  下载文件
+                </Button>
                 <Button
                   variant="outline"
                   size="sm"
