@@ -1710,6 +1710,67 @@ export const api = {
       }>("/backups", { method: "POST", body: JSON.stringify({ type, description }), sudoToken }),
 
     /**
+     * 导入外部备份文件（.bak / .zip）到当前实例的备份仓库（管理员 + sudo）。
+     *
+     * 典型场景：
+     *   - 管理员收到「发送到邮箱」的 .bak 附件，想在别的实例接上；
+     *   - 从 U盘 / 异机拷贝 nowen-backup-*.zip 过来。
+     *
+     * 导入本身不触及现网数据——文件只是被放进 backupDir 并补齐 meta.json。要真
+     * 正应用它，管理员还需要在列表里点「恢复」，走 dryRun 预览 + sudo 二次确认
+     * 的完整流程，与就地创建的备份完全同构。
+     *
+     * 约束（违反会返回 400）：
+     *   - 扩展名必须是 .bak / .zip；
+     *   - .bak 文件头必须是 SQLite；.zip 必须含 meta.json + db.sqlite；
+     *   - 单文件 ≤ 500MB（超限请用服务器文件系统拷贝到 backupDir）。
+     *
+     * 注意：本调用绕过 request() 通用封装，因为 Content-Type 需要让浏览器
+     * 自动带上 multipart boundary；错误同样以 Error 抛出（带 code / status）。
+     */
+    upload: async (
+      file: File,
+      sudoToken: string,
+      description?: string,
+    ): Promise<{
+      id: string;
+      filename: string;
+      size: number;
+      type: "full" | "db-only";
+      createdAt: string;
+      noteCount: number;
+      notebookCount: number;
+      checksum: string;
+      formatVersion: number;
+      schemaVersion: number;
+      description?: string;
+    }> => {
+      const token = getToken();
+      const form = new FormData();
+      form.append("file", file);
+      if (description) form.append("description", description);
+      const res = await fetch(`${getBaseUrl()}/backups/upload`, {
+        method: "POST",
+        headers: {
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+          "X-Sudo-Token": sudoToken,
+          // 注意：不要手动设 Content-Type，浏览器会自动加 boundary
+        },
+        body: form,
+      });
+      const body = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+      if (!res.ok) {
+        const err = new Error(
+          (body?.error as string) || `导入失败: ${res.status}`,
+        ) as Error & { code?: string; status?: number };
+        err.code = body?.code as string | undefined;
+        err.status = res.status;
+        throw err;
+      }
+      return body as Awaited<ReturnType<typeof api.backup.upload>>;
+    },
+
+    /**
      * 启停自动备份（管理员 + sudo）
      *
      * 后端会把 {enabled, intervalHours} 持久化到 system_settings.backup:auto，

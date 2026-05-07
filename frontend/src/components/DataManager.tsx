@@ -1384,6 +1384,13 @@ function BackupSection() {
   const [creating, setCreating] = useState<"db-only" | "full" | null>(null);
   const [createMsg, setCreateMsg] = useState<{ type: "ok" | "err"; text: string } | null>(null);
 
+  // 「导入外部 .bak/.zip」状态独立于 create：它不生成新备份，而是把用户硬盘上
+  // 的文件搬进 backupDir 再补 .meta.json。独立 importing 让按钮 loading 态
+  // 不会卡住"立即备份"那两个按钮，UI 上也能并行显示。
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const [importing, setImporting] = useState(false);
+  const [importMsg, setImportMsg] = useState<{ type: "ok" | "err"; text: string } | null>(null);
+
   // 当前用户角色/邮箱：
   //   - isAdmin 决定是否渲染「邮件通道（SMTP）」配置折叠区——SMTP 含凭证，非管理员看不到；
   //   - currentEmail 作为发邮件对话框的默认值，省去管理员手输，降低误发风险。
@@ -1505,6 +1512,53 @@ function BackupSection() {
       });
     } finally {
       setCreating(null);
+    }
+  };
+
+  /**
+   * 导入外部 .bak / .zip 备份到当前实例的备份仓库。
+   *
+   * 行为取舍：
+   *   - 上传成功后 **不自动进入恢复流程**，只是刷新列表让新备份显现 —— 恢复仍
+   *     要管理员自己在列表里点，走 dryRun 预览 + sudo 二次确认。理由是邮件
+   *     投递 / 跨机拷贝拿到的备份，管理员 80% 的情况下想先看"这份到底有多少
+   *     笔记 / 附件"再下决定，而不是一键覆盖当前库。
+   *   - 成功后把 input.value 清空，允许同一个文件重复选择（浏览器默认会静默
+   *     吞掉相同文件名的第二次 change）。
+   *   - 错误信息直接透传后端 error 字段，便于管理员看到"文件头校验失败 / 格式
+   *     版本过高"这类具体原因。
+   */
+  const handleImport = async (file: File) => {
+    setImporting(true);
+    setImportMsg(null);
+    try {
+      const out = await withSudo(
+        (tk) => api.backup.upload(file, tk),
+        askPassword,
+        sudoTokenRef.current,
+      );
+      if (!out) {
+        // 用户取消密码框
+        setImporting(false);
+        return;
+      }
+      sudoTokenRef.current = out.sudoToken;
+      setImportMsg({
+        type: "ok",
+        text: t("dataManager.backup.importSuccess", {
+          filename: out.result.filename,
+          size: fmtBytes(out.result.size),
+        }),
+      });
+      reload();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setImportMsg({
+        type: "err",
+        text: t("dataManager.backup.importFailed", { error: msg }),
+      });
+    } finally {
+      setImporting(false);
     }
   };
 
@@ -1817,6 +1871,13 @@ function BackupSection() {
           </div>
         )}
 
+        {importMsg && (
+          <div className={`text-xs flex items-start gap-1 ${importMsg.type === "ok" ? "text-green-600" : "text-red-500"}`}>
+            {importMsg.type === "ok" ? <CheckCircle size={12} className="mt-0.5" /> : <AlertCircle size={12} className="mt-0.5" />}
+            <span>{importMsg.text}</span>
+          </div>
+        )}
+
         {/* ===== 立即备份按钮 =====
             布局取舍：
               - 之前用 grid-cols-3 等宽，导致中文最长的"立即备份（仅数据库）"被强制换行，
@@ -1875,6 +1936,56 @@ function BackupSection() {
             <RefreshCw size={14} className={`mr-1.5 flex-shrink-0 ${loading ? "animate-spin" : ""}`} />
             {t("dataManager.backup.refresh")}
           </button>
+        </div>
+
+        {/* ===== 导入外部 .bak / .zip ===== 
+            —————————————————————————————————————————————————————————————————
+            场景：邮件投递回来的附件 / U盘异机拷贝 / 运维从别的实例搬过来。
+            
+            行为：仅上传 + 补 meta.json 入备份列表；不直接覆盖现网数据。用户上传
+            成功后，备份列表里会出现一条 `*-imported-*.bak|zip`，再由用户点击
+            旁边的「恢复」按钮走 dryRun 预览 + sudo 确认的常规路径。
+            
+            刻意与上面的"立即备份"放在同一区块下方而非放进顶部，是因为"导入"是
+            低频操作——默认视觉权重低于"就地创建备份"，避免首次看到的人被多个
+            并列按钮弄乱。 */}
+        <div className="flex items-center gap-2 pt-1">
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept=".bak,.zip,application/octet-stream,application/zip"
+            className="hidden"
+            onChange={(e) => {
+              const f = e.target.files?.[0];
+              // 清空 input，允许用户连续选同一个文件（默认浏览器会静默吞第二次 change）
+              e.target.value = "";
+              if (f) void handleImport(f);
+            }}
+          />
+          <button
+            onClick={() => fileInputRef.current?.click()}
+            disabled={importing || creating !== null}
+            className={`h-9 flex items-center justify-center px-3 rounded-lg font-medium text-sm whitespace-nowrap border transition-all ${
+              importing || creating !== null
+                ? "border-zinc-200 dark:border-zinc-700 text-zinc-400 cursor-not-allowed"
+                : "border-sky-300 dark:border-sky-600 text-sky-700 dark:text-sky-300 hover:bg-sky-50 dark:hover:bg-sky-500/10"
+            }`}
+          >
+            {importing ? (
+              <>
+                <Loader2 className="w-4 h-4 mr-1.5 animate-spin flex-shrink-0" />
+                <span className="truncate">{t("dataManager.backup.importing")}</span>
+              </>
+            ) : (
+              <>
+                <Upload className="w-4 h-4 mr-1.5 flex-shrink-0" />
+                <span className="truncate">{t("dataManager.backup.importBackup")}</span>
+              </>
+            )}
+          </button>
+          <span className="text-[11px] text-zinc-500 dark:text-zinc-400 leading-relaxed">
+            {t("dataManager.backup.importHint")}
+          </span>
         </div>
 
         {/* ===== 备份列表 ===== */}

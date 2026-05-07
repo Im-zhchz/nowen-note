@@ -6,6 +6,7 @@
  * - GET    /api/backups/dir                   — 当前备份目录 + 数据目录（管理员）
  * - POST   /api/backups/dir                   — 切换备份目录（管理员 + sudo；?dryRun=1 仅校验）
  * - POST   /api/backups                       — 创建备份（管理员 + sudo）
+ * - POST   /api/backups/upload                — 导入外部 .bak/.zip 备份（管理员 + sudo）
  * - GET    /api/backups/:filename/download    — 下载备份（管理员）
  * - POST   /api/backups/:filename/restore     — 从备份恢复（管理员 + sudo；支持 ?dryRun=1）
  * - DELETE /api/backups/:filename             — 删除备份（管理员 + sudo）
@@ -161,6 +162,58 @@ backupsRouter.post("/", async (c) => {
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     return c.json({ error: `备份失败: ${msg}` }, 500);
+  }
+});
+
+// ===== POST /api/backups/upload =====
+// multipart/form-data，字段名 "file"（可选 "description"）
+//
+// 用途：把"外部"备份文件（邮件附件回收、U盘拷贝、异机迁移）放进当前实例的备份
+// 列表。进去之后就能走既有的 dryRun 预览 → sudo 恢复的完整流程，与就地创建的
+// 备份完全同构。
+//
+// 刻意"只导入、不恢复"：上传这一步本身不触及现网数据，即便文件有问题也只是多
+// 一份坏备份躺在目录里，管理员下一步点"恢复"时仍有 dryRun 可以看预览 + 再确
+// 认。这与 /api/data-file/import 的"直接覆盖"是不同语义，不能合并。
+//
+// 安全：
+//   - 管理员 + sudo（备份文件含全库快照，写入会进入备份目录，强度与 create/delete 一致）；
+//   - 大小上限 500 MB：足以覆盖绝大多数实际备份，同时避免恶意巨大文件打爆磁盘；
+//   - 文件类型白名单 .bak / .zip（BackupManager.ingestUploadedBackup 内再做魔数校验）。
+backupsRouter.post("/upload", async (c) => {
+  const denied = requireBackupSudo(c);
+  if (denied) return denied;
+
+  let form: FormData;
+  try {
+    form = await c.req.formData();
+  } catch {
+    return c.json({ error: "请求必须是 multipart/form-data" }, 400);
+  }
+  const file = form.get("file");
+  if (!(file instanceof File)) {
+    return c.json({ error: "缺少 file 字段" }, 400);
+  }
+  if (file.size === 0) {
+    return c.json({ error: "上传文件为空" }, 400);
+  }
+  // 500 MB 上限。全量 .zip 可能偏大，比 SMTP 的 25MB 要宽很多。
+  if (file.size > 500 * 1024 * 1024) {
+    return c.json({ error: "文件过大（>500MB），请通过服务器文件系统拷贝" }, 413);
+  }
+
+  const description = (form.get("description") ?? "").toString().slice(0, 500) || undefined;
+  const bytes = Buffer.from(await file.arrayBuffer());
+
+  const manager = getBackupManager();
+  try {
+    const info = await manager.ingestUploadedBackup(file.name || "uploaded.bak", bytes, { description });
+    return c.json(info, 201);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    // 文件格式非法 → 400（客户端问题）；其他 → 500
+    const isFormatErr = /文件头|缺少|仅支持|格式|meta\.json|非法|损坏/.test(msg);
+    return c.json({ error: `导入失败: ${msg}` }, isFormatErr ? 400 : 500);
   }
 });
 

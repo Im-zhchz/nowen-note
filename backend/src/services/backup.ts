@@ -772,6 +772,160 @@ export class BackupManager {
   }
 
   /**
+   * 导入一份外部备份文件（管理员从邮件附件 / U盘 / 异机拷贝拿到的 .bak 或 .zip）
+   * 到 backupDir，补齐 .meta.json，让它与"就地创建的备份"完全同构——之后既能走
+   * listBackups() 列出，也能走 restoreFromBackup() 恢复，不需要任何二次处理。
+   *
+   * 与 /api/data-file/import（直接覆盖 DB 文件）的本质区别：
+   *   - 这里只是"把备份文件放进备份仓库"，**不触及现网数据**；是否覆盖 DB 由后续
+   *     用户点击"恢复"来决定，走 dryRun 预览 + sudo 再确认的老路径。这样"导入"
+   *     本身是安全的 —— 即便文件内容有问题，也只是多一份坏备份躺在那。
+   *   - 避免把"投递 + 覆盖"耦合成一步：邮件里拿到的 .bak 管理员往往想先接上看
+   *     预览（"将清空 N 行 / 插入 M 行"）再下决定，而不是一键灌库。
+   *
+   * 安全校验：
+   *   1. 扩展名必须是 .bak（SQLite 快照）或 .zip（full 全量包），其他一律拒收，
+   *      防止管理员顺手上传 pdf/docx 污染备份目录；
+   *   2. 文件大小不为 0（早筛空上传）；
+   *   3. 按扩展名做魔数校验：
+   *      - .bak → 前 16 字节必须是 "SQLite format 3\0"；
+   *      - .zip → 前 2 字节必须是 "PK"；
+   *      杜绝改扩展名绕过；
+   *   4. .zip 还会进一步解析 meta.json、比对 formatVersion / schemaVersion，
+   *      形式非法直接拒绝（与 restoreFromZip 的前置检查语义一致，避免无法恢复
+   *      的坏包进库）；
+   *   5. 生成的文件名固定为 `nowen-backup-<type>-imported-<ts>.<ext>`，
+   *      强制前缀"imported"让管理员在列表里一眼区分"这份是外部导入的"。
+   *
+   * 元信息：
+   *   - .bak：formatVersion=1（与 db-only 等同）；noteCount/notebookCount 会用
+   *     只读连接打开快照数一次，让列表 UI 的"N 条笔记"也能正常显示；
+   *   - .zip：meta.json 里的 schemaVersion / formatVersion 直接继承；noteCount
+   *     / notebookCount 取自 meta.tables.notes / meta.tables.notebooks（旧包没
+   *     这字段的用 0 占位）；
+   *   - checksum 重新计算 sha256（不信任外部来源）；
+   *   - description 默认带上"[imported] 原始文件名 xxx"，让管理员知道它是哪来的。
+   */
+  async ingestUploadedBackup(
+    originalFilename: string,
+    bytes: Buffer,
+    opts: { description?: string } = {},
+  ): Promise<BackupInfo> {
+    if (!bytes || bytes.length === 0) {
+      throw new Error("上传文件为空");
+    }
+
+    // —— 1. 扩展名校验
+    const safeName = path.basename(originalFilename || "").trim();
+    const extLower = path.extname(safeName).toLowerCase();
+    if (extLower !== ".bak" && extLower !== ".zip") {
+      throw new Error(`仅支持 .bak / .zip 格式的备份文件，收到：${extLower || "无扩展名"}`);
+    }
+
+    // —— 2. 魔数校验（杜绝改扩展名）
+    let type: "full" | "db-only";
+    let schemaVersion = getDbSchemaVersion();
+    let formatVersion = 1;
+    let noteCount = 0;
+    let notebookCount = 0;
+
+    if (extLower === ".bak") {
+      // SQLite 文件头固定前 16 字节 = "SQLite format 3\0"
+      const sqliteMagic = Buffer.from("SQLite format 3\u0000", "utf-8");
+      if (bytes.length < 16 || !bytes.slice(0, 16).equals(sqliteMagic)) {
+        throw new Error(".bak 文件不是合法的 SQLite 数据库（文件头校验失败）");
+      }
+      type = "db-only";
+      formatVersion = 1;
+
+      // 只读打开临时文件，数一下行数，让列表 UI 正常展示
+      const tmp = path.join(os.tmpdir(), `nowen-ingest-probe-${Date.now()}-${crypto.randomBytes(4).toString("hex")}.db`);
+      fs.writeFileSync(tmp, bytes);
+      try {
+        const Database = (await import("better-sqlite3")).default;
+        const probe = new Database(tmp, { readonly: true });
+        try {
+          // 有些 .bak 可能不是本项目 schema，表不存在时静默为 0，不阻塞导入
+          try {
+            noteCount = (probe.prepare("SELECT COUNT(*) as c FROM notes").get() as { c: number }).c;
+          } catch { noteCount = 0; }
+          try {
+            notebookCount = (probe.prepare("SELECT COUNT(*) as c FROM notebooks").get() as { c: number }).c;
+          } catch { notebookCount = 0; }
+        } finally {
+          probe.close();
+        }
+      } finally {
+        try { fs.unlinkSync(tmp); } catch { /* ignore */ }
+      }
+    } else {
+      // .zip：PK\x03\x04 前两字节必是 "PK"
+      if (bytes.length < 2 || bytes[0] !== 0x50 || bytes[1] !== 0x4b) {
+        throw new Error(".zip 文件头非法（不是合法的 ZIP 容器）");
+      }
+      type = "full";
+      // 解析 meta.json，拒绝无法恢复的坏包
+      const zip = await JSZip.loadAsync(bytes);
+      const metaFile = zip.file("meta.json");
+      if (!metaFile) {
+        throw new Error(".zip 内缺少 meta.json，非 nowen-note 全量备份格式");
+      }
+      const dbFile = zip.file("db.sqlite");
+      if (!dbFile) {
+        throw new Error(".zip 内缺少 db.sqlite，非 nowen-note 全量备份格式");
+      }
+      let meta: {
+        formatVersion?: number;
+        schemaVersion?: number;
+        tables?: Record<string, number>;
+      };
+      try {
+        meta = JSON.parse(await metaFile.async("string"));
+      } catch (e) {
+        throw new Error(`meta.json 解析失败：${e instanceof Error ? e.message : String(e)}`);
+      }
+      if (meta.formatVersion && meta.formatVersion > BACKUP_FORMAT_VERSION) {
+        throw new Error(
+          `备份格式版本 ${meta.formatVersion} 高于当前程序支持的 ${BACKUP_FORMAT_VERSION}，请升级到更新版本的 nowen-note 后再导入`,
+        );
+      }
+      formatVersion = meta.formatVersion ?? BACKUP_FORMAT_VERSION;
+      schemaVersion = meta.schemaVersion ?? schemaVersion;
+      noteCount = Number(meta.tables?.notes ?? 0) || 0;
+      notebookCount = Number(meta.tables?.notebooks ?? 0) || 0;
+    }
+
+    // —— 3. 落盘 + 生成 meta.json
+    this.ensureDir();
+    const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+    const destFilename = `nowen-backup-${type}-imported-${ts}${extLower}`;
+    const destPath = path.join(this.backupDir, destFilename);
+
+    fs.writeFileSync(destPath, bytes);
+
+    const checksum = crypto.createHash("sha256").update(bytes).digest("hex");
+    const info: BackupInfo = {
+      id: crypto.randomUUID(),
+      filename: destFilename,
+      size: bytes.length,
+      type,
+      createdAt: new Date().toISOString(),
+      noteCount,
+      notebookCount,
+      checksum,
+      formatVersion,
+      schemaVersion,
+      description:
+        opts.description?.toString().slice(0, 500) ||
+        `[imported] 原始文件：${safeName}`,
+    };
+    fs.writeFileSync(path.join(this.backupDir, `${destFilename}.meta.json`), JSON.stringify(info, null, 2), "utf-8");
+
+    console.log(`[Backup] 外部备份已导入：${destFilename}（size=${bytes.length}, type=${type}）`);
+    return info;
+  }
+
+  /**
    * 从备份恢复。
    *
    * - 兼容三种文件：
