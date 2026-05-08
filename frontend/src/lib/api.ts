@@ -1139,6 +1139,21 @@ export const api = {
       request<{ success: boolean }>(`/files/${id}`, { method: "DELETE" }),
 
     /**
+     * 批量删除附件（含磁盘文件）。
+     * 单次最多 200 个；后端逐项做 ACL，部分失败不影响其它项继续删。
+     * 返回值里的 failed[] 会列出被跳过的 id 与原因，前端按需提示。
+     */
+    batchRemove: (ids: string[]) =>
+      request<{
+        success: boolean;
+        deleted: number;
+        failed: Array<{ id: string; reason: string }>;
+      }>(`/files/batch-delete`, {
+        method: "POST",
+        body: JSON.stringify({ ids }),
+      }),
+
+    /**
      * 上传一份文件到文件管理（无笔记归属时后端落到 holder note）。
      * 用 FormData；不要手动设 Content-Type，交给浏览器注入 multipart boundary。
      */
