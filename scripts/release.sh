@@ -807,10 +807,22 @@ if [ "$HAS_FPK" = "1" ]; then
     [ -f "scripts/fpk/build-fpk.mjs" ] || die "未找到 scripts/fpk/build-fpk.mjs（飞牛 .fpk 打包脚本）"
     command -v node >/dev/null 2>&1 || die "未安装 node（fpk 打包脚本需要 node）"
 
-    # fnpack 二进制：build-fpk.mjs 内部会找 fnpack-* / FNPACK_BIN，校验只做友好提示
+    # fnpack 二进制：build-fpk.mjs 内部会找 fnpack-* / FNPACK_BIN
+    # 原子/一键全量发布下，必须前置 die，否则等所有构建跑完才在最后失败，浪费时间
     if [ -z "${FNPACK_BIN:-}" ] && \
        ! ls "${REPO_ROOT:-.}"/fnpack-* >/dev/null 2>&1 && \
        ! command -v fnpack >/dev/null 2>&1; then
+        if [ "${_ONE_SHOT:-0}" = "1" ] || [ "$ATOMIC_RELEASE" = "1" ]; then
+            die "未找到 fnpack 二进制（原子/一键全量发布要求 fpk 必须能打包）
+
+请放置 fnpack 可执行文件，三选一：
+  1) 放到项目根目录：${REPO_ROOT:-.}/fnpack 或 fnpack-<版本>-<os>-<arch>
+  2) 放到 PATH：sudo cp fnpack /usr/local/bin/ && sudo chmod +x /usr/local/bin/fnpack
+  3) 通过环境变量指定：export FNPACK_BIN=/path/to/fnpack
+
+Linux 版下载（飞牛官方）：https://www.fnnas.com/  → 开发者工具 → fnpack
+你当前仓库里只有 Windows 版（fnpack-1.2.1-windows-amd64），跑 Linux 打包用不了"
+        fi
         warn "未找到 fnpack 二进制（项目根目录的 fnpack-* / PATH 中的 fnpack / 环境变量 FNPACK_BIN）"
         warn "fpk 打包阶段会失败，请先放置 fnpack 可执行文件"
     fi
@@ -1797,56 +1809,11 @@ if [ "$HAS_ANDROID" = "1" ]; then
     ok "Android 打包完成，用时 ${ANDROID_BUILD_DURATION}s"
 fi
 
-# -------------------- 原子发布：统一推送 Docker 镜像 --------------------
-# 走到这里意味着所选目标（docker/pc/android）全部构建成功。
-# 现在才是真正"把东西发出去"的时候：先 docker push，再 git tag push，再 gh release。
-# 任何一步失败 set -e 会立即 die，后续不再继续。
-if [ "$SHOULD_BUILD_DOCKER" = "1" ] && [ "$ATOMIC_RELEASE" = "1" ]; then
-    step "统一推送 Docker 镜像（原子发布：所有构建已完成）"
-    PUSH_START=$(date +%s)
-
-    case "$ARCH" in
-        multi)
-            # 第二次跑 buildx --push：第一次的层已经在 buildx 缓存里，绝大部分是秒过
-            info "buildx 重新执行 --push（利用第一次构建的缓存）"
-            ensure_buildx_builder
-            PUSH_CMD=(
-                docker buildx build
-                --platform linux/amd64,linux/arm64
-                -f "$REPO_ROOT/Dockerfile"
-                "${BUILD_TAGS[@]}"
-                "${OCI_LABELS[@]}"
-                --push
-                "$REPO_ROOT"
-            )
-            echo "  ${PUSH_CMD[*]}"
-            run_argv "${PUSH_CMD[@]}"
-            ;;
-        amd64|arm64)
-            info "推送：${IMAGE_NAME}:${VERSION_TAG}"
-            run "docker push \"${IMAGE_NAME}:${VERSION_TAG}\""
-            if [ "$DO_LATEST" = "1" ]; then
-                info "推送：${IMAGE_NAME}:latest"
-                run "docker push \"${IMAGE_NAME}:latest\""
-            fi
-            ;;
-    esac
-
-    PUSH_END=$(date +%s)
-    PUSH_DURATION=$((PUSH_END - PUSH_START))
-
-    # 现在本地已有镜像（或 multi push 成功），可以取 digest 了
-    if [ "$DRY_RUN" != "1" ] && [ "$ARCH" != "multi" ]; then
-        DIGEST="$(docker inspect --format='{{index .RepoDigests 0}}' "${IMAGE_NAME}:${VERSION_TAG}" 2>/dev/null || echo "")"
-    fi
-    ok "Docker 镜像推送完成，用时 ${PUSH_DURATION}s"
-fi
-
-# -------------------- 飞牛 .fpk 打包 --------------------
-# 必须在 docker push 之后执行：fpk 内的 compose 引用 dockerhub 镜像，
-# 用户从飞牛 NAS 安装时会自动拉取对应 tag。镜像不在 dockerhub 上 = 安装阶段失败。
-# 即便用户没勾 docker target（仅 --target fpk），也认为镜像已经发过；
-# 单独 fpk 模式适合"补打 fpk"场景。
+# -------------------- 飞牛 .fpk 打包（原子发布：在 docker push 之前） --------------------
+# 设计要点：fpk 本地打包仅生成 compose.yml 引用 DockerHub 镜像名，
+# 不依赖镜像已经推到 DockerHub（运行时用户的 NAS 才会去 docker pull）。
+# 所以 fpk 必须在 docker push 之前完成 —— 任何一端构建失败时，docker 还没推，
+# 真正满足"全部成功才推送"的原子语义。
 FPK_ARTIFACTS=()
 FPK_BUILD_DURATION=0
 if [ "$HAS_FPK" = "1" ]; then
@@ -1891,6 +1858,51 @@ if [ "$HAS_FPK" = "1" ]; then
     FPK_END=$(date +%s)
     FPK_BUILD_DURATION=$((FPK_END - FPK_START))
     ok "飞牛 .fpk 打包完成，用时 ${FPK_BUILD_DURATION}s"
+fi
+
+# -------------------- 原子发布：统一推送 Docker 镜像 --------------------
+# 走到这里意味着所选目标（docker/pc/android/fpk）全部构建成功。
+# 现在才是真正"把东西发出去"的时候：先 docker push，再 git tag push，再 gh release。
+# 任何一步失败 set -e 会立即 die，后续不再继续。
+if [ "$SHOULD_BUILD_DOCKER" = "1" ] && [ "$ATOMIC_RELEASE" = "1" ]; then
+    step "统一推送 Docker 镜像（原子发布：所有构建已完成）"
+    PUSH_START=$(date +%s)
+
+    case "$ARCH" in
+        multi)
+            # 第二次跑 buildx --push：第一次的层已经在 buildx 缓存里，绝大部分是秒过
+            info "buildx 重新执行 --push（利用第一次构建的缓存）"
+            ensure_buildx_builder
+            PUSH_CMD=(
+                docker buildx build
+                --platform linux/amd64,linux/arm64
+                -f "$REPO_ROOT/Dockerfile"
+                "${BUILD_TAGS[@]}"
+                "${OCI_LABELS[@]}"
+                --push
+                "$REPO_ROOT"
+            )
+            echo "  ${PUSH_CMD[*]}"
+            run_argv "${PUSH_CMD[@]}"
+            ;;
+        amd64|arm64)
+            info "推送：${IMAGE_NAME}:${VERSION_TAG}"
+            run "docker push \"${IMAGE_NAME}:${VERSION_TAG}\""
+            if [ "$DO_LATEST" = "1" ]; then
+                info "推送：${IMAGE_NAME}:latest"
+                run "docker push \"${IMAGE_NAME}:latest\""
+            fi
+            ;;
+    esac
+
+    PUSH_END=$(date +%s)
+    PUSH_DURATION=$((PUSH_END - PUSH_START))
+
+    # 现在本地已有镜像（或 multi push 成功），可以取 digest 了
+    if [ "$DRY_RUN" != "1" ] && [ "$ARCH" != "multi" ]; then
+        DIGEST="$(docker inspect --format='{{index .RepoDigests 0}}' "${IMAGE_NAME}:${VERSION_TAG}" 2>/dev/null || echo "")"
+    fi
+    ok "Docker 镜像推送完成，用时 ${PUSH_DURATION}s"
 fi
 
 
