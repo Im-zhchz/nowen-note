@@ -97,8 +97,41 @@ try {
 function findFnpack() {
     const env = process.env.FNPACK_BIN;
     if (env && existsSync(env)) return env;
+
+    // 优先匹配项目根目录里 fnpack-* 形式的文件（适配多版本/多平台命名，
+    // 比如 fnpack-1.2.1-windows-amd64 / fnpack-1.2.1-linux-amd64 / fnpack-1.2.1-linux-arm64）
+    // 优先用与当前平台/架构匹配的，找不到就退回任意 fnpack-*
+    try {
+        const entries = readdirSync(PROJECT_ROOT)
+            .filter((f) => f.toLowerCase().startsWith('fnpack'));
+
+        const platform = process.platform; // 'win32' | 'linux' | 'darwin'
+        const arch = process.arch;          // 'x64' | 'arm64'
+        const platTag = platform === 'win32' ? 'windows'
+                      : platform === 'darwin' ? 'darwin'
+                      : 'linux';
+        const archTag = arch === 'x64' ? 'amd64' : arch;
+
+        // 第一优先：完全匹配当前平台 + 架构
+        const exact = entries.find((f) => {
+            const lf = f.toLowerCase();
+            return lf.includes(platTag) && lf.includes(archTag);
+        });
+        if (exact) return join(PROJECT_ROOT, exact);
+
+        // 第二优先：仅平台匹配
+        const platMatch = entries.find((f) => f.toLowerCase().includes(platTag));
+        if (platMatch) return join(PROJECT_ROOT, platMatch);
+
+        // 第三：任何 fnpack-* 文件
+        const anyFnpack = entries.find((f) => /^fnpack[-.]/i.test(f));
+        if (anyFnpack) return join(PROJECT_ROOT, anyFnpack);
+    } catch (_) {
+        // ignore
+    }
+
+    // 最后退回写死的几个固定名（向后兼容）
     const candidates = [
-        join(PROJECT_ROOT, 'fnpack-1.2.1-windows-amd64'),
         join(PROJECT_ROOT, 'fnpack.exe'),
         join(PROJECT_ROOT, 'fnpack'),
     ];
