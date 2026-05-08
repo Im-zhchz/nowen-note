@@ -790,7 +790,14 @@ if [ "$HAS_ANDROID" = "1" ]; then
     fi
 
     if [ ! -f "frontend/android/keystore.properties" ] && [ -z "${NOWEN_ANDROID_KEYSTORE_B64:-}" ]; then
-        warn "未找到 frontend/android/keystore.properties 且未设 NOWEN_ANDROID_KEYSTORE_B64，APK 将不会被签名（只能用于调试）"
+        # 一键全量发布（_ONE_SHOT=1）或原子发布模式下，未签名 APK 等于不可用产物
+        # （Android 同包名不同签名 = 用户必须卸载老版才能装新版，等于发了个废包）
+        # 直接 die，不让它走到 GitHub Release 给用户造成升级灾难
+        if [ "${_ONE_SHOT:-0}" = "1" ] || [ "$ATOMIC_RELEASE" = "1" ]; then
+            die "未找到 frontend/android/keystore.properties 且未设 NOWEN_ANDROID_KEYSTORE_B64：原子/一键全量发布要求签名 APK，请配置后重试（参考 docs/android-signing.md）"
+        else
+            warn "未找到 frontend/android/keystore.properties 且未设 NOWEN_ANDROID_KEYSTORE_B64，APK 将不会被签名（只能用于调试）"
+        fi
     fi
     command -v node >/dev/null 2>&1 || die "未安装 node（Android 端打包需要先跑 vite build + cap sync）"
 fi
@@ -1488,10 +1495,30 @@ if [ "$HAS_PC" = "1" ]; then
         else
             # 临时关闭 publish（避免 electron-builder 自动推 GitHub；我们自己用 gh release 上传）
             # --publish never 是 CLI 标准开关，-c.publish=never 在 25.x 会被当成非法 provider
+            #
+            # 这里特意临时关掉 set -e 跑 electron-builder，捕获退出码后再决定怎么报错：
+            # - electron-builder 在 Linux 上跑 win 目标时常见失败：wine 跑 rcedit 被 OOM-kill (signal: killed)
+            # - 直接 set -e die 出来用户只看到一串 builder 日志，不知道根因
+            # 这里失败就主动 die，并附上常见原因提示，原子发布时更友好
+            set +e
             ( cd "$REPO_ROOT" && run_argv npx electron-builder \
                 --config electron/builder.config.js \
                 --publish never \
                 "${EB_PLATFORM_ARGS[@]}" )
+            _EB_EXIT=$?
+            set -e
+            if [ "$_EB_EXIT" != "0" ]; then
+                echo
+                warn "electron-builder 退出码 $_EB_EXIT"
+                if [ "$PC_HAS_WIN" = "1" ] && [ "$UNAME_S_PC" = "Linux" ]; then
+                    warn "你正在 Linux 下打 Windows 目标，常见失败原因："
+                    warn "  1) wine 跑 rcedit 被 OOM-kill (signal: killed) → 给 WSL2 加内存：%UserProfile%\\.wslconfig 设 memory=12GB swap=8GB，再 wsl --shutdown"
+                    warn "  2) wine 32 位子系统未装 → sudo dpkg --add-architecture i386 && sudo apt install -y wine32:i386 && wineboot -i"
+                    warn "  3) winCodeSign 下载被墙 → 设 NOWEN_SKIP_RCEDIT=1 跳过 rcedit/签名（产物可用，仅缺 exe 元信息）"
+                    warn "  4) 想绕过 PC 段：删掉 win 目标 → ./release.sh --pc-platform linux"
+                fi
+                die "PC 端打包失败（原子发布：未推送任何东西）"
+            fi
         fi
     else
         # Windows 宿主：沿用 safe-build.mjs（只会出 win 目标，这里忽略用户 --pc-platform 里的 linux/mac）
@@ -1751,6 +1778,11 @@ if [ "$HAS_ANDROID" = "1" ]; then
             # 未签名 APK
             APK_UNSIGNED="${REPO_ROOT}/frontend/android/app/build/outputs/apk/release/app-release-unsigned.apk"
             if [ -f "$APK_UNSIGNED" ]; then
+                # 原子/一键全量发布：未签名 APK = 不可发布（同包名换签名会让所有老用户必须卸载重装）
+                # 必须 die，不能让未签名包混进 GitHub Release
+                if [ "${_ONE_SHOT:-0}" = "1" ] || [ "$ATOMIC_RELEASE" = "1" ]; then
+                    die "Android 打包产出的是未签名 APK ($APK_UNSIGNED)：原子/一键全量发布要求签名 APK，请检查 frontend/android/keystore.properties 或 NOWEN_ANDROID_KEYSTORE_B64 配置"
+                fi
                 warn "只找到未签名 APK: $APK_UNSIGNED"
                 warn "检查 frontend/android/keystore.properties 或 NOWEN_ANDROID_KEYSTORE_B64 是否配置正确"
                 ANDROID_ARTIFACTS+=( "$APK_UNSIGNED" )
@@ -1840,7 +1872,20 @@ if [ "$HAS_FPK" = "1" ]; then
         for f in "${FPK_ARTIFACTS[@]}"; do
             echo "    - $(basename "$f")"
         done
-        [ "${#FPK_ARTIFACTS[@]}" -eq 0 ] && warn "未找到任何 .fpk 产物（请检查 build-fpk.mjs 输出）"
+        [ "${#FPK_ARTIFACTS[@]}" -eq 0 ] && {
+            # 原子/一键全量发布：build-fpk.mjs 退出码可能是 0 但产物为空（脚本内部容错过度）
+            # 这种情况绝不能往下走 GitHub Release
+            if [ "${_ONE_SHOT:-0}" = "1" ] || [ "$ATOMIC_RELEASE" = "1" ]; then
+                die "未找到任何 .fpk 产物：原子/一键全量发布要求 fpk 构建必须有产物，请检查 build-fpk.mjs 输出"
+            fi
+            warn "未找到任何 .fpk 产物（请检查 build-fpk.mjs 输出）"
+        }
+    elif [ "$DRY_RUN" != "1" ]; then
+        # dist-fpk 目录都不存在 = build-fpk.mjs 没产任何东西
+        if [ "${_ONE_SHOT:-0}" = "1" ] || [ "$ATOMIC_RELEASE" = "1" ]; then
+            die "fpk 输出目录 $FPK_OUT 不存在：原子/一键全量发布要求 fpk 构建成功，请检查 build-fpk.mjs"
+        fi
+        warn "fpk 输出目录 $FPK_OUT 不存在"
     fi
 
     FPK_END=$(date +%s)
