@@ -1,6 +1,6 @@
 {
   "name": "nowen-note",
-  "version": "1.0.26",
+  "version": "1.0.28",
   "description": "Nowen Note - A modern note-taking application",
   "author": "Nowen",
   "private": true,
@@ -20,7 +20,8 @@
     "build:backend": "cd backend && npm run build",
     "build:all": "npm run build:backend && npm run build:frontend",
     "zip": "node scripts/export-zip.mjs",
-    "zip:jszip": "node scripts/export-zip-jszip.mjs"
+    "zip:jszip": "node scripts/export-zip-jszip.mjs",
+    "fpk": "node scripts/fpk/build-fpk.mjs"
   },
   "devDependencies": {
     "@capacitor/android": "^8.2.0",
