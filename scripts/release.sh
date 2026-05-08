@@ -840,11 +840,74 @@ if [ "$BUILD_ONLY" != "1" ]; then
         ok "工作区已自动恢复干净"
     fi
 
-    # -------------------- git pull --------------------
+    # -------------------- git pull（智能同步）--------------------
+    # 不再用裸 git pull --ff-only：在多机协作（开发机 + NAS）场景下
+    # 经常出现 diverged，硬 ff 会直接 fatal 退出。
+    # 这里改为先 fetch 再判断 ahead/behind：
+    #   - 同步         : 跳过
+    #   - 落后         : ff-merge 拉取
+    #   - 领先         : 提示，跳过（push 阶段会一起推）
+    #   - diverged    : 交互问 rebase / merge / abort；-y 时默认 rebase
     if [ "$DO_PULL" = "1" ]; then
-        info "git pull --ff-only origin $CURRENT_BRANCH ..."
-        run "git pull --ff-only origin \"$CURRENT_BRANCH\""
-        ok "代码已是最新：$(git log -1 --pretty=format:'%h  %s')"
+        info "git fetch origin $CURRENT_BRANCH ..."
+        run "git fetch origin \"$CURRENT_BRANCH\""
+
+        _LR="$(git rev-list --left-right --count "HEAD...origin/$CURRENT_BRANCH" 2>/dev/null || echo "0	0")"
+        _AHEAD="$(echo "$_LR" | awk '{print $1}')"
+        _BEHIND="$(echo "$_LR" | awk '{print $2}')"
+        info "本地相对 origin/$CURRENT_BRANCH：ahead=${_AHEAD}, behind=${_BEHIND}"
+
+        if [ "$_AHEAD" = "0" ] && [ "$_BEHIND" = "0" ]; then
+            ok "代码已是最新：$(git log -1 --pretty=format:'%h  %s')"
+        elif [ "$_AHEAD" = "0" ] && [ "$_BEHIND" != "0" ]; then
+            info "本地落后 ${_BEHIND} 个 commit，执行 fast-forward ..."
+            run "git merge --ff-only \"origin/$CURRENT_BRANCH\""
+            ok "已快进到：$(git log -1 --pretty=format:'%h  %s')"
+        elif [ "$_AHEAD" != "0" ] && [ "$_BEHIND" = "0" ]; then
+            warn "本地领先 ${_AHEAD} 个 commit，远端无新提交"
+            info "跳过 pull；这些本地 commit 会在发布完成时一并推送"
+        else
+            warn "本地与远端 diverged：本地领先 ${_AHEAD}，远端领先 ${_BEHIND}"
+            echo "  本地独有 commit："
+            git --no-pager log --oneline "origin/$CURRENT_BRANCH..HEAD" | head -10 | sed 's/^/    /'
+            echo "  远端独有 commit："
+            git --no-pager log --oneline "HEAD..origin/$CURRENT_BRANCH" | head -10 | sed 's/^/    /'
+
+            _MERGE_CHOICE=""
+            if [ "$ASSUME_YES" = "1" ]; then
+                _MERGE_CHOICE="rebase"
+                info "非交互模式（-y）→ 默认采用 ${C_GREEN}rebase${C_RESET} 策略"
+            else
+                echo
+                echo "  请选择处理方式："
+                echo "    ${C_CYAN}1${C_RESET}) rebase  把本地 commit 重放到远端最新（推荐，历史最干净）"
+                echo "    ${C_CYAN}2${C_RESET}) merge   生成一个 merge commit"
+                echo "    ${C_CYAN}3${C_RESET}) abort   终止，留给你手动处理"
+                read -r -p "  请输入 [1-3]（默认 1）: " _mc
+                _mc="${_mc:-1}"
+                case "$_mc" in
+                    1) _MERGE_CHOICE="rebase" ;;
+                    2) _MERGE_CHOICE="merge" ;;
+                    3) die "用户选择 abort，已取消发布" ;;
+                    *) die "无效选择: $_mc" ;;
+                esac
+            fi
+
+            if [ "$_MERGE_CHOICE" = "rebase" ]; then
+                info "git rebase origin/$CURRENT_BRANCH ..."
+                if ! git rebase "origin/$CURRENT_BRANCH"; then
+                    git rebase --abort >/dev/null 2>&1 || true
+                    die "rebase 出现冲突，已自动 abort。请手动 'git rebase origin/$CURRENT_BRANCH' 解决冲突后重跑。"
+                fi
+            else
+                info "git merge --no-ff origin/$CURRENT_BRANCH ..."
+                if ! git merge --no-ff --no-edit "origin/$CURRENT_BRANCH"; then
+                    git merge --abort >/dev/null 2>&1 || true
+                    die "merge 出现冲突，已自动 abort。请手动解决后重跑。"
+                fi
+            fi
+            ok "同步完成：$(git log -1 --pretty=format:'%h  %s')"
+        fi
     else
         info "跳过 git pull（--no-pull）"
     fi
