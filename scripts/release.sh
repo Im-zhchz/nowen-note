@@ -88,9 +88,9 @@ DO_TAR=0               # --tar，仅在 build-only + arm64 下
 TAR_OUT="$DEFAULT_TAR_OUT"
 DO_PUSH_CUSTOM=0       # --push，仅在 build-only + 自定义 image 下
 
-# ===== 多端发版（PC / Android / Docker / GitHub Releases） =====
-# TARGETS 用逗号分隔的集合：docker / pc / android / all
-# 默认 docker（向后兼容旧行为）；all = docker,pc,android
+# ===== 多端发版（PC / Android / Docker / GitHub Releases / 飞牛 .fpk） =====
+# TARGETS 用逗号分隔的集合：docker / pc / android / fpk / all
+# 默认 docker（向后兼容旧行为）；all = docker,pc,android,fpk
 TARGETS="docker"
 TARGETS_EXPLICIT=0     # 用户是否通过 --target 显式指定了
 DO_GITHUB_RELEASE=0    # --github-release：把 PC/Android 产物上传到 GitHub Release（自动打 tag）
@@ -131,6 +131,11 @@ RESTORE_BACKEND_ABI=0                                    # --restore-backend-abi
 ATOMIC_RELEASE=-1              # -1=未指定（由目标组合自动推断）；0=关；1=开
 ATOMIC_RELEASE_EXPLICIT=0      # 用户通过 --atomic/--no-atomic 显式设置
 
+# ===== 飞牛 .fpk 打包 =====
+# 复用 scripts/fpk/build-fpk.mjs。镜像地址默认与 DEFAULT_IMAGE_NAME 保持一致，
+# 也可通过 --fpk-dockerhub-repo 或环境变量 DOCKERHUB_REPO 覆盖。
+FPK_DOCKERHUB_REPO=""           # --fpk-dockerhub-repo
+
 usage() {
     cat <<EOF
 用法: $0 [选项]
@@ -148,8 +153,10 @@ usage() {
       --no-git-tag         不打 git tag / 不推送到 GitHub
 
 多端发版选项（可组合）:
-      --target TARGETS     逗号分隔：docker / pc / android / all
-                           默认 docker；示例：--target pc,android
+      --target TARGETS     逗号分隔：docker / pc / android / fpk / all
+                           默认 docker；示例：--target pc,android,fpk
+      --fpk-dockerhub-repo USER/REPO
+                           飞牛 .fpk 引用的 dockerhub 镜像（默认取 cropflre/nowen-note）
       --pc-platform LIST   PC 端要打的平台，逗号分隔：win / linux / mac
                            默认：Linux 宿主 => win,linux；macOS => mac,linux；Windows => win
                            在 Debian 上打 Windows exe 需要 wine64 + mono（首次 apt install 一次）
@@ -254,6 +261,7 @@ while [ $# -gt 0 ]; do
         --prerelease)   RELEASE_PRERELEASE=1; shift ;;
         --atomic)       ATOMIC_RELEASE=1; ATOMIC_RELEASE_EXPLICIT=1; shift ;;
         --no-atomic)    ATOMIC_RELEASE=0; ATOMIC_RELEASE_EXPLICIT=1; shift ;;
+        --fpk-dockerhub-repo) FPK_DOCKERHUB_REPO="${2:-}"; shift 2 ;;
         -h|--help)      usage ;;
         *)              die "未知参数: $1（使用 -h 查看帮助）" ;;
     esac
@@ -276,10 +284,11 @@ if [ "$TARGETS_EXPLICIT" = "0" ] && [ "$BUILD_ONLY" = "0" ] && [ "$ASSUME_YES" =
     echo "  ${C_CYAN}2${C_RESET})  PC 客户端                 打包 exe / AppImage / deb / dmg"
     echo "  ${C_CYAN}3${C_RESET})  Android APK               打包 Android 安装包"
     echo "  ${C_CYAN}4${C_RESET})  PC + Android              同时打 PC 和 Android"
-    echo "  ${C_BOLD}${C_GREEN}5${C_RESET})  ${C_BOLD}🚀 一键全量发布${C_RESET}          git tag + Docker(amd64+arm64) + exe + APK + GitHub Releases"
-    echo "  ${C_CYAN}6${C_RESET})  自定义组合                手动输入 docker,pc,android 组合"
+    echo "  ${C_BOLD}${C_GREEN}5${C_RESET})  ${C_BOLD}🚀 一键全量发布${C_RESET}          git tag + Docker(amd64+arm64) + exe + APK + .fpk + GitHub Releases"
+    echo "  ${C_CYAN}6${C_RESET})  自定义组合                手动输入 docker,pc,android,fpk 组合"
+    echo "  ${C_CYAN}7${C_RESET})  飞牛 .fpk                 仅打包飞牛 NAS 安装包（要求镜像已发到 Docker Hub）"
     echo
-    read -r -p "请输入序号 [1-6]（默认 1）: " _mode_choice
+    read -r -p "请输入序号 [1-7]（默认 1）: " _mode_choice
     _mode_choice="${_mode_choice:-1}"
 
     # _ONE_SHOT=1 表示"一键全量发布"模式：后续 Docker 架构 / PC 平台 / Android 方式 /
@@ -292,7 +301,7 @@ if [ "$TARGETS_EXPLICIT" = "0" ] && [ "$BUILD_ONLY" = "0" ] && [ "$ASSUME_YES" =
         3) TARGETS="android" ;;
         4) TARGETS="pc,android" ;;
         5)
-            TARGETS="docker,pc,android"
+            TARGETS="docker,pc,android,fpk"
             _ONE_SHOT=1
             # ---- 一键全量：Docker 多架构 ----
             ARCH="multi"
@@ -338,23 +347,25 @@ if [ "$TARGETS_EXPLICIT" = "0" ] && [ "$BUILD_ONLY" = "0" ] && [ "$ASSUME_YES" =
             info "   - git tag:     ${C_GREEN}是${C_RESET}"
             info "   - GitHub 发布: ${C_GREEN}是${C_RESET}"
             info "   - git pull:    ${C_GREEN}是${C_RESET}"
+            info "   - 飞牛 .fpk:   ${C_GREEN}是${C_RESET}（在 Docker push 后构建）"
             info "   - 原子发布:    ${C_GREEN}是${C_RESET}（三端全部构建成功才推送）"
             ;;
         6)
             echo
-            echo "  可选值：${C_GREEN}docker${C_RESET}, ${C_GREEN}pc${C_RESET}, ${C_GREEN}android${C_RESET}（逗号分隔）"
+            echo "  可选值：${C_GREEN}docker${C_RESET}, ${C_GREEN}pc${C_RESET}, ${C_GREEN}android${C_RESET}, ${C_GREEN}fpk${C_RESET}（逗号分隔）"
             read -r -p "  请输入组合: " _custom_targets
             [ -z "$_custom_targets" ] && die "未输入任何目标"
             TARGETS="$_custom_targets"
             ;;
+        7) TARGETS="fpk" ;;
         *) die "无效选择: $_mode_choice" ;;
     esac
     [ "$_ONE_SHOT" = "0" ] && info "已选择发布目标: ${C_GREEN}${TARGETS}${C_RESET}"
 
     # 提前解析一下 TARGETS，以便后续步骤做条件判断
-    _W_HAS_DOCKER=0; _W_HAS_PC=0; _W_HAS_ANDROID=0
+    _W_HAS_DOCKER=0; _W_HAS_PC=0; _W_HAS_ANDROID=0; _W_HAS_FPK=0
     for _wt in $(echo "$TARGETS" | tr ',' ' '); do
-        case "$_wt" in docker) _W_HAS_DOCKER=1;; pc) _W_HAS_PC=1;; android) _W_HAS_ANDROID=1;; esac
+        case "$_wt" in docker) _W_HAS_DOCKER=1;; pc) _W_HAS_PC=1;; android) _W_HAS_ANDROID=1;; fpk) _W_HAS_FPK=1;; esac
     done
 
     # ======== 第 2 步：Docker 架构（仅当目标包含 docker 时） ========
@@ -468,7 +479,7 @@ if [ "$TARGETS_EXPLICIT" = "0" ] && [ "$BUILD_ONLY" = "0" ] && [ "$ASSUME_YES" =
     fi
 
     # ======== 第 5 步：GitHub Release ========
-    if [ "$_ONE_SHOT" = "0" ] && { [ "$_W_HAS_PC" = "1" ] || [ "$_W_HAS_ANDROID" = "1" ]; }; then
+    if [ "$_ONE_SHOT" = "0" ] && { [ "$_W_HAS_PC" = "1" ] || [ "$_W_HAS_ANDROID" = "1" ] || [ "$_W_HAS_FPK" = "1" ]; }; then
         echo
         echo "${C_BOLD}🚀 第 5 步：是否上传产物到 GitHub Releases？${C_RESET}"
         echo
@@ -533,31 +544,32 @@ if [ "$TARGETS_EXPLICIT" = "0" ] && [ "$BUILD_ONLY" = "0" ] && [ "$ASSUME_YES" =
 fi
 
 # 展开 TARGETS
-# - all -> docker,pc,android
+# - all -> docker,pc,android,fpk
 # - 去重 / 校验
 TARGETS="$(echo "$TARGETS" | tr ',' '\n' | awk 'NF{print}' | sort -u | tr '\n' ',' | sed 's/,$//')"
 if echo ",$TARGETS," | grep -q ',all,'; then
-    TARGETS="docker,pc,android"
+    TARGETS="docker,pc,android,fpk"
 fi
-HAS_DOCKER=0; HAS_PC=0; HAS_ANDROID=0
+HAS_DOCKER=0; HAS_PC=0; HAS_ANDROID=0; HAS_FPK=0
 for t in $(echo "$TARGETS" | tr ',' ' '); do
     case "$t" in
         docker)  HAS_DOCKER=1 ;;
         pc)      HAS_PC=1 ;;
         android) HAS_ANDROID=1 ;;
-        *)       die "--target 未知值: $t （合法: docker / pc / android / all）" ;;
+        fpk)     HAS_FPK=1 ;;
+        *)       die "--target 未知值: $t （合法: docker / pc / android / fpk / all）" ;;
     esac
 done
-[ "$HAS_DOCKER" = "0" ] && [ "$HAS_PC" = "0" ] && [ "$HAS_ANDROID" = "0" ] \
+[ "$HAS_DOCKER" = "0" ] && [ "$HAS_PC" = "0" ] && [ "$HAS_ANDROID" = "0" ] && [ "$HAS_FPK" = "0" ] \
     && die "--target 至少包含一个目标"
 
 # ===== 自动推断 --github-release =====
-# 当 target 包含 pc 或 android 时，自动启用 GitHub Release 上传（无需手动加 --github-release）
-# 因为 PC/Android 产物的主要分发渠道就是 GitHub Releases
+# 当 target 包含 pc/android/fpk 时，自动启用 GitHub Release 上传（无需手动加 --github-release）
+# 因为 PC/Android/fpk 产物的主要分发渠道就是 GitHub Releases
 # 若用户显式传了 --no-github-release 则跳过自动推断
 if [ "$DO_GITHUB_RELEASE" = "0" ] && [ "$NO_GITHUB_RELEASE_EXPLICIT" = "0" ] \
-   && { [ "$HAS_PC" = "1" ] || [ "$HAS_ANDROID" = "1" ]; }; then
-    info "检测到 target 包含 pc/android，自动启用 --github-release（可用 --no-github-release 关闭）"
+   && { [ "$HAS_PC" = "1" ] || [ "$HAS_ANDROID" = "1" ] || [ "$HAS_FPK" = "1" ]; }; then
+    info "检测到 target 包含 pc/android/fpk，自动启用 --github-release（可用 --no-github-release 关闭）"
     DO_GITHUB_RELEASE=1
 fi
 
@@ -568,7 +580,7 @@ fi
 # 单目标时没有跨端一致性需求，保持关闭以免 multi 模式需要额外构建开销。
 # 用户显式传了 --atomic / --no-atomic 时不再自动推断。
 if [ "$ATOMIC_RELEASE" = "-1" ]; then
-    _TARGET_COUNT=$((HAS_DOCKER + HAS_PC + HAS_ANDROID))
+    _TARGET_COUNT=$((HAS_DOCKER + HAS_PC + HAS_ANDROID + HAS_FPK))
     if [ "$_TARGET_COUNT" -ge 2 ]; then
         ATOMIC_RELEASE=1
         info "检测到多端组合（${TARGETS}），自动启用 ${C_GREEN}原子发布${C_RESET}（可用 --no-atomic 关闭）"
@@ -597,8 +609,8 @@ if [ "$BUILD_ONLY" = "1" ]; then
         DO_PUSH_CUSTOM=1
     fi
     # build-only 仅对 docker 构建有意义
-    if [ "$HAS_PC" = "1" ] || [ "$HAS_ANDROID" = "1" ]; then
-        die "--build-only 模式不支持 --target pc/android（仅限 docker）"
+    if [ "$HAS_PC" = "1" ] || [ "$HAS_ANDROID" = "1" ] || [ "$HAS_FPK" = "1" ]; then
+        die "--build-only 模式不支持 --target pc/android/fpk（仅限 docker）"
     fi
     if [ "$DO_GITHUB_RELEASE" = "1" ]; then
         die "--build-only 模式不支持 --github-release"
@@ -781,6 +793,29 @@ if [ "$HAS_ANDROID" = "1" ]; then
         warn "未找到 frontend/android/keystore.properties 且未设 NOWEN_ANDROID_KEYSTORE_B64，APK 将不会被签名（只能用于调试）"
     fi
     command -v node >/dev/null 2>&1 || die "未安装 node（Android 端打包需要先跑 vite build + cap sync）"
+fi
+
+# fpk target 前置检查
+if [ "$HAS_FPK" = "1" ]; then
+    [ -f "scripts/fpk/build-fpk.mjs" ] || die "未找到 scripts/fpk/build-fpk.mjs（飞牛 .fpk 打包脚本）"
+    command -v node >/dev/null 2>&1 || die "未安装 node（fpk 打包脚本需要 node）"
+
+    # fnpack 二进制：build-fpk.mjs 内部会找 fnpack-* / FNPACK_BIN，校验只做友好提示
+    if [ -z "${FNPACK_BIN:-}" ] && \
+       ! ls "${REPO_ROOT:-.}"/fnpack-* >/dev/null 2>&1 && \
+       ! command -v fnpack >/dev/null 2>&1; then
+        warn "未找到 fnpack 二进制（项目根目录的 fnpack-* / PATH 中的 fnpack / 环境变量 FNPACK_BIN）"
+        warn "fpk 打包阶段会失败，请先放置 fnpack 可执行文件"
+    fi
+
+    # dockerhub 镜像名：优先用 --fpk-dockerhub-repo，再环境变量，再默认 IMAGE_NAME
+    if [ -z "$FPK_DOCKERHUB_REPO" ]; then
+        FPK_DOCKERHUB_REPO="${DOCKERHUB_REPO:-}"
+    fi
+    if [ -z "$FPK_DOCKERHUB_REPO" ]; then
+        FPK_DOCKERHUB_REPO="$DEFAULT_IMAGE_NAME"
+    fi
+    info "fpk 镜像地址: ${C_GREEN}${FPK_DOCKERHUB_REPO}${C_RESET}"
 fi
 
 # -------------------- 发布模式专属前置检查 --------------------
@@ -1074,6 +1109,12 @@ else
             echo "  Android 打包  : Capacitor + gradlew assembleRelease（本机）"
         fi
         echo "  Android 版本  : versionName=${VERSION}, versionCode=$(android_version_code_of "$VERSION")"
+    fi
+    if [ "$HAS_FPK" = "1" ]; then
+        echo "  飞牛 .fpk     : scripts/fpk/build-fpk.mjs（镜像: ${FPK_DOCKERHUB_REPO}:${VERSION_TAG}）"
+        if [ "$HAS_DOCKER" != "1" ]; then
+            echo "                  ${C_YELLOW}(未同时构建 docker target，请确保镜像已发布到 Docker Hub)${C_RESET}"
+        fi
     fi
     echo "  同步 git tag  : $([ "$DO_GIT_TAG" = "1" ] && echo yes || echo no)"
     echo "  GitHub Release: $([ "$DO_GITHUB_RELEASE" = "1" ] && echo yes || echo no)"
@@ -1706,6 +1747,45 @@ if [ "$SHOULD_BUILD_DOCKER" = "1" ] && [ "$ATOMIC_RELEASE" = "1" ]; then
     ok "Docker 镜像推送完成，用时 ${PUSH_DURATION}s"
 fi
 
+# -------------------- 飞牛 .fpk 打包 --------------------
+# 必须在 docker push 之后执行：fpk 内的 compose 引用 dockerhub 镜像，
+# 用户从飞牛 NAS 安装时会自动拉取对应 tag。镜像不在 dockerhub 上 = 安装阶段失败。
+# 即便用户没勾 docker target（仅 --target fpk），也认为镜像已经发过；
+# 单独 fpk 模式适合"补打 fpk"场景。
+FPK_ARTIFACTS=()
+FPK_BUILD_DURATION=0
+if [ "$HAS_FPK" = "1" ]; then
+    step "飞牛 .fpk 打包"
+    FPK_START=$(date +%s)
+
+    # build-fpk.mjs 通过环境变量取镜像地址；版本号取 package.json 的 version
+    # 此前 sync_root_pkg_version 已把 package.json 改成本次 VERSION，这里直接读即可
+    info "调用 scripts/fpk/build-fpk.mjs（DOCKERHUB_REPO=${FPK_DOCKERHUB_REPO}）"
+    if [ "$DRY_RUN" = "1" ]; then
+        echo "  (dry-run) DOCKERHUB_REPO=${FPK_DOCKERHUB_REPO} node scripts/fpk/build-fpk.mjs"
+    else
+        ( cd "$REPO_ROOT" && DOCKERHUB_REPO="$FPK_DOCKERHUB_REPO" run_argv node scripts/fpk/build-fpk.mjs )
+    fi
+
+    # 收集 dist-fpk/ 下产物
+    FPK_OUT="${REPO_ROOT}/dist-fpk"
+    if [ "$DRY_RUN" != "1" ] && [ -d "$FPK_OUT" ]; then
+        while IFS= read -r f; do
+            FPK_ARTIFACTS+=( "$f" )
+        done < <(find "$FPK_OUT" -maxdepth 1 -type f -name "*.fpk" 2>/dev/null | sort)
+        info "fpk 产物目录: $FPK_OUT"
+        for f in "${FPK_ARTIFACTS[@]}"; do
+            echo "    - $(basename "$f")"
+        done
+        [ "${#FPK_ARTIFACTS[@]}" -eq 0 ] && warn "未找到任何 .fpk 产物（请检查 build-fpk.mjs 输出）"
+    fi
+
+    FPK_END=$(date +%s)
+    FPK_BUILD_DURATION=$((FPK_END - FPK_START))
+    ok "飞牛 .fpk 打包完成，用时 ${FPK_BUILD_DURATION}s"
+fi
+
+
 # -------------------- git tag --------------------
 if [ "$DO_GIT_TAG" = "1" ]; then
     step "打 git tag 并推送到 GitHub"
@@ -1840,6 +1920,7 @@ if [ "$DO_GITHUB_RELEASE" = "1" ]; then
     ALL_ASSETS=()
     [ "${#PC_ARTIFACTS[@]}" -gt 0 ]      && ALL_ASSETS+=( "${PC_ARTIFACTS[@]}" )
     [ "${#ANDROID_ARTIFACTS[@]}" -gt 0 ] && ALL_ASSETS+=( "${ANDROID_ARTIFACTS[@]}" )
+    [ "${#FPK_ARTIFACTS[@]}" -gt 0 ]     && ALL_ASSETS+=( "${FPK_ARTIFACTS[@]}" )
 
     if [ "${#ALL_ASSETS[@]}" -eq 0 ]; then
         warn "没有产物需要上传到 GitHub Release，跳过"
@@ -1901,10 +1982,16 @@ if [ "$HAS_ANDROID" = "1" ] && [ "${#ANDROID_ARTIFACTS[@]}" -gt 0 ]; then
         echo "    - $(basename "$f")"
     done
 fi
+if [ "$HAS_FPK" = "1" ] && [ "${#FPK_ARTIFACTS[@]}" -gt 0 ]; then
+    echo "  ${C_GREEN}飞牛 .fpk 产物${C_RESET}："
+    for f in "${FPK_ARTIFACTS[@]}"; do
+        echo "    - $(basename "$f")"
+    done
+fi
 [ "$DO_GIT_TAG" = "1" ] && echo "  ${C_GREEN}git tag ${VERSION_TAG}${C_RESET}  ←  已推送到 GitHub"
 [ -n "$RELEASE_URL" ]   && echo "  ${C_GREEN}GitHub Release${C_RESET}  ←  ${RELEASE_URL}"
 
-echo "  总耗时        : ${TOTAL}s  (docker:${BUILD_DURATION}s push:${PUSH_DURATION}s pc:${PC_BUILD_DURATION}s android:${ANDROID_BUILD_DURATION}s)"
+echo "  总耗时        : ${TOTAL}s  (docker:${BUILD_DURATION}s push:${PUSH_DURATION}s pc:${PC_BUILD_DURATION}s android:${ANDROID_BUILD_DURATION}s fpk:${FPK_BUILD_DURATION}s)"
 [ -n "$DIGEST" ] && echo "  docker digest : ${DIGEST}"
 
 echo
