@@ -1178,6 +1178,11 @@
     "openSource": "Open Source",
     "github": "GitHub",
     "license": "MIT License",
+    "sponsor": "Sponsor",
+    "sponsorDesc": "If this project helps you, buy the author a coffee ☕",
+    "sponsorAction": "Show QR code",
+    "sponsorCollapse": "Hide",
+    "sponsorTip": "Scan with WeChat · buy the author a keyboard / a bug fix",
     "madeWith": "Made with ❤️"
   },
   "versions": {

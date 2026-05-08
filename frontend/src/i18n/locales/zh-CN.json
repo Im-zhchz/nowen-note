@@ -1187,6 +1187,11 @@
     "openSource": "开源项目",
     "github": "GitHub",
     "license": "MIT License",
+    "sponsor": "支持作者",
+    "sponsorDesc": "如果这个项目对你有帮助，欢迎请作者喝杯咖啡 ☕",
+    "sponsorAction": "展开赞赏码",
+    "sponsorCollapse": "收起",
+    "sponsorTip": "微信扫一扫 · 支持作者买键盘 / 修 Bug",
     "madeWith": "用 ❤️ 打造"
   },
   "versions": {

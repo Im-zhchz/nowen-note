@@ -1,7 +1,7 @@
 import React, { useState, useRef, useEffect, useCallback } from "react";
 import { createPortal } from "react-dom";
 import { motion, AnimatePresence } from "framer-motion";
-import { Palette, Shield, Database, X, Settings, Camera, Save, Loader2, Trash2, Upload, Type, Check, ChevronDown, Globe, Bot, Users, Info, ExternalLink } from "lucide-react";
+import { Palette, Shield, Database, X, Settings, Camera, Save, Loader2, Trash2, Upload, Type, Check, ChevronDown, Globe, Bot, Users, Info, ExternalLink, Heart } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import ThemeToggle from "@/components/ThemeToggle";
 import SkinSwitcher from "@/components/SkinSwitcher";
@@ -56,6 +56,7 @@ class PanelErrorBoundary extends React.Component<
 
 function AboutPanel() {
   const { t } = useTranslation();
+  const [showSponsor, setShowSponsor] = useState(false);
   return (
     <div className="space-y-6">
       {/* 标题区 */}
@@ -107,6 +108,55 @@ function AboutPanel() {
           <ExternalLink size={12} />
           {t('about.github')}
         </a>
+      </div>
+
+      {/* 支持作者 / 打赏 */}
+      <div className="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-zinc-50/50 dark:bg-zinc-800/30 overflow-hidden">
+        <button
+          type="button"
+          onClick={() => setShowSponsor((v) => !v)}
+          className="w-full flex items-center justify-between p-4 hover:bg-zinc-100/60 dark:hover:bg-zinc-800/50 transition-colors"
+        >
+          <div className="flex items-center gap-3">
+            <span className="flex items-center justify-center w-8 h-8 rounded-lg bg-rose-500/10 text-rose-500">
+              <Heart size={16} fill="currentColor" />
+            </span>
+            <div className="text-left">
+              <div className="text-sm font-medium text-zinc-700 dark:text-zinc-300">
+                {t('about.sponsor')}
+              </div>
+              <div className="text-xs text-zinc-500 dark:text-zinc-400 mt-0.5">
+                {t('about.sponsorDesc')}
+              </div>
+            </div>
+          </div>
+          <span className="text-xs text-zinc-500 dark:text-zinc-400 shrink-0">
+            {showSponsor ? t('about.sponsorCollapse') : t('about.sponsorAction')}
+          </span>
+        </button>
+        <AnimatePresence initial={false}>
+          {showSponsor && (
+            <motion.div
+              initial={{ height: 0, opacity: 0 }}
+              animate={{ height: 'auto', opacity: 1 }}
+              exit={{ height: 0, opacity: 0 }}
+              transition={{ duration: 0.2 }}
+              className="overflow-hidden"
+            >
+              <div className="px-4 pb-4 pt-2 flex flex-col items-center gap-3 border-t border-zinc-200/60 dark:border-zinc-800/60">
+                <img
+                  src="/weixin.jpg"
+                  alt={t('about.sponsor')}
+                  className="w-44 h-44 sm:w-52 sm:h-52 object-contain rounded-lg bg-white p-2 shadow-sm"
+                  loading="lazy"
+                />
+                <p className="text-xs text-zinc-500 dark:text-zinc-400 text-center">
+                  {t('about.sponsorTip')}
+                </p>
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
       </div>
 
       {/* 底部 */}
