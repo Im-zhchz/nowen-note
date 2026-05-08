@@ -1,6 +1,6 @@
 services:
   nowen-note:
-    image: {{DOCKERHUB_REPO}}:{{VERSION}}
+    image: {{DOCKERHUB_REPO}}:{{IMAGE_TAG}}
     container_name: nowen-note
     restart: unless-stopped
     ports:

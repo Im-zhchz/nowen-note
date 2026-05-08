@@ -10,7 +10,9 @@
  *
  * 可选环境变量：
  *   DOCKERHUB_REPO   必填，例如 myname/nowen-note
- *   FPK_VERSION      可选，默认读 package.json 的 version
+ *   FPK_VERSION      可选，写入 manifest 的版本号（飞牛要求 X.Y.Z 形式），默认 package.json.version
+ *   FPK_IMAGE_TAG    可选，compose.yaml 里镜像的 tag（可带 v 前缀），默认与 FPK_VERSION 一致
+ *                    -- release.sh 走原子发布时会传 v${VERSION}，与 docker push 的 tag 对齐
  *   FNPACK_BIN       可选，fnpack 可执行文件路径，默认自动探测
  *   FPK_OUT_DIR      可选，输出目录，默认 dist-fpk
  */
@@ -35,6 +37,9 @@ const TEMPLATE_DIR = join(__dirname, 'template');
 
 const pkg = JSON.parse(readFileSync(join(PROJECT_ROOT, 'package.json'), 'utf8'));
 const VERSION = process.env.FPK_VERSION || pkg.version;
+// 镜像 tag 默认 = VERSION；release.sh 会覆盖成 v${VERSION} 与 docker push 的 tag 对齐
+// （DockerHub 上实际镜像 tag 是 v1.0.30，飞牛 NAS 拉裸 1.0.30 会 manifest unknown / EOF）
+const IMAGE_TAG = process.env.FPK_IMAGE_TAG || VERSION;
 const DOCKERHUB_REPO = process.env.DOCKERHUB_REPO;
 const OUT_DIR = resolve(PROJECT_ROOT, process.env.FPK_OUT_DIR || 'dist-fpk');
 
@@ -43,8 +48,8 @@ if (!DOCKERHUB_REPO) {
     process.exit(1);
 }
 
-console.log(`[fpk] 项目版本: ${VERSION}`);
-console.log(`[fpk] 镜像地址: ${DOCKERHUB_REPO}:${VERSION}`);
+console.log(`[fpk] 项目版本: ${VERSION}（写入 manifest）`);
+console.log(`[fpk] 镜像地址: ${DOCKERHUB_REPO}:${IMAGE_TAG}（写入 compose.yaml）`);
 
 // 1. 准备工作目录
 mkdirSync(OUT_DIR, { recursive: true });
@@ -57,14 +62,23 @@ console.log('[fpk] 复制模板到工作目录');
 cpSync(TEMPLATE_DIR, WORK_DIR, { recursive: true });
 
 // 3. 注入版本号 / 镜像地址
-function injectVars(filePath) {
-    const content = readFileSync(filePath, 'utf8')
-        .replace(/\{\{VERSION\}\}/g, VERSION)
-        .replace(/\{\{DOCKERHUB_REPO\}\}/g, DOCKERHUB_REPO);
+//    - manifest 用 VERSION（飞牛 NAS 应用版本，必须 X.Y.Z 纯版本号）
+//    - docker-compose.yaml 用 IMAGE_TAG（DockerHub 上的实际 tag，可能带 v 前缀）
+function injectInto(filePath, replacements) {
+    let content = readFileSync(filePath, 'utf8');
+    for (const [key, val] of Object.entries(replacements)) {
+        content = content.replace(new RegExp(`\\{\\{${key}\\}\\}`, 'g'), val);
+    }
     writeFileSync(filePath, content);
 }
-injectVars(join(WORK_DIR, 'manifest'));
-injectVars(join(WORK_DIR, 'app', 'docker', 'docker-compose.yaml'));
+injectInto(join(WORK_DIR, 'manifest'), {
+    VERSION,
+    DOCKERHUB_REPO,
+});
+injectInto(join(WORK_DIR, 'app', 'docker', 'docker-compose.yaml'), {
+    IMAGE_TAG,
+    DOCKERHUB_REPO,
+});
 
 // 4. 生成图标（根目录 ICON.PNG/ICON_256.PNG，UI 目录 icon_64.png/icon_256.png）
 console.log('[fpk] 生成图标');

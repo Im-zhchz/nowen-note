@@ -1820,13 +1820,19 @@ if [ "$HAS_FPK" = "1" ]; then
     step "飞牛 .fpk 打包"
     FPK_START=$(date +%s)
 
-    # build-fpk.mjs 通过环境变量取镜像地址；版本号取 package.json 的 version
-    # 此前 sync_root_pkg_version 已把 package.json 改成本次 VERSION，这里直接读即可
-    info "调用 scripts/fpk/build-fpk.mjs（DOCKERHUB_REPO=${FPK_DOCKERHUB_REPO}）"
+    # build-fpk.mjs 通过环境变量取镜像地址 / 版本号
+    # 关键：FPK_IMAGE_TAG=${VERSION_TAG} 让 compose.yaml 拉的镜像 tag 与 docker push 一致。
+    # 如果不传 FPK_IMAGE_TAG，build-fpk.mjs fallback 用裸版本号（如 1.0.30），
+    # 但 release.sh 实际 push 的是 v1.0.30，飞牛 NAS 安装时会报 "manifest unknown / EOF"。
+    # manifest 内的 version 字段仍用纯版本号（飞牛要求 X.Y.Z 形式）。
+    info "调用 scripts/fpk/build-fpk.mjs（DOCKERHUB_REPO=${FPK_DOCKERHUB_REPO}, image tag=${VERSION_TAG}, manifest version=${VERSION}）"
     if [ "$DRY_RUN" = "1" ]; then
-        echo "  (dry-run) DOCKERHUB_REPO=${FPK_DOCKERHUB_REPO} node scripts/fpk/build-fpk.mjs"
+        echo "  (dry-run) DOCKERHUB_REPO=${FPK_DOCKERHUB_REPO} FPK_IMAGE_TAG=${VERSION_TAG} node scripts/fpk/build-fpk.mjs"
     else
-        ( cd "$REPO_ROOT" && DOCKERHUB_REPO="$FPK_DOCKERHUB_REPO" run_argv node scripts/fpk/build-fpk.mjs )
+        ( cd "$REPO_ROOT" && \
+          DOCKERHUB_REPO="$FPK_DOCKERHUB_REPO" \
+          FPK_IMAGE_TAG="$VERSION_TAG" \
+          run_argv node scripts/fpk/build-fpk.mjs )
     fi
 
     # 收集 dist-fpk/ 下产物
