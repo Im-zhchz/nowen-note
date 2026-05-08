@@ -73,6 +73,12 @@ npm run electron:build    # 打包 Windows / macOS / Linux
 
 Android 可直接从 [Releases](https://github.com/cropflre/nowen-note/releases) 下载 APK，或 `npx cap sync android && npx cap open android` 自行构建。
 
+### 飞牛 fnOS（.fpk 一键安装）
+
+从 [Releases](https://github.com/cropflre/nowen-note/releases) 下载最新 `nowen-note-x.y.z.fpk`，在飞牛 NAS 「应用中心 → 设置 → 手动安装应用」选中文件即可。安装后桌面出现「弄文笔记」图标，浏览器打开 `http://<飞牛IP>:3001`。
+
+> 当前 .fpk 仅支持 x86_64 飞牛设备（`platform=x86`）。手动打包参见 [scripts/fpk/README.md](./scripts/fpk/README.md)。
+
 ## 配置
 
 | 环境变量 | 默认值 | 说明 |
@@ -88,6 +94,7 @@ Android 可直接从 [Releases](https://github.com/cropflre/nowen-note/releases)
 ## 文档
 
 - 部署指南（本地 / Docker / 桌面 / 移动 / 群晖 / 绿联 / 威联通 / 飞牛 / 极空间 / ARM64）：[docs/deployment.md](./docs/deployment.md)
+- 飞牛 .fpk 应用打包：[scripts/fpk/README.md](./scripts/fpk/README.md)
 - ARM64 详解：[docs/deploy-arm64.md](./docs/deploy-arm64.md)
 - 邮件备份配置：[docs/backup-email-smtp.md](./docs/backup-email-smtp.md)
 - 编辑器模式切换：[docs/editor-mode-switch.md](./docs/editor-mode-switch.md)

@@ -73,6 +73,12 @@ npm run electron:build    # Package for Windows / macOS / Linux
 
 For Android, download the APK directly from [Releases](https://github.com/cropflre/nowen-note/releases), or build it yourself with `npx cap sync android && npx cap open android`.
 
+### fnOS (one-click .fpk install)
+
+Grab the latest `nowen-note-x.y.z.fpk` from [Releases](https://github.com/cropflre/nowen-note/releases). On your fnOS NAS, open **App Center → Settings → Install app manually** and pick the file. After installation, click the "Nowen Note" icon on the desktop or open `http://<nas-ip>:3001` in your browser.
+
+> The .fpk currently targets x86_64 fnOS only (`platform=x86`). To build it yourself, see [scripts/fpk/README.md](./scripts/fpk/README.md).
+
 ## Configuration
 
 | Env var | Default | Description |
@@ -88,6 +94,7 @@ Backup policy: auto-backups are written to `/app/data/backups` by default, shari
 ## Documentation
 
 - Deployment guide (Local / Docker / Desktop / Mobile / Synology / UGREEN / QNAP / fnOS / ZSpace / ARM64): [docs/deployment.md](./docs/deployment.md)
+- fnOS .fpk packaging: [scripts/fpk/README.md](./scripts/fpk/README.md)
 - ARM64 details: [docs/deploy-arm64.md](./docs/deploy-arm64.md)
 - Email backup configuration: [docs/backup-email-smtp.md](./docs/backup-email-smtp.md)
 - Editor mode switch: [docs/editor-mode-switch.md](./docs/editor-mode-switch.md)
