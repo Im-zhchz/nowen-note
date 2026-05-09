@@ -1641,22 +1641,37 @@ if [ "$HAS_PC" = "1" ]; then
     done
 
     if [ "$DRY_RUN" != "1" ] && [ -n "$PC_OUT" ]; then
-        # 收集要上传的产物：.exe / .dmg / .AppImage / .deb / -portable.exe / .zip / .blockmap / latest*.yml
-        # electron-updater 需要 latest.yml / latest-mac.yml / latest-linux.yml + blockmap
+        # 收集要上传的产物：仅匹配"当前版本号"的安装包 + electron-updater 元数据
+        #
+        # 历史教训（v1.0.32 翻车）：dist-electron/ 是 electron-builder 默认输出目录，
+        # 它从不主动清理历史版本——CI 容器或本地长期累积时，目录里会同时存在
+        # Setup.1.0.11.exe ~ Setup.1.0.31.exe 一大堆旧产物，再加 .blockmap。
+        # 之前用 -name "*.exe" / "*.AppImage" / "*.blockmap" 全捞，会把所有历史
+        # 版本一锅端上传到 GitHub Release，造成 v1.0.32 的 Release 里挂了 60+ 个
+        # 历史包（参见 issue：v1.0.32 Release Assets 含 1.0.11 起所有版本）。
+        #
+        # 正确做法：用 ${VERSION} 作为子串过滤。electron-builder 输出文件名一定
+        # 带版本号（Nowen.Note.Setup.1.0.32.exe / Nowen.Note-1.0.32.AppImage /
+        # Nowen.Note-1.0.32-arm64-mac.zip / Nowen.Note-1.0.32.exe.blockmap 等）。
+        # 例外：latest.yml / latest-mac.yml / latest-linux.yml 不带版本号，但
+        # electron-builder 每次构建会覆写为当前版本元数据，直接全收即可。
+        #
+        # 注意：bash 的 find -name 通配 * 不匹配 /，但同名 glob 在脚本里被花括号
+        # 包住时仍然由 find 自己解释，安全。
         while IFS= read -r f; do
             PC_ARTIFACTS+=( "$f" )
         done < <(
             find "$PC_OUT" -maxdepth 1 -type f \( \
-                -name "*.exe" -o \
-                -name "*.dmg" -o \
-                -name "*.zip" -o \
-                -name "*.AppImage" -o \
-                -name "*.deb" -o \
-                -name "*.blockmap" -o \
+                -name "*${VERSION}*.exe" -o \
+                -name "*${VERSION}*.dmg" -o \
+                -name "*${VERSION}*.zip" -o \
+                -name "*${VERSION}*.AppImage" -o \
+                -name "*${VERSION}*.deb" -o \
+                -name "*${VERSION}*.blockmap" -o \
                 -name "latest*.yml" \
             \) 2>/dev/null | sort
         )
-        info "PC 产物目录: $PC_OUT"
+        info "PC 产物目录: $PC_OUT (仅匹配版本 ${VERSION})"
         for f in "${PC_ARTIFACTS[@]}"; do
             echo "    - $(basename "$f")"
         done
@@ -1997,22 +2012,24 @@ if [ "$HAS_LITE" = "1" ]; then
     done
 
     if [ "$DRY_RUN" != "1" ] && [ -n "$LITE_OUT" ]; then
-        # 与 PC 端一致：收集 setup.exe / portable.exe / dmg / AppImage / deb / blockmap / latest*.yml
+        # 与 PC 端一致：仅匹配当前版本号的产物 + latest*.yml 元数据
+        # （根因和修复见 PC 段同位置注释——dist-electron-lite/ 同样是 electron-builder
+        # 的累积目录，旧版本不清理；用 ${VERSION} 子串过滤精确收敛）
         # blockmap + latest*.yml 让 lite 也能走 electron-updater 自更新（channel="lite"）
         while IFS= read -r f; do
             LITE_ARTIFACTS+=( "$f" )
         done < <(
             find "$LITE_OUT" -maxdepth 1 -type f \( \
-                -name "*.exe" -o \
-                -name "*.dmg" -o \
-                -name "*.zip" -o \
-                -name "*.AppImage" -o \
-                -name "*.deb" -o \
-                -name "*.blockmap" -o \
+                -name "*${VERSION}*.exe" -o \
+                -name "*${VERSION}*.dmg" -o \
+                -name "*${VERSION}*.zip" -o \
+                -name "*${VERSION}*.AppImage" -o \
+                -name "*${VERSION}*.deb" -o \
+                -name "*${VERSION}*.blockmap" -o \
                 -name "latest*.yml" \
             \) 2>/dev/null | sort
         )
-        info "Lite 产物目录: $LITE_OUT"
+        info "Lite 产物目录: $LITE_OUT (仅匹配版本 ${VERSION})"
         for f in "${LITE_ARTIFACTS[@]}"; do
             echo "    - $(basename "$f")"
         done
