@@ -172,48 +172,54 @@ tasks.get("/:id", (c) => {
 //   - body.noteId 指定时，不强制对齐 noteId 的 workspaceId —— 现实中任务绑
 //     定的笔记可能在个人空间而任务本身挂在工作区，反之亦然；由用户自己
 //     掌握语义，后端不越权校验。
-tasks.post("/", requireWorkspaceFeature("tasks"), (c) => {
+// 实现备注：这里故意用 async 而不是 `() => c.req.json().then(...)` 的链式返回。
+// 旧写法下 TypeScript 会把 handler 的返回类型推断成
+//   JSONRespondReturn<403> | Promise<void | JSONRespondReturn<201|400|403|404>>
+// 这个 union 与 Hono 的 Handler<..., HandlerResponse<any>>（要求 Response | Promise<Response>，
+// Promise 分支内部还必须是 void 才被视作 "无返回"）不兼容，tsc 会在 tasks.post("/", ...)
+// 的这一行报 TS2769 "No overload matches this call"。统一 async/await 后，所有分支都
+// 走同一条 Promise 路径，返回类型收敛为 Promise<Response>，类型校验即通过。
+tasks.post("/", requireWorkspaceFeature("tasks"), async (c) => {
   const db = getDb();
   const userId = c.req.header("X-User-Id")!;
 
   const scope = resolveTaskScope(c, userId);
   if (scope.error) return c.json({ error: scope.error, code: "FORBIDDEN" }, 403);
 
-  return c.req.json().then((body: any) => {
-    const id = crypto.randomUUID();
-    const { title, priority = 2, dueDate = null, noteId = null, parentId = null } = body;
+  const body: any = await c.req.json();
+  const id = crypto.randomUUID();
+  const { title, priority = 2, dueDate = null, noteId = null, parentId = null } = body;
 
-    if (!title || !title.trim()) {
-      return c.json({ error: "Title is required" }, 400);
+  if (!title || !title.trim()) {
+    return c.json({ error: "Title is required" }, 400);
+  }
+
+  // 父任务继承：子任务必须与父任务在同一 scope。
+  let effectiveWorkspaceId: string | null = scope.workspaceId;
+  if (parentId) {
+    const parent = db
+      .prepare("SELECT userId, workspaceId FROM tasks WHERE id = ?")
+      .get(parentId) as { userId: string; workspaceId: string | null } | undefined;
+    if (!parent) return c.json({ error: "父任务不存在" }, 404);
+    if (!canReadTask(parent, userId)) {
+      return c.json({ error: "无权在该父任务下创建子任务", code: "FORBIDDEN" }, 403);
     }
-
-    // 父任务继承：子任务必须与父任务在同一 scope。
-    let effectiveWorkspaceId: string | null = scope.workspaceId;
-    if (parentId) {
-      const parent = db
-        .prepare("SELECT userId, workspaceId FROM tasks WHERE id = ?")
-        .get(parentId) as { userId: string; workspaceId: string | null } | undefined;
-      if (!parent) return c.json({ error: "父任务不存在" }, 404);
-      if (!canReadTask(parent, userId)) {
-        return c.json({ error: "无权在该父任务下创建子任务", code: "FORBIDDEN" }, 403);
-      }
-      if (effectiveWorkspaceId !== parent.workspaceId) {
-        return c.json(
-          { error: "子任务必须与父任务在同一工作区", code: "SCOPE_MISMATCH" },
-          400,
-        );
-      }
-      effectiveWorkspaceId = parent.workspaceId;
+    if (effectiveWorkspaceId !== parent.workspaceId) {
+      return c.json(
+        { error: "子任务必须与父任务在同一工作区", code: "SCOPE_MISMATCH" },
+        400,
+      );
     }
+    effectiveWorkspaceId = parent.workspaceId;
+  }
 
-    db.prepare(`
-      INSERT INTO tasks (id, userId, workspaceId, title, isCompleted, priority, dueDate, noteId, parentId)
-      VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?)
-    `).run(id, userId, effectiveWorkspaceId, title.trim(), priority, dueDate, noteId, parentId);
+  db.prepare(`
+    INSERT INTO tasks (id, userId, workspaceId, title, isCompleted, priority, dueDate, noteId, parentId)
+    VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?)
+  `).run(id, userId, effectiveWorkspaceId, title.trim(), priority, dueDate, noteId, parentId);
 
-    const task = db.prepare("SELECT * FROM tasks WHERE id = ?").get(id);
-    return c.json(task, 201);
-  });
+  const task = db.prepare("SELECT * FROM tasks WHERE id = ?").get(id);
+  return c.json(task, 201);
 });
 
 // 更新任务
