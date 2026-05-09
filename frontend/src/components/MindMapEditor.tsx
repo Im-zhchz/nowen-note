@@ -597,7 +597,11 @@ export default function MindMapCenter() {
   const handleCreate = useCallback(async () => {
     try {
       const map = await api.createMindMap({ title: t("mindMap.untitled") });
-      setMaps((prev) => [{ id: map.id, userId: map.userId, title: map.title, createdAt: map.createdAt, updatedAt: map.updatedAt }, ...prev]);
+      // 注意：MindMapListItem 自 Y4 起新增了必填字段 workspaceId（null = 个人空间）。
+      // 这里必须把后端返回的 workspaceId 一并透传，否则 tsc 会报
+      //   TS2345: Property 'workspaceId' is missing in type ...
+      // 导致 frontend build 挂掉（Docker/Release 流水线里表现为 vite build 阶段失败）。
+      setMaps((prev) => [{ id: map.id, userId: map.userId, workspaceId: map.workspaceId, title: map.title, createdAt: map.createdAt, updatedAt: map.updatedAt }, ...prev]);
       handleSelect(map.id);
     } catch (err) {
       console.error("Failed to create mindmap:", err);
