@@ -39,6 +39,115 @@ import { getDbSchemaVersion, getCodeSchemaVersion } from "../db/schema";
 const router = new Hono();
 
 /**
+ * 解析"当前实例正在托管的前端 bundle 标识"。
+ *
+ * 动机（H2 修复）：
+ *   UpdateNotifier 旧逻辑是拿服务端 `appVersion`（= package.json 里的版本号）
+ *   与编译期注入的 `__APP_VERSION__` 比对。这在"只升后端忘推前端"的部署里
+ *   会把用户卡在"刷新 loop"——因为前端包版本号没跟着变，`__APP_VERSION__` 永远
+ *   和服务端 `appVersion` 对不上，用户刷 N 次还是旧 bundle。
+ *
+ * 这里给出一个"**只要前端 bundle 真变了，这个字段就一定变**"的稳态信号：
+ *   读取 `frontend/dist/.vite/manifest.json` 的入口 chunk（`isEntry=true`）的
+ *   `file` 字段（形如 `assets/index-abc123.js`），Vite 会把产物 hash 硬编码进
+ *   文件名；任何源代码改动都会产生新 hash，也就是新的 buildId。
+ *
+ * 解析路径顺序（与 appVersion 的候选列表思路一致，适配 dev / docker / 源码态）：
+ *   1. ENV 显式注入（CI 构建时写 `NOWEN_FRONTEND_BUILD_ID`，最确定）
+ *   2. 同仓库 `frontend/dist/.vite/manifest.json`（docker / npm run build 后）
+ *   3. 回退 null —— 前端此时会降级到原来的 appVersion 比对逻辑
+ *
+ * 缓存：进程级，避免每次请求都 fs.readFileSync。若运维需要"不重启换包热生效"，
+ * 应当重启进程——这是容器部署的默认假设，不必为此牺牲接口性能。
+ */
+let cachedFrontendBuildId: string | null | undefined = undefined;
+function resolveFrontendBuildId(): string | null {
+  if (cachedFrontendBuildId !== undefined) return cachedFrontendBuildId;
+
+  const envId = process.env.NOWEN_FRONTEND_BUILD_ID?.trim();
+  if (envId) {
+    cachedFrontendBuildId = envId;
+    return cachedFrontendBuildId;
+  }
+
+  // 几个可能的 manifest 位置——dev 态 cwd 是根；docker 里 cwd 是 /app 或 backend/。
+  // .vite/manifest.json 只有在 vite.config 开启 build.manifest=true 时才生成；
+  // 本项目没开，故主路径走 index.html 的 hash 提取作为 buildId（见下）。
+  const candidates = [
+    path.resolve(process.cwd(), "frontend/dist/.vite/manifest.json"),
+    path.resolve(process.cwd(), "../frontend/dist/.vite/manifest.json"),
+    path.resolve(__dirname, "../../../frontend/dist/.vite/manifest.json"),
+  ];
+  for (const p of candidates) {
+    try {
+      if (!fs.existsSync(p)) continue;
+      const raw = fs.readFileSync(p, "utf-8");
+      const m = JSON.parse(raw) as Record<string, { isEntry?: boolean; file?: string }>;
+      // 找 isEntry=true 的第一个条目（通常是 index.html 入口）
+      for (const key of Object.keys(m)) {
+        const entry = m[key];
+        if (entry?.isEntry && entry.file) {
+          // 与前端 `detectClientBuildId()` 口径对齐：只保留文件名（含 hash）
+          const f = entry.file;
+          cachedFrontendBuildId = f.substring(f.lastIndexOf("/") + 1);
+          return cachedFrontendBuildId;
+        }
+      }
+    } catch {
+      // 继续尝试下一个候选
+    }
+  }
+
+  // 备选方案：直接扫 `frontend/dist/index.html` 中主入口脚本的 hash。
+  // 生产构建 index.html 里必然有 <script type="module" crossorigin src="/assets/index-<hash>.js"></script>，
+  // 抓这串路径并**只保留文件名**，与前端 `detectClientBuildId()` 取值口径一致
+  // （前端运行时也只取最后一段文件名），避免 CDN / baseUrl 变化或代理路径
+  // 差异导致两边对不上引发误提示。
+  const indexCandidates = [
+    path.resolve(process.cwd(), "frontend/dist/index.html"),
+    path.resolve(process.cwd(), "../frontend/dist/index.html"),
+    path.resolve(__dirname, "../../../frontend/dist/index.html"),
+  ];
+  for (const p of indexCandidates) {
+    try {
+      if (!fs.existsSync(p)) continue;
+      const html = fs.readFileSync(p, "utf-8");
+      const match = html.match(/<script[^>]+type="module"[^>]+src="([^"]+)"/i);
+      if (match && match[1]) {
+        const src = match[1].split("?")[0].split("#")[0];
+        cachedFrontendBuildId = src.substring(src.lastIndexOf("/") + 1);
+        return cachedFrontendBuildId;
+      }
+    } catch {
+      // 继续尝试下一个候选
+    }
+  }
+
+  cachedFrontendBuildId = null;
+  return cachedFrontendBuildId;
+}
+
+/**
+ * 解析"最低兼容客户端版本号"。
+ *
+ * 用于 Android 原生壳的硬性升级引导：当 `__APP_VERSION__` < `minClientVersion`
+ * 时，前端 UpdateNotifier 会退出可关闭的"软提示"形态，改成不可关闭的"请到
+ * 官网下载新 APK"卡片——因为 Android WebView 里只刷 JS bundle 解决不了原生
+ * plugin 不兼容（权限/签名/API 变更）。
+ *
+ * 来源：
+ *   - ENV `NOWEN_MIN_CLIENT_VERSION`（最低兼容版本，例："1.0.30"）
+ *   - 未配置则返回 null，前端据此走软提示路径，完全向后兼容
+ *
+ * 为什么不存 DB：这类运维旋钮生命周期与部署绑定；放在 ENV 里改完重启生效，
+ * 与当前"改迁移要重启"的运维心智一致。若将来要前端 UI 配置再平移到 DB。
+ */
+function resolveMinClientVersion(): string | null {
+  const v = process.env.NOWEN_MIN_CLIENT_VERSION?.trim();
+  return v || null;
+}
+
+/**
  * 解析当前应用版本号。缓存进程级结果，避免每次请求都 fs.readFileSync。
  * 读文件抛错时静默降级，用 fallback 字符串；这个接口要"永远能答"。
  */
@@ -107,12 +216,18 @@ router.get("/", (c) => {
   }
 
   const buildTime = process.env.NOWEN_BUILD_TIME?.trim();
+  const frontendBuildId = resolveFrontendBuildId();
+  const minClientVersion = resolveMinClientVersion();
 
   return c.json({
     appVersion: resolveAppVersion(),
     schemaVersion,
     codeSchemaVersion,
     ...(buildTime ? { buildTime } : {}),
+    // 仅当真的解析到时才返回字段，避免前端误判"有字段 == 已部署新方案"。
+    // 前端逻辑：frontendBuildId 有值优先用它比对，否则降级到 appVersion。
+    ...(frontendBuildId ? { frontendBuildId } : {}),
+    ...(minClientVersion ? { minClientVersion } : {}),
   });
 });
 

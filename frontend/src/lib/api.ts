@@ -557,6 +557,20 @@ export const api = {
     schemaVersion: number | null;
     codeSchemaVersion: number | null;
     buildTime?: string;
+    /**
+     * 当前实例托管的前端 bundle 标识（入口 chunk 的 hashed 文件名）。
+     * 存在即表示后端已经部署了"按 buildId 比对"的新方案；前端应优先用它
+     * 与本地 bundle 的 buildId 比对，避免"只升后端没升前端"导致的刷新 loop。
+     * 旧后端不返回此字段 → 前端降级到 appVersion 比对（向后兼容）。
+     */
+    frontendBuildId?: string;
+    /**
+     * 最低兼容客户端版本号（语义化版本字符串，例 "1.0.30"）。
+     * 用于 Android 原生壳硬性升级引导：当 __APP_VERSION__ < minClientVersion
+     * 时，前端展示不可关闭的"请下载新 APK"卡片，因为 WebView 内只刷 JS 解决
+     * 不了原生 plugin 不兼容。Web / Electron 无视此字段（它们走各自的升级通道）。
+     */
+    minClientVersion?: string;
   }> => {
     const res = await fetch(`${getBaseUrl()}/version`);
     if (!res.ok) throw new Error(`版本信息获取失败: ${res.status}`);

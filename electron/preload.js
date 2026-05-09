@@ -105,6 +105,25 @@ contextBridge.exposeInMainWorld("nowenDesktop", {
   releaseChannel: (process.argv || []).includes("--nowen-lite-only") ? "lite" : "latest",
 
   /**
+   * 是否运行在 portable / 免安装版下。
+   *
+   * electron-builder 的 Windows portable target 启动时会注入环境变量
+   * `PORTABLE_EXECUTABLE_FILE`（值为 .exe 自身路径）；其它包格式（NSIS 安装版、
+   * dmg、AppImage）不会有这个 env。我们在这里**仅**用它的存在性作为信号。
+   *
+   * 为什么需要：electron-updater 不支持 portable 包的差分自更新，autoUpdater
+   * 在 portable 上调 `checkForUpdates()` 会抛 error，但用户看到的现象是关于页
+   * 一直转圈或显示"更新失败"——很难排查。前端拿到 `isPortable=true` 后，应该
+   * 把"检查桌面端更新"按钮替换成"前往下载页"，给出明确的人工升级路径。
+   *
+   * 注意：AppImage 的"无升级"也类似，但目前 release 流水线没有 AppImage 产物，
+   * 暂不在这里处理；如未来加入，可在主进程里统一判定后通过额外字段下发。
+   */
+  isPortable: Boolean(
+    process.env.PORTABLE_EXECUTABLE_FILE && process.env.PORTABLE_EXECUTABLE_FILE.length > 0,
+  ),
+
+  /**
    * 凭据存储（记住密码 / 自动登录）。
    * renderer 同步 / 异步都走这些接口；主进程用 safeStorage 加密落盘。
    *

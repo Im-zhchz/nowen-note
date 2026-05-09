@@ -12,7 +12,7 @@ import UserManagement from "@/components/UserManagement";
 import WhatsNewModal from "@/components/WhatsNewModal";
 import { useSiteSettings, BUILTIN_FONTS, getBuiltinFontName } from "@/hooks/useSiteSettings";
 import { api } from "@/lib/api";
-import { isDesktop, checkForUpdates, onUpdaterStatus, getReleaseChannel, type UpdaterPayload } from "@/lib/desktopBridge";
+import { isDesktop, checkForUpdates, onUpdaterStatus, getReleaseChannel, isPortableDesktop, type UpdaterPayload } from "@/lib/desktopBridge";
 import { CustomFont } from "@/types";
 import { cn } from "@/lib/utils";
 
@@ -98,6 +98,10 @@ function VersionCompareCard() {
 
   const desktop = isDesktop();
   const releaseChannel = getReleaseChannel();
+  // Portable / 免安装版（Windows portable target）不走 electron-updater，
+  // autoUpdater.checkForUpdates() 会抛 error；此时按钮要换成"前往下载页"，
+  // 避免用户点了之后静默失败还以为是网络问题。
+  const portable = isPortableDesktop();
   const clientVersion = typeof __APP_VERSION__ === "string" ? __APP_VERSION__ : "0.0.0";
 
   // 拉版本信息
@@ -235,7 +239,9 @@ function VersionCompareCard() {
         </span>
       </div>
 
-      {/* 桌面端：检查更新按钮 + autoUpdater 状态 */}
+      {/* 桌面端：检查更新按钮 + autoUpdater 状态
+          Portable 版本不支持 electron-updater，切换成"前往下载页"CTA，
+          并显式给出原因提示，避免用户点按钮后只看到模糊的错误。 */}
       {desktop && (
         <div className="pt-2 border-t border-zinc-200/60 dark:border-zinc-800/60 space-y-2">
           {releaseChannel && (
@@ -243,29 +249,49 @@ function VersionCompareCard() {
               <span>发布渠道</span>
               <span className="font-mono px-1.5 py-0.5 rounded bg-zinc-200/60 dark:bg-zinc-700/40 text-zinc-700 dark:text-zinc-200">
                 {releaseChannel}
+                {portable ? " · portable" : ""}
               </span>
             </div>
           )}
-          <button
-            type="button"
-            onClick={handleCheckUpdates}
-            disabled={updaterStatus?.status === "checking" || updaterStatus?.status === "downloading"}
-            className="w-full flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-lg bg-accent-primary text-white text-xs font-medium hover:opacity-90 disabled:opacity-60"
-          >
-            <RefreshCw
-              size={12}
-              className={
-                updaterStatus?.status === "checking" || updaterStatus?.status === "downloading"
-                  ? "animate-spin"
-                  : ""
-              }
-            />
-            检查桌面端更新
-          </button>
-          {updaterStatus && (
-            <div className="text-xs text-zinc-500 dark:text-zinc-400 text-center">
-              {renderUpdaterStatus(updaterStatus)}
-            </div>
+          {portable ? (
+            <>
+              <a
+                href="https://github.com/cropflre/nowen-note/releases/latest"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="w-full flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-lg bg-accent-primary text-white text-xs font-medium hover:opacity-90"
+              >
+                <ExternalLink size={12} />
+                前往下载页
+              </a>
+              <p className="text-[11px] text-zinc-400 dark:text-zinc-500 text-center leading-relaxed">
+                免安装版不支持自动更新，请下载新版本 portable.exe 替换当前文件。
+              </p>
+            </>
+          ) : (
+            <>
+              <button
+                type="button"
+                onClick={handleCheckUpdates}
+                disabled={updaterStatus?.status === "checking" || updaterStatus?.status === "downloading"}
+                className="w-full flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-lg bg-accent-primary text-white text-xs font-medium hover:opacity-90 disabled:opacity-60"
+              >
+                <RefreshCw
+                  size={12}
+                  className={
+                    updaterStatus?.status === "checking" || updaterStatus?.status === "downloading"
+                      ? "animate-spin"
+                      : ""
+                  }
+                />
+                检查桌面端更新
+              </button>
+              {updaterStatus && (
+                <div className="text-xs text-zinc-500 dark:text-zinc-400 text-center">
+                  {renderUpdaterStatus(updaterStatus)}
+                </div>
+              )}
+            </>
           )}
         </div>
       )}

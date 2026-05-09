@@ -105,6 +105,13 @@ interface NowenDesktopAPI {
   releaseChannel?: "lite" | "latest";
   /** Lite-only 发行版标识（旧版本 preload 可能没有，按 undefined 处理）。 */
   isLiteOnly?: boolean;
+  /**
+   * 是否 portable / 免安装版（Windows portable target）。
+   * portable 包不支持 electron-updater 自更新，UI 应隐藏"检查更新"按钮，
+   * 改为引导用户去 GitHub Release 页人工下载新版。
+   * 旧版本 preload 不暴露此字段 → undefined（按 false 处理）。
+   */
+  isPortable?: boolean;
 }
 
 function getBridge(): NowenDesktopAPI | null {
@@ -133,6 +140,20 @@ export function getReleaseChannel(): "lite" | "latest" | null {
     return bridge.isLiteOnly ? "lite" : "latest";
   }
   return null;
+}
+
+/**
+ * 是否 portable / 免安装版桌面端（Windows portable target）。
+ *
+ * portable 包**不支持** electron-updater 自更新——autoUpdater.checkForUpdates()
+ * 会抛 error。AboutPanel 里据此把"检查桌面端更新"按钮替换成"前往下载页"，
+ * 给用户一个明确的人工升级路径，避免静默失败。
+ *
+ * 旧版本 preload（没注入 isPortable 字段）按 false 处理，行为不变。
+ */
+export function isPortableDesktop(): boolean {
+  const bridge = getBridge();
+  return bridge?.isPortable === true;
 }
 
 /** 订阅菜单事件，返回反注册函数。非 Electron 环境返回 no-op。 */
