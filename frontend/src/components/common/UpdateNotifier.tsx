@@ -15,19 +15,27 @@
  *          装不上新的原生 plugin / 权限 / API。用户必须重装 APK。
  *
  * =========================================================================
- * 版本比对策略（新）：
+ * 版本比对策略：
  *
- *   旧版本比的是 server.appVersion vs __APP_VERSION__。问题在于"只升后端
- *   忘推前端"的部署里，前端 bundle 里的 __APP_VERSION__ 永远和服务器的
- *   appVersion 对不上，用户刷新 N 次还是旧 bundle —— 陷入刷新 loop。
+ *   "appVersion 优先 + buildId 辅助去重"
  *
- *   现在优先用 server.frontendBuildId（后端从 `dist/index.html` 解析出的
- *   入口 chunk hash 名）作为"真相"。只要这次刷新拿到的新 bundle 里被注入
- *   的 __FRONTEND_BUILD_ID__ 与服务器一致，就认为"刷新到位"，不再提示。
+ *   1) server.appVersion 与 __APP_VERSION__ 相等 → 静默。版本号是发版的唯一
+ *      信源，相等就不该骚扰用户——即便 buildId 因 dev 态、CDN 前缀、反代重写
+ *      等原因对不上，也属于环境差异，不能越权触发提示。
  *
- *   __FRONTEND_BUILD_ID__ 由 vite.config.ts 在构建时注入（与 __APP_VERSION__
- *   同机制）。注入失败或后端不返回此字段时，自动降级到 appVersion 比对，
- *   保证向后兼容。
+ *   2) server.appVersion 不同 → 真发了新版，提示刷新。展示字符串用 appVersion
+ *      （更可读）；dismiss key 在两边 buildId 都存在且不同时升级为
+ *      `build:<hash>`，便于"同版本号但偷偷换了 bundle"的极端运维场景下做
+ *      精细去重，否则退回 appVersion。
+ *
+ *   3) server.appVersion 缺失或为 "0.0.0"（/api/version 的 fallback） → 没有
+ *      可靠的"新版本"概念，直接不提示。
+ *
+ *   历史背景：早期版本仅用 appVersion 比对，"只升后端忘推前端" 时前端
+ *   __APP_VERSION__ 永远赶不上服务器 → 刷新 loop。后来一度把 buildId 提到
+ *   最高优先级，反而引入相反的误报（同 appVersion 但 buildId 不同 → 假阳性）。
+ *   现在的折中是：把 buildId 降级为 dismiss 的辅助维度，提示触发完全交给
+ *   appVersion，两个误报方向都不会出现。
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -177,25 +185,37 @@ export default function UpdateNotifier() {
     }
 
     // ---- 软提示：前端 bundle 不一致 ----
-    // 优先用 frontendBuildId 比对（解决"只升后端忘推前端"的刷新 loop）；
-    // 后端未返回 buildId（老版本 / 源码态）时降级到 appVersion 比对。
-    let mismatched = false;
-    let displayKey: string; // 既作为 dismiss key 也作为展示字符串
-
-    if (serverInfo.frontendBuildId && CLIENT_BUILD_ID) {
-      mismatched = serverInfo.frontendBuildId !== CLIENT_BUILD_ID;
-      displayKey = `build:${serverInfo.frontendBuildId}`;
-    } else {
-      // 兜底：appVersion 为 "0.0.0" 时说明后端也解析失败（/api/version 的 fallback），
-      // 没有可靠的"新版本"概念，直接不提示，避免错误提示污染用户。
-      mismatched =
-        !!serverInfo.appVersion &&
-        serverInfo.appVersion !== "0.0.0" &&
-        serverInfo.appVersion !== CLIENT_VERSION;
-      displayKey = serverInfo.appVersion;
+    //
+    // 比对优先级（从强到弱）：
+    //   1) appVersion 相等          → 直接静默。这是用户最直觉的"版本号一样
+    //      为什么还提示我"。即便 buildId 因 dev 态、CDN 前缀、反代重写等原因
+    //      对不上，也不该越权骚扰；版本号是发版的唯一信源。
+    //   2) appVersion 不同          → 真发了新版，提示。展示字符串用 appVersion，
+    //      dismiss key 用 buildId（若两边都有）以便同版本下不同 bundle 的精细
+    //      去重，否则退回 appVersion。
+    //   3) appVersion 缺失/不可信   → 服务器是 "0.0.0"（fallback）或空串，
+    //      不存在"新版本"语义，直接不提示。
+    //
+    // 关键修复：之前 buildId 优先级最高，导致 appVersion 相等但 buildId 不同
+    // 的常见环境（dev、反代、CDN）也持续提示——明明用户什么也升不动。
+    const serverApp = serverInfo.appVersion;
+    if (!serverApp || serverApp === "0.0.0") {
+      return { kind: "none", serverDisplay: "" };
+    }
+    if (serverApp === CLIENT_VERSION) {
+      // 版本号一致 → 安静。即使 buildId 不同也认为是环境差异（hash 算法 / 反代
+      // 路径），而不是"用户需要刷新"。真出现"同版本号不同 bundle"的运维事故，
+      // 会通过下一次发版的版本号变化自动恢复提示，不会丢失通知能力。
+      return { kind: "none", serverDisplay: "" };
     }
 
-    if (!mismatched) return { kind: "none", serverDisplay: "" };
+    // 走到这里说明 appVersion 真的不同 → 提示
+    const buildKey =
+      serverInfo.frontendBuildId && CLIENT_BUILD_ID && serverInfo.frontendBuildId !== CLIENT_BUILD_ID
+        ? `build:${serverInfo.frontendBuildId}`
+        : null;
+    const displayKey = buildKey ?? serverApp;
+
     if (displayKey === dismissed) return { kind: "none", serverDisplay: "" };
 
     return {
@@ -217,10 +237,16 @@ export default function UpdateNotifier() {
 
   const handleDismiss = () => {
     // 软提示才允许关闭。硬升级走这里不会被调用（UI 根本不渲染关闭按钮）。
+    // 走到这里 serverInfo.appVersion 必定 ≠ CLIENT_VERSION（state 计算保证），
+    // 所以 dismiss key 至少能拿到一个稳定的服务器版本号；buildId 只在两边
+    // 都有且不同时作为更精细的去重维度，避免"同版本号下 bundle 微变"也被
+    // 一次 dismiss 永久压住。
     if (!serverInfo) return;
-    const key = serverInfo.frontendBuildId
-      ? `build:${serverInfo.frontendBuildId}`
-      : serverInfo.appVersion;
+    const buildKey =
+      serverInfo.frontendBuildId && CLIENT_BUILD_ID && serverInfo.frontendBuildId !== CLIENT_BUILD_ID
+        ? `build:${serverInfo.frontendBuildId}`
+        : null;
+    const key = buildKey ?? serverInfo.appVersion;
     try {
       sessionStorage.setItem(DISMISS_KEY, key);
     } catch {
