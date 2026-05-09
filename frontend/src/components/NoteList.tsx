@@ -285,14 +285,29 @@ function NotebookTreeItem({
 }
 
 function MoveNoteModal({
-  isOpen, noteTitle, count, currentNotebookId, notebooks, onMove, onClose,
+  isOpen, noteTitle, count, currentNotebookId, notebooks, sourceWorkspaceId, onMove, onClose,
 }: {
   isOpen: boolean; noteTitle: string; count?: number; currentNotebookId: string;
-  notebooks: Notebook[]; onMove: (notebookId: string) => void; onClose: () => void;
+  notebooks: Notebook[];
+  /**
+   * 源笔记所在的工作区（null = 个人空间）。候选目标会被严格限制到同一个
+   * workspace，以匹配后端 PUT /notes/:id 的 "CROSS_WORKSPACE_MOVE_FORBIDDEN"
+   * 校验——避免用户在"混合列表"状态下选到另一空间的笔记本后收到 400。
+   *
+   * 不传（undefined） → 不做过滤，回落到旧行为（给所有 notebooks）。
+   */
+  sourceWorkspaceId?: string | null;
+  onMove: (notebookId: string) => void; onClose: () => void;
 }) {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const { t } = useTranslation();
-  const tree = buildNotebookTree(notebooks);
+  // 归一化：workspaceId 为 undefined/"" 都视作 null（= 个人空间）
+  const normalizedSrc = sourceWorkspaceId === undefined ? undefined : (sourceWorkspaceId || null);
+  const filteredNotebooks =
+    normalizedSrc === undefined
+      ? notebooks
+      : notebooks.filter((nb) => (nb.workspaceId || null) === normalizedSrc);
+  const tree = buildNotebookTree(filteredNotebooks);
   const isBulk = (count || 1) > 1;
 
   useEffect(() => {
@@ -937,7 +952,15 @@ export default function NoteList() {
   const { state } = useApp();
   const actions = useAppActions();
   const { menu, menuRef, openMenu, closeMenu } = useContextMenu();
-  const [moveModal, setMoveModal] = useState<{ noteIds: string[]; noteTitle: string; notebookId: string } | null>(null);
+  // moveModal 新增 sourceWorkspaceId：源笔记所在工作区（null = 个人空间）。
+  // 后端已强制"源/目标同 workspace"，这里把 UI 候选也按同一规则过滤，避免让用户
+  // 选到必然会被 400 拒绝的跨空间笔记本。
+  const [moveModal, setMoveModal] = useState<{
+    noteIds: string[];
+    noteTitle: string;
+    notebookId: string;
+    sourceWorkspaceId: string | null;
+  } | null>(null);
   const [pickerOpen, setPickerOpen] = useState(false);
   const [dateFilter, setDateFilter] = useState<string | null>(null); // YYYY-MM-DD
   const [showCalendar, setShowCalendar] = useState(false);
@@ -1452,16 +1475,31 @@ export default function NoteList() {
             toast.warning(t('common.noteLockedCannotEdit') || t('editor.lockedBanner'));
             break;
           }
+          // 批量移动要求源都在同一个 workspace，否则直接拒绝（后端反正也会拒）。
+          // 用 Set 收集所有涉及到的 workspaceId（归一化 undefined/"" → null）。
+          const wsSet = new Set<string | null>(
+            ids.map((id) => {
+              const n = state.notes.find((x) => x.id === id);
+              return (n?.workspaceId || null) as string | null;
+            }),
+          );
+          if (wsSet.size > 1) {
+            toast.warning("所选笔记跨多个工作区，请分别移动");
+            break;
+          }
+          const [sourceWs] = Array.from(wsSet);
           setMoveModal({
             noteIds: ids,
             noteTitle: targetNote.title,
             notebookId: targetNote.notebookId,
+            sourceWorkspaceId: sourceWs ?? null,
           });
         } else {
           setMoveModal({
             noteIds: [targetId],
             noteTitle: targetNote.title,
             notebookId: targetNote.notebookId,
+            sourceWorkspaceId: (targetNote.workspaceId || null) as string | null,
           });
         }
         break;
@@ -1501,6 +1539,16 @@ export default function NoteList() {
     const failed = results.filter((r) => r.status === "rejected").length;
     const success = ids.length - failed;
 
+    // 识别"跨工作区被后端拒绝"的专属错误码，给出显式提示——否则会落到
+    // bulkMoveFailed 的通用"移动失败"文案，让用户不知道问题是什么。
+    // 后端返回形如 { error, code: "CROSS_WORKSPACE_MOVE_FORBIDDEN", ... }，
+    // api.ts 的 request() 会把该 body 序列化后塞进 Error.message。
+    const crossWsRejected = results.filter(
+      (r) =>
+        r.status === "rejected" &&
+        /CROSS_WORKSPACE_MOVE_FORBIDDEN/.test(String((r as PromiseRejectedResult).reason?.message || "")),
+    ).length;
+
     // 同步 activeNote（若它也在被移动的列表里）
     if (state.activeNote && ids.includes(state.activeNote.id)) {
       actions.setActiveNote({ ...state.activeNote, notebookId: targetNotebookId });
@@ -1513,11 +1561,21 @@ export default function NoteList() {
     actions.refreshNotebooks();
 
     if (ids.length === 1) {
-      if (failed) toast.error(t('noteList.bulkMoveFailed', { error: '' }));
+      if (failed) {
+        if (crossWsRejected > 0) {
+          toast.error("不能跨工作区移动，目标笔记本与源笔记不在同一空间");
+        } else {
+          toast.error(t('noteList.bulkMoveFailed', { error: '' }));
+        }
+      }
     } else if (failed === 0) {
       toast.success(t('noteList.bulkMoveSuccess', { count: success }));
     } else if (success === 0) {
-      toast.error(t('noteList.bulkMoveFailed', { error: '' }));
+      if (crossWsRejected === failed) {
+        toast.error("不能跨工作区移动，目标笔记本与源笔记不在同一空间");
+      } else {
+        toast.error(t('noteList.bulkMoveFailed', { error: '' }));
+      }
     } else {
       toast.warning(t('noteList.bulkMovePartial', { success, failed }));
     }
@@ -1825,10 +1883,23 @@ export default function NoteList() {
                       return;
                     }
                     const first = state.notes.find((n) => n.id === ids[0]);
+                    // 与右键菜单同样做跨 workspace 防护
+                    const wsSet = new Set<string | null>(
+                      ids.map((id) => {
+                        const n = state.notes.find((x) => x.id === id);
+                        return (n?.workspaceId || null) as string | null;
+                      }),
+                    );
+                    if (wsSet.size > 1) {
+                      toast.warning("所选笔记跨多个工作区，请分别移动");
+                      return;
+                    }
+                    const [sourceWs] = Array.from(wsSet);
                     setMoveModal({
                       noteIds: ids,
                       noteTitle: first?.title || "",
                       notebookId: first?.notebookId || "",
+                      sourceWorkspaceId: sourceWs ?? null,
                     });
                   }}
                   title={t('noteList.moveSelected')}
@@ -2004,6 +2075,7 @@ export default function NoteList() {
         count={moveModal?.noteIds.length || 1}
         currentNotebookId={moveModal?.notebookId || ""}
         notebooks={state.notebooks}
+        sourceWorkspaceId={moveModal?.sourceWorkspaceId ?? null}
         onMove={handleMoveNote}
         onClose={() => setMoveModal(null)}
       />

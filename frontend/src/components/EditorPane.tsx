@@ -907,15 +907,38 @@ export default function EditorPane() {
 
   const handleMoveToNotebook = useCallback(async (notebookId: string) => {
     if (!activeNote || notebookId === activeNote.notebookId) return;
-    const updated = await api.updateNote(activeNote.id, { notebookId } as any);
-    actions.setActiveNote(updated);
-    actions.updateNoteInList({ id: updated.id, notebookId: updated.notebookId });
-    setShowMoveDropdown(false);
-    actions.refreshNotebooks();
+    // 必须 try/catch：后端对跨工作区移动会返回 400 CROSS_WORKSPACE_MOVE_FORBIDDEN，
+    // 若不捕获会冒泡成 "Uncaught (in promise)" 噪音。这里识别错误码给出明确提示。
+    try {
+      const updated = await api.updateNote(activeNote.id, { notebookId } as any);
+      actions.setActiveNote(updated);
+      actions.updateNoteInList({ id: updated.id, notebookId: updated.notebookId });
+      setShowMoveDropdown(false);
+      actions.refreshNotebooks();
+    } catch (e: any) {
+      const msg = String(e?.message || "");
+      if (/CROSS_WORKSPACE_MOVE_FORBIDDEN/.test(msg)) {
+        toast.error("不能跨工作区移动，目标笔记本与当前笔记不在同一空间");
+      } else {
+        toast.error(msg || "移动失败");
+      }
+      setShowMoveDropdown(false);
+    }
   }, [activeNote, actions]);
 
   // 构建与左侧侧边栏完全一致的笔记本树
-  const notebookTree = useMemo(() => buildTree(state.notebooks), [state.notebooks]);
+  //
+  // 但"移动到笔记本"的候选必须严格限制在**当前笔记所在的 workspace**：
+  // 后端 PUT /notes/:id 已强制源/目标同 workspace，这里做前端软 guard，让
+  // 用户看到的树就是干净的同空间树，避免点到必然会被 400 拒绝的笔记本。
+  // workspaceId 归一：undefined/"" 都视作 null（= 个人空间）。
+  const notebookTree = useMemo(() => {
+    const srcWs = (activeNote?.workspaceId || null) as string | null;
+    const sameWsNotebooks = activeNote
+      ? state.notebooks.filter((nb) => (nb.workspaceId || null) === srcWs)
+      : state.notebooks;
+    return buildTree(sameWsNotebooks);
+  }, [state.notebooks, activeNote]);
   // 当前笔记所属笔记本的完整路径（面包屑）
   const currentPath = useMemo(
     () => findPathById(state.notebooks, activeNote?.notebookId),

@@ -27,6 +27,7 @@ import { useBackButton, hideSplashScreen, useStatusBarSync, useKeyboardLayout, i
 import { useDesktopMenuBridge } from "@/hooks/useDesktopMenuBridge";
 import CommandPalette from "@/components/common/CommandPalette";
 import OfflineIndicator from "@/components/common/OfflineIndicator";
+import UpdateNotifier from "@/components/common/UpdateNotifier";
 
 function SidebarResizeHandle() {
   const { state } = useApp();
@@ -313,6 +314,45 @@ function AppLayout() {
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [quickCreateNote]);
 
+  // ── 工作区切换：清空当前会话态，回到空态页 ──────────────────────────
+  //
+  // WorkspaceSwitcher 切换后会广播 "nowen:workspace-changed"。之前只有 Sidebar /
+  // TaskCenter / FileManager / DiaryCenter / MindMap 自己监听并各自重拉，但
+  // App 顶层并没有清理"正在编辑的笔记 + 笔记列表 + 选择/筛选状态"——于是会
+  // 出现两类问题：
+  //   1) 切到 A 空间后，右侧仍显示着 B 空间的 activeNote，且该笔记被 B 空间
+  //      的权限/归属保护，任何保存操作都可能落到错误的上下文里；
+  //   2) 上一次选中的 notebookId / tagId 仍在 state 中，下一次"快速新建"会
+  //      把新笔记塞到不属于当前空间的笔记本里（后端已拒，但 UX 很糟）。
+  //
+  // 切换工作区是一次强隔离事件，正确的交互是：**回到"选择一条笔记开始编辑
+  // / Alt+N 快速新建"空态页**。因此这里统一做：
+  //   - activeNote = null      → EditorPane 渲染空态
+  //   - notes = []             → 避免旧空间的列表残留（后续 refresh 会填）
+  //   - selectedNotebookId/Tag = null
+  //   - viewMode = "all"       → 回到"所有笔记"默认视图
+  //   - mobileView = "list"    → 移动端从编辑页退回列表页
+  //   - searchQuery = ""       → 搜索词也一并清掉，避免跨空间的语义错位
+  //   - refreshNotes/Notebooks → 触发重拉，让 Sidebar/NoteList 拿到新空间数据
+  //
+  // 注：notebooks/tags 本身由 Sidebar 监听同一事件重拉，这里不重复；但我们
+  //     显式调用 refreshNotebooks 以统一触发一次订阅刷新，保持一致性。
+  useEffect(() => {
+    const onWorkspaceChanged = () => {
+      actions.setActiveNote(null);
+      actions.setNotes([]);
+      actions.setSelectedNotebook(null);
+      actions.setSelectedTag(null);
+      actions.setViewMode("all");
+      actions.setMobileView("list");
+      actions.setSearchQuery("");
+      actions.refreshNotes();
+      actions.refreshNotebooks();
+    };
+    window.addEventListener("nowen:workspace-changed", onWorkspaceChanged);
+    return () => window.removeEventListener("nowen:workspace-changed", onWorkspaceChanged);
+  }, [actions]);
+
   // Electron 桌面端：菜单 / 托盘动作 IPC 桥
   useDesktopMenuBridge({
     onNewNote: () => void quickCreateNote(),
@@ -437,6 +477,9 @@ function AppLayout() {
 
       {/* 离线状态 + 待同步指示器 */}
       <OfflineIndicator />
+
+      {/* 服务端版本升级提示（前端 bundle 与服务端不一致时） */}
+      <UpdateNotifier />
     </div>
   );
 }

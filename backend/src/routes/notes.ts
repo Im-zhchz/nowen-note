@@ -449,7 +449,22 @@ app.put("/:id", async (c) => {
     }
   }
 
-  // 移动笔记到其他笔记本时，同步更新 workspaceId
+  // 移动笔记到其他笔记本（改 notebookId）——严格的工作区隔离
+  //
+  // 规则：**源笔记所在的 workspace 必须与目标 notebook 所在的 workspace 完全一致**
+  //       （含"都为 null = 个人空间"的情形）。跨工作区移动一律 400 拒绝。
+  //
+  // 背景：历史实现只检查"目标 notebook 存在 + 当前用户对其有 write 权限"，然后就
+  //       把 notes.workspaceId 同步改成目标 notebook 的 workspaceId。对于同时是
+  //       "个人空间 owner"和"某工作区 editor"的用户，两个 write 条件会同时成立，
+  //       从而出现"在个人空间视图里把工作站工作区的笔记拖进个人笔记本 → 笔记被
+  //       过户到个人空间"这类跨空间污染。
+  //
+  // 对照：notebooks.ts:179 的 /:id/move 路由已经正确做了同空间校验，此处补齐，
+  //       让 notes 与 notebooks 的保护对称。
+  //
+  // 归一：个人空间在 DB 中以 workspaceId = NULL 表示；`|| null` 把 undefined/""
+  //       也归一到 null 再比较，避免 "null !== undefined" 的字符串假阳性。
   let newWorkspaceId: string | null | undefined = undefined;
   if (body.notebookId !== undefined) {
     const nb = db.prepare("SELECT workspaceId FROM notebooks WHERE id = ?").get(body.notebookId) as
@@ -458,11 +473,34 @@ app.put("/:id", async (c) => {
     if (!nb) return c.json({ error: "目标笔记本不存在" }, 404);
     newWorkspaceId = nb.workspaceId;
 
+    // ★ 严格空间隔离：源/目标必须同 workspace（都为 null = 个人空间 也算同）
+    const srcWs = noteWorkspaceId || null;
+    const dstWs = nb.workspaceId || null;
+    if (srcWs !== dstWs) {
+      return c.json(
+        {
+          error: "不能跨工作区移动笔记",
+          code: "CROSS_WORKSPACE_MOVE_FORBIDDEN",
+          sourceWorkspaceId: srcWs,
+          targetWorkspaceId: dstWs,
+        },
+        400,
+      );
+    }
+
     // 目标笔记本必须有 write 权限
     const targetPerm = resolveNotebookPermission(body.notebookId, userId);
     if (!hasPermission(targetPerm.permission, "write")) {
       return c.json({ error: "您对目标笔记本无权限" }, 403);
     }
+  }
+
+  // 防御性：即使前端误传 workspaceId 字段也一律忽略——workspaceId 的唯一合法
+  // 来源是"目标 notebook 的归属"（见上），不允许客户端直接改写，以免绕过上面
+  // 的同空间校验。writeFields 白名单里本就没有 workspaceId，这里只是显式说明。
+  if ("workspaceId" in body) {
+    // 不 return，只是清掉，不污染后续 UPDATE 字段收集
+    delete (body as Record<string, unknown>).workspaceId;
   }
 
   // Phase 3: 保存版本历史（仅在内容有实质变更时）
