@@ -88,9 +88,9 @@ DO_TAR=0               # --tar，仅在 build-only + arm64 下
 TAR_OUT="$DEFAULT_TAR_OUT"
 DO_PUSH_CUSTOM=0       # --push，仅在 build-only + 自定义 image 下
 
-# ===== 多端发版（PC / Android / Docker / GitHub Releases / 飞牛 .fpk） =====
-# TARGETS 用逗号分隔的集合：docker / pc / android / fpk / all
-# 默认 docker（向后兼容旧行为）；all = docker,pc,android,fpk
+# ===== 多端发版（PC / Android / Docker / GitHub Releases / 飞牛 .fpk / Lite / Clipper） =====
+# TARGETS 用逗号分隔的集合：docker / pc / android / fpk / lite / clipper / all
+# 默认 docker（向后兼容旧行为）；all = docker,pc,android,fpk,lite,clipper
 TARGETS="docker"
 TARGETS_EXPLICIT=0     # 用户是否通过 --target 显式指定了
 DO_GITHUB_RELEASE=0    # --github-release：把 PC/Android 产物上传到 GitHub Release（自动打 tag）
@@ -153,8 +153,10 @@ usage() {
       --no-git-tag         不打 git tag / 不推送到 GitHub
 
 多端发版选项（可组合）:
-      --target TARGETS     逗号分隔：docker / pc / android / fpk / all
-                           默认 docker；示例：--target pc,android,fpk
+      --target TARGETS     逗号分隔：docker / pc / android / fpk / lite / clipper / all
+                           默认 docker；示例：--target pc,android,fpk,lite,clipper
+                           - lite     : 调 scripts/build-lite.mjs 出 \"无后端\" 的 PC 安装包
+                           - clipper  : 调 packages/nowen-clipper 出浏览器扩展 zip
       --fpk-dockerhub-repo USER/REPO
                            飞牛 .fpk 引用的 dockerhub 镜像（默认取 cropflre/nowen-note）
       --pc-platform LIST   PC 端要打的平台，逗号分隔：win / linux / mac
@@ -284,11 +286,13 @@ if [ "$TARGETS_EXPLICIT" = "0" ] && [ "$BUILD_ONLY" = "0" ] && [ "$ASSUME_YES" =
     echo "  ${C_CYAN}2${C_RESET})  PC 客户端                 打包 exe / AppImage / deb / dmg"
     echo "  ${C_CYAN}3${C_RESET})  Android APK               打包 Android 安装包"
     echo "  ${C_CYAN}4${C_RESET})  PC + Android              同时打 PC 和 Android"
-    echo "  ${C_BOLD}${C_GREEN}5${C_RESET})  ${C_BOLD}🚀 一键全量发布${C_RESET}          git tag + Docker(amd64+arm64) + exe + APK + .fpk + GitHub Releases"
-    echo "  ${C_CYAN}6${C_RESET})  自定义组合                手动输入 docker,pc,android,fpk 组合"
+    echo "  ${C_BOLD}${C_GREEN}5${C_RESET})  ${C_BOLD}🚀 一键全量发布${C_RESET}          git tag + Docker(amd64+arm64) + exe + APK + .fpk + lite + clipper + GitHub Releases"
+    echo "  ${C_CYAN}6${C_RESET})  自定义组合                手动输入 docker,pc,android,fpk,lite,clipper 组合"
     echo "  ${C_CYAN}7${C_RESET})  飞牛 .fpk                 仅打包飞牛 NAS 安装包（要求镜像已发到 Docker Hub）"
+    echo "  ${C_CYAN}8${C_RESET})  Lite 版（无后端）          仅打 PC 端 lite 安装包（builder.lite.config.js）"
+    echo "  ${C_CYAN}9${C_RESET})  浏览器扩展 (clipper)        仅打 nowen-clipper 浏览器扩展 zip"
     echo
-    read -r -p "请输入序号 [1-7]（默认 1）: " _mode_choice
+    read -r -p "请输入序号 [1-9]（默认 1）: " _mode_choice
     _mode_choice="${_mode_choice:-1}"
 
     # _ONE_SHOT=1 表示"一键全量发布"模式：后续 Docker 架构 / PC 平台 / Android 方式 /
@@ -301,7 +305,7 @@ if [ "$TARGETS_EXPLICIT" = "0" ] && [ "$BUILD_ONLY" = "0" ] && [ "$ASSUME_YES" =
         3) TARGETS="android" ;;
         4) TARGETS="pc,android" ;;
         5)
-            TARGETS="docker,pc,android,fpk"
+            TARGETS="docker,pc,android,fpk,lite,clipper"
             _ONE_SHOT=1
             # ---- 一键全量：Docker 多架构 ----
             ARCH="multi"
@@ -348,24 +352,35 @@ if [ "$TARGETS_EXPLICIT" = "0" ] && [ "$BUILD_ONLY" = "0" ] && [ "$ASSUME_YES" =
             info "   - GitHub 发布: ${C_GREEN}是${C_RESET}"
             info "   - git pull:    ${C_GREEN}是${C_RESET}"
             info "   - 飞牛 .fpk:   ${C_GREEN}是${C_RESET}（在 Docker push 后构建）"
+            info "   - Lite 版:     ${C_GREEN}是${C_RESET}（无后端 PC 安装包）"
+            info "   - 浏览器扩展:  ${C_GREEN}是${C_RESET}（nowen-clipper zip）"
             info "   - 原子发布:    ${C_GREEN}是${C_RESET}（三端全部构建成功才推送）"
             ;;
         6)
             echo
-            echo "  可选值：${C_GREEN}docker${C_RESET}, ${C_GREEN}pc${C_RESET}, ${C_GREEN}android${C_RESET}, ${C_GREEN}fpk${C_RESET}（逗号分隔）"
+            echo "  可选值：${C_GREEN}docker${C_RESET}, ${C_GREEN}pc${C_RESET}, ${C_GREEN}android${C_RESET}, ${C_GREEN}fpk${C_RESET}, ${C_GREEN}lite${C_RESET}, ${C_GREEN}clipper${C_RESET}（逗号分隔）"
             read -r -p "  请输入组合: " _custom_targets
             [ -z "$_custom_targets" ] && die "未输入任何目标"
             TARGETS="$_custom_targets"
             ;;
         7) TARGETS="fpk" ;;
+        8) TARGETS="lite" ;;
+        9) TARGETS="clipper" ;;
         *) die "无效选择: $_mode_choice" ;;
     esac
     [ "$_ONE_SHOT" = "0" ] && info "已选择发布目标: ${C_GREEN}${TARGETS}${C_RESET}"
 
     # 提前解析一下 TARGETS，以便后续步骤做条件判断
-    _W_HAS_DOCKER=0; _W_HAS_PC=0; _W_HAS_ANDROID=0; _W_HAS_FPK=0
+    _W_HAS_DOCKER=0; _W_HAS_PC=0; _W_HAS_ANDROID=0; _W_HAS_FPK=0; _W_HAS_LITE=0; _W_HAS_CLIPPER=0
     for _wt in $(echo "$TARGETS" | tr ',' ' '); do
-        case "$_wt" in docker) _W_HAS_DOCKER=1;; pc) _W_HAS_PC=1;; android) _W_HAS_ANDROID=1;; fpk) _W_HAS_FPK=1;; esac
+        case "$_wt" in
+            docker)  _W_HAS_DOCKER=1 ;;
+            pc)      _W_HAS_PC=1 ;;
+            android) _W_HAS_ANDROID=1 ;;
+            fpk)     _W_HAS_FPK=1 ;;
+            lite)    _W_HAS_LITE=1 ;;
+            clipper) _W_HAS_CLIPPER=1 ;;
+        esac
     done
 
     # ======== 第 2 步：Docker 架构（仅当目标包含 docker 时） ========
@@ -479,7 +494,7 @@ if [ "$TARGETS_EXPLICIT" = "0" ] && [ "$BUILD_ONLY" = "0" ] && [ "$ASSUME_YES" =
     fi
 
     # ======== 第 5 步：GitHub Release ========
-    if [ "$_ONE_SHOT" = "0" ] && { [ "$_W_HAS_PC" = "1" ] || [ "$_W_HAS_ANDROID" = "1" ] || [ "$_W_HAS_FPK" = "1" ]; }; then
+    if [ "$_ONE_SHOT" = "0" ] && { [ "$_W_HAS_PC" = "1" ] || [ "$_W_HAS_ANDROID" = "1" ] || [ "$_W_HAS_FPK" = "1" ] || [ "$_W_HAS_LITE" = "1" ] || [ "$_W_HAS_CLIPPER" = "1" ]; }; then
         echo
         echo "${C_BOLD}🚀 第 5 步：是否上传产物到 GitHub Releases？${C_RESET}"
         echo
@@ -544,43 +559,46 @@ if [ "$TARGETS_EXPLICIT" = "0" ] && [ "$BUILD_ONLY" = "0" ] && [ "$ASSUME_YES" =
 fi
 
 # 展开 TARGETS
-# - all -> docker,pc,android,fpk
+# - all -> docker,pc,android,fpk,lite,clipper
 # - 去重 / 校验
 TARGETS="$(echo "$TARGETS" | tr ',' '\n' | awk 'NF{print}' | sort -u | tr '\n' ',' | sed 's/,$//')"
 if echo ",$TARGETS," | grep -q ',all,'; then
-    TARGETS="docker,pc,android,fpk"
+    TARGETS="docker,pc,android,fpk,lite,clipper"
 fi
-HAS_DOCKER=0; HAS_PC=0; HAS_ANDROID=0; HAS_FPK=0
+HAS_DOCKER=0; HAS_PC=0; HAS_ANDROID=0; HAS_FPK=0; HAS_LITE=0; HAS_CLIPPER=0
 for t in $(echo "$TARGETS" | tr ',' ' '); do
     case "$t" in
         docker)  HAS_DOCKER=1 ;;
         pc)      HAS_PC=1 ;;
         android) HAS_ANDROID=1 ;;
         fpk)     HAS_FPK=1 ;;
-        *)       die "--target 未知值: $t （合法: docker / pc / android / fpk / all）" ;;
+        lite)    HAS_LITE=1 ;;
+        clipper) HAS_CLIPPER=1 ;;
+        *)       die "--target 未知值: $t （合法: docker / pc / android / fpk / lite / clipper / all）" ;;
     esac
 done
 [ "$HAS_DOCKER" = "0" ] && [ "$HAS_PC" = "0" ] && [ "$HAS_ANDROID" = "0" ] && [ "$HAS_FPK" = "0" ] \
+    && [ "$HAS_LITE" = "0" ] && [ "$HAS_CLIPPER" = "0" ] \
     && die "--target 至少包含一个目标"
 
 # ===== 自动推断 --github-release =====
-# 当 target 包含 pc/android/fpk 时，自动启用 GitHub Release 上传（无需手动加 --github-release）
-# 因为 PC/Android/fpk 产物的主要分发渠道就是 GitHub Releases
+# 当 target 包含 pc/android/fpk/lite/clipper 时，自动启用 GitHub Release 上传
+# 因为这些产物的主要分发渠道就是 GitHub Releases
 # 若用户显式传了 --no-github-release 则跳过自动推断
 if [ "$DO_GITHUB_RELEASE" = "0" ] && [ "$NO_GITHUB_RELEASE_EXPLICIT" = "0" ] \
-   && { [ "$HAS_PC" = "1" ] || [ "$HAS_ANDROID" = "1" ] || [ "$HAS_FPK" = "1" ]; }; then
-    info "检测到 target 包含 pc/android/fpk，自动启用 --github-release（可用 --no-github-release 关闭）"
+   && { [ "$HAS_PC" = "1" ] || [ "$HAS_ANDROID" = "1" ] || [ "$HAS_FPK" = "1" ] || [ "$HAS_LITE" = "1" ] || [ "$HAS_CLIPPER" = "1" ]; }; then
+    info "检测到 target 包含 pc/android/fpk/lite/clipper，自动启用 --github-release（可用 --no-github-release 关闭）"
     DO_GITHUB_RELEASE=1
 fi
 
 # ===== 自动推断 --atomic（原子发布） =====
-# 多端组合（Docker+PC / Docker+Android / Docker+PC+Android）时自动开启：
+# 多端组合（任意 ≥2 个 target）时自动开启：
 # 先把所有构建完成，最后统一执行 docker push / git tag / GitHub Release，
 # 避免"Docker 镜像已推送，但 PC/Android 构建失败"的半成品状态。
 # 单目标时没有跨端一致性需求，保持关闭以免 multi 模式需要额外构建开销。
 # 用户显式传了 --atomic / --no-atomic 时不再自动推断。
 if [ "$ATOMIC_RELEASE" = "-1" ]; then
-    _TARGET_COUNT=$((HAS_DOCKER + HAS_PC + HAS_ANDROID + HAS_FPK))
+    _TARGET_COUNT=$((HAS_DOCKER + HAS_PC + HAS_ANDROID + HAS_FPK + HAS_LITE + HAS_CLIPPER))
     if [ "$_TARGET_COUNT" -ge 2 ]; then
         ATOMIC_RELEASE=1
         info "检测到多端组合（${TARGETS}），自动启用 ${C_GREEN}原子发布${C_RESET}（可用 --no-atomic 关闭）"
@@ -609,8 +627,8 @@ if [ "$BUILD_ONLY" = "1" ]; then
         DO_PUSH_CUSTOM=1
     fi
     # build-only 仅对 docker 构建有意义
-    if [ "$HAS_PC" = "1" ] || [ "$HAS_ANDROID" = "1" ] || [ "$HAS_FPK" = "1" ]; then
-        die "--build-only 模式不支持 --target pc/android/fpk（仅限 docker）"
+    if [ "$HAS_PC" = "1" ] || [ "$HAS_ANDROID" = "1" ] || [ "$HAS_FPK" = "1" ] || [ "$HAS_LITE" = "1" ] || [ "$HAS_CLIPPER" = "1" ]; then
+        die "--build-only 模式不支持 --target pc/android/fpk/lite/clipper（仅限 docker）"
     fi
     if [ "$DO_GITHUB_RELEASE" = "1" ]; then
         die "--build-only 模式不支持 --github-release"
@@ -835,6 +853,26 @@ Linux 版下载（飞牛官方）：https://www.fnnas.com/  → 开发者工具 
         FPK_DOCKERHUB_REPO="$DEFAULT_IMAGE_NAME"
     fi
     info "fpk 镜像地址: ${C_GREEN}${FPK_DOCKERHUB_REPO}${C_RESET}"
+fi
+
+# lite target 前置检查
+# Lite 版完全复用 PC 端的 electron-builder 链路，但走 builder.lite.config.js，
+# 不打 backend，因此无需 wine + better-sqlite3 等 PC target 的重型依赖。
+if [ "$HAS_LITE" = "1" ]; then
+    [ -f "scripts/build-lite.mjs" ]                  || die "未找到 scripts/build-lite.mjs（lite 打包脚本）"
+    [ -f "electron/builder.lite.config.js" ]         || die "未找到 electron/builder.lite.config.js"
+    command -v node >/dev/null 2>&1                  || die "未安装 node（lite 打包需要）"
+fi
+
+# clipper target 前置检查
+# 浏览器扩展打包独立于主仓库的 npm workspace，需要 packages/nowen-clipper 自身
+# 装好依赖（首跑会自动 npm install）。
+if [ "$HAS_CLIPPER" = "1" ]; then
+    [ -d "packages/nowen-clipper" ]                  || die "未找到 packages/nowen-clipper 目录"
+    [ -f "packages/nowen-clipper/package.json" ]     || die "未找到 packages/nowen-clipper/package.json"
+    [ -f "packages/nowen-clipper/scripts/pack.mjs" ] || die "未找到 packages/nowen-clipper/scripts/pack.mjs"
+    command -v node >/dev/null 2>&1                  || die "未安装 node（clipper 打包需要）"
+    command -v npm  >/dev/null 2>&1                  || die "未安装 npm（clipper 打包需要）"
 fi
 
 # -------------------- 发布模式专属前置检查 --------------------
@@ -1222,6 +1260,12 @@ else
             echo "                  ${C_YELLOW}(未同时构建 docker target，请确保镜像已发布到 Docker Hub)${C_RESET}"
         fi
     fi
+    if [ "$HAS_LITE" = "1" ]; then
+        echo "  Lite 版       : scripts/build-lite.mjs（electron/builder.lite.config.js）"
+    fi
+    if [ "$HAS_CLIPPER" = "1" ]; then
+        echo "  浏览器扩展    : packages/nowen-clipper -> nowen-clipper-<ver>.zip"
+    fi
     echo "  同步 git tag  : $([ "$DO_GIT_TAG" = "1" ] && echo yes || echo no)"
     echo "  GitHub Release: $([ "$DO_GITHUB_RELEASE" = "1" ] && echo yes || echo no)"
     echo "  原子发布      : $([ "$ATOMIC_RELEASE" = "1" ] && echo "yes（三端全部构建成功才推送）" || echo no)"
@@ -1264,6 +1308,17 @@ OCI_LABELS=(
     --label "org.opencontainers.image.title=nowen-note"
 )
 [ -n "$VERSION_TAG" ] && OCI_LABELS+=( --label "org.opencontainers.image.version=${VERSION_TAG}" )
+
+# Docker --build-arg：把版本号 / 构建时间塞到运行时 ENV 里
+#   - BUILD_DATE  -> 容器内 NOWEN_BUILD_TIME   -> /api/version 的 buildTime 字段
+#   - APP_VERSION -> 容器内 NOWEN_APP_VERSION  -> /api/version 的 appVersion 兜底
+# 发布模式才有 VERSION（构建模式 VERSION 为空，APP_VERSION 也跟着空，Dockerfile 里 ARG 默认空字符串兼容）。
+DOCKER_BUILD_ARGS=(
+    --build-arg "BUILD_DATE=${BUILD_DATE}"
+)
+if [ -n "${VERSION:-}" ]; then
+    DOCKER_BUILD_ARGS+=( --build-arg "APP_VERSION=${VERSION}" )
+fi
 
 # 确保 buildx builder 存在（仅 arm64/multi 需要）
 ensure_buildx_builder() {
@@ -1314,7 +1369,7 @@ if [ "$SHOULD_BUILD_DOCKER" = "1" ]; then
         amd64)
             # 明确 -f Dockerfile 与上下文路径 "$REPO_ROOT"，避免个别环境下 docker build 被
             # 劫持为 buildx bake 模式时无法正确定位 Dockerfile
-            BUILD_CMD=( docker build -f "$REPO_ROOT/Dockerfile" "${BUILD_TAGS[@]}" "${OCI_LABELS[@]}" "$REPO_ROOT" )
+            BUILD_CMD=( docker build -f "$REPO_ROOT/Dockerfile" "${BUILD_TAGS[@]}" "${OCI_LABELS[@]}" "${DOCKER_BUILD_ARGS[@]}" "$REPO_ROOT" )
             echo "  ${BUILD_CMD[*]}"
             run_argv "${BUILD_CMD[@]}"
             ;;
@@ -1326,6 +1381,7 @@ if [ "$SHOULD_BUILD_DOCKER" = "1" ]; then
                 -f "$REPO_ROOT/Dockerfile"
                 "${BUILD_TAGS[@]}"
                 "${OCI_LABELS[@]}"
+                "${DOCKER_BUILD_ARGS[@]}"
                 "${BUILDX_OUTPUT[@]}"
                 "$REPO_ROOT"
             )
@@ -1344,6 +1400,7 @@ if [ "$SHOULD_BUILD_DOCKER" = "1" ]; then
                 -f "$REPO_ROOT/Dockerfile"
                 "${BUILD_TAGS[@]}"
                 "${OCI_LABELS[@]}"
+                "${DOCKER_BUILD_ARGS[@]}"
                 "${BUILDX_OUTPUT[@]}"
                 "$REPO_ROOT"
             )
@@ -1890,8 +1947,150 @@ if [ "$HAS_FPK" = "1" ]; then
     ok "飞牛 .fpk 打包完成，用时 ${FPK_BUILD_DURATION}s"
 fi
 
+# -------------------- Lite 版打包（无后端 PC 安装包） --------------------
+# 复用 PC 端的依赖体检结果（HAS_PC=1 时 backend/frontend 依赖都已经在 PC 段处理过）。
+# 单独跑 lite（HAS_PC=0）时这里也保险地确保 frontend 依赖在位——build-lite.mjs
+# 内部会跑 build:frontend，缺包会直接 TS2307。
+LITE_ARTIFACTS=()
+LITE_BUILD_DURATION=0
+if [ "$HAS_LITE" = "1" ]; then
+    step "Lite 版打包（scripts/build-lite.mjs）"
+    LITE_START=$(date +%s)
+
+    UNAME_S_LITE="$(uname -s 2>/dev/null || echo unknown)"
+
+    # 确保 frontend 依赖：若 PC 段没跑过（HAS_PC=0），这里独立体检一次。
+    # PC 段已经体检过的话，再跑一次也只是几个 ls -d，可忽略。
+    if [ "$DRY_RUN" != "1" ]; then
+        if [ ! -d "${REPO_ROOT}/frontend/node_modules" ]; then
+            info "frontend/node_modules 不存在，自动 npm install"
+            ( cd "${REPO_ROOT}/frontend" && run_argv npm install )
+        fi
+    fi
+
+    # build-lite.mjs：Windows 上加 --safe（taskkill 残留 + 临时 OUT 目录）；
+    # Linux/macOS 不需要，直接出到 dist-electron-lite/。
+    LITE_ARGS=( "$REPO_ROOT/scripts/build-lite.mjs" )
+    case "$UNAME_S_LITE" in
+        MINGW*|MSYS*|CYGWIN*) LITE_ARGS+=( "--safe" ) ;;
+    esac
+
+    if [ "$DRY_RUN" = "1" ]; then
+        echo "  (dry-run) node ${LITE_ARGS[*]}"
+    else
+        ( cd "$REPO_ROOT" && run_argv node "${LITE_ARGS[@]}" )
+    fi
+
+    # 收集产物：候选目录与 build-lite.mjs 内部一致
+    #   - 普通态：dist-electron-lite/
+    #   - --safe：%TEMP%/nowen-note-lite-build/
+    LITE_OUT_CANDIDATES=(
+        "${REPO_ROOT}/dist-electron-lite"
+        "$(node -e 'console.log(require("os").tmpdir())' 2>/dev/null)/nowen-note-lite-build"
+    )
+    LITE_OUT=""
+    for cand in "${LITE_OUT_CANDIDATES[@]}"; do
+        if [ -d "$cand" ]; then
+            LITE_OUT="$cand"
+            break
+        fi
+    done
+
+    if [ "$DRY_RUN" != "1" ] && [ -n "$LITE_OUT" ]; then
+        # 与 PC 端一致：收集 setup.exe / portable.exe / dmg / AppImage / deb / blockmap / latest*.yml
+        # blockmap + latest*.yml 让 lite 也能走 electron-updater 自更新（channel="lite"）
+        while IFS= read -r f; do
+            LITE_ARTIFACTS+=( "$f" )
+        done < <(
+            find "$LITE_OUT" -maxdepth 1 -type f \( \
+                -name "*.exe" -o \
+                -name "*.dmg" -o \
+                -name "*.zip" -o \
+                -name "*.AppImage" -o \
+                -name "*.deb" -o \
+                -name "*.blockmap" -o \
+                -name "latest*.yml" \
+            \) 2>/dev/null | sort
+        )
+        info "Lite 产物目录: $LITE_OUT"
+        for f in "${LITE_ARTIFACTS[@]}"; do
+            echo "    - $(basename "$f")"
+        done
+        if [ "${#LITE_ARTIFACTS[@]}" -eq 0 ]; then
+            if [ "${_ONE_SHOT:-0}" = "1" ] || [ "$ATOMIC_RELEASE" = "1" ]; then
+                die "Lite 输出目录 $LITE_OUT 没有任何安装包：原子/一键全量发布要求 lite 必须有产物"
+            fi
+            warn "Lite 输出目录 $LITE_OUT 没有任何匹配的安装包"
+        fi
+    elif [ "$DRY_RUN" != "1" ]; then
+        if [ "${_ONE_SHOT:-0}" = "1" ] || [ "$ATOMIC_RELEASE" = "1" ]; then
+            die "Lite 输出目录不存在（dist-electron-lite / nowen-note-lite-build）：build-lite.mjs 是否成功？"
+        fi
+        warn "Lite 输出目录不存在（dist-electron-lite / nowen-note-lite-build）"
+    fi
+
+    LITE_END=$(date +%s)
+    LITE_BUILD_DURATION=$((LITE_END - LITE_START))
+    ok "Lite 打包完成，用时 ${LITE_BUILD_DURATION}s"
+fi
+
+# -------------------- 浏览器扩展（nowen-clipper）打包 --------------------
+# 输出 packages/nowen-clipper/releases/nowen-clipper-<extVer>.zip
+# 注意：扩展自身的 version 来自 packages/nowen-clipper/package.json，与主仓库 VERSION
+# 解耦（Chrome/Firefox 商店上传必须递增扩展自身版本号；和主版本号绑定反而难维护）。
+# 这里尊重 packages/nowen-clipper/package.json 已经写好的版本号，不做改写。
+CLIPPER_ARTIFACTS=()
+CLIPPER_BUILD_DURATION=0
+if [ "$HAS_CLIPPER" = "1" ]; then
+    step "浏览器扩展打包（packages/nowen-clipper）"
+    CLIPPER_START=$(date +%s)
+
+    CLIPPER_DIR="${REPO_ROOT}/packages/nowen-clipper"
+
+    # 1) 依赖体检：缺 node_modules 自动 npm install
+    if [ "$DRY_RUN" != "1" ] && [ ! -d "${CLIPPER_DIR}/node_modules" ]; then
+        info "packages/nowen-clipper/node_modules 不存在，自动 npm install"
+        ( cd "$CLIPPER_DIR" && run_argv npm install )
+    fi
+
+    # 2) 跑 npm run pack：内部串了 build + flatten-html + copy-public + pack.mjs
+    info "npm run pack（packages/nowen-clipper）"
+    if [ "$DRY_RUN" = "1" ]; then
+        echo "  (dry-run) cd packages/nowen-clipper && npm run pack"
+    else
+        ( cd "$CLIPPER_DIR" && run_argv npm run pack )
+    fi
+
+    # 3) 收集 releases/*.zip
+    CLIPPER_OUT="${CLIPPER_DIR}/releases"
+    if [ "$DRY_RUN" != "1" ] && [ -d "$CLIPPER_OUT" ]; then
+        # 只收"本次打的那一个"，避免把历史 zip 一并上传：
+        # 读 packages/nowen-clipper/package.json 的 version 字段
+        CLIPPER_VER="$(grep -oE '"version"[[:space:]]*:[[:space:]]*"[^"]+"' "${CLIPPER_DIR}/package.json" | head -1 | sed -E 's/.*"([^"]+)"$/\1/')"
+        TARGET_ZIP="${CLIPPER_OUT}/nowen-clipper-${CLIPPER_VER}.zip"
+        if [ -f "$TARGET_ZIP" ]; then
+            CLIPPER_ARTIFACTS+=( "$TARGET_ZIP" )
+            info "Clipper 产物: $TARGET_ZIP"
+        else
+            if [ "${_ONE_SHOT:-0}" = "1" ] || [ "$ATOMIC_RELEASE" = "1" ]; then
+                die "未找到 $TARGET_ZIP：原子/一键全量发布要求 clipper 必须有产物"
+            fi
+            warn "未找到 $TARGET_ZIP（pack.mjs 是否成功？）"
+        fi
+    elif [ "$DRY_RUN" != "1" ]; then
+        if [ "${_ONE_SHOT:-0}" = "1" ] || [ "$ATOMIC_RELEASE" = "1" ]; then
+            die "Clipper 输出目录不存在: $CLIPPER_OUT"
+        fi
+        warn "Clipper 输出目录不存在: $CLIPPER_OUT"
+    fi
+
+    CLIPPER_END=$(date +%s)
+    CLIPPER_BUILD_DURATION=$((CLIPPER_END - CLIPPER_START))
+    ok "浏览器扩展打包完成，用时 ${CLIPPER_BUILD_DURATION}s"
+fi
+
 # -------------------- 原子发布：统一推送 Docker 镜像 --------------------
-# 走到这里意味着所选目标（docker/pc/android/fpk）全部构建成功。
+# 走到这里意味着所选目标（docker/pc/android/fpk/lite/clipper）全部构建成功。
 # 现在才是真正"把东西发出去"的时候：先 docker push，再 git tag push，再 gh release。
 # 任何一步失败 set -e 会立即 die，后续不再继续。
 if [ "$SHOULD_BUILD_DOCKER" = "1" ] && [ "$ATOMIC_RELEASE" = "1" ]; then
@@ -1909,6 +2108,7 @@ if [ "$SHOULD_BUILD_DOCKER" = "1" ] && [ "$ATOMIC_RELEASE" = "1" ]; then
                 -f "$REPO_ROOT/Dockerfile"
                 "${BUILD_TAGS[@]}"
                 "${OCI_LABELS[@]}"
+                "${DOCKER_BUILD_ARGS[@]}"
                 --push
                 "$REPO_ROOT"
             )
@@ -2086,6 +2286,8 @@ if [ "$DO_GITHUB_RELEASE" = "1" ]; then
     [ "${#PC_ARTIFACTS[@]}" -gt 0 ]      && ALL_ASSETS+=( "${PC_ARTIFACTS[@]}" )
     [ "${#ANDROID_ARTIFACTS[@]}" -gt 0 ] && ALL_ASSETS+=( "${ANDROID_ARTIFACTS[@]}" )
     [ "${#FPK_ARTIFACTS[@]}" -gt 0 ]     && ALL_ASSETS+=( "${FPK_ARTIFACTS[@]}" )
+    [ "${#LITE_ARTIFACTS[@]}" -gt 0 ]    && ALL_ASSETS+=( "${LITE_ARTIFACTS[@]}" )
+    [ "${#CLIPPER_ARTIFACTS[@]}" -gt 0 ] && ALL_ASSETS+=( "${CLIPPER_ARTIFACTS[@]}" )
 
     if [ "${#ALL_ASSETS[@]}" -eq 0 ]; then
         warn "没有产物需要上传到 GitHub Release，跳过"
@@ -2153,10 +2355,22 @@ if [ "$HAS_FPK" = "1" ] && [ "${#FPK_ARTIFACTS[@]}" -gt 0 ]; then
         echo "    - $(basename "$f")"
     done
 fi
+if [ "$HAS_LITE" = "1" ] && [ "${#LITE_ARTIFACTS[@]}" -gt 0 ]; then
+    echo "  ${C_GREEN}Lite 版产物${C_RESET}（${#LITE_ARTIFACTS[@]} 个）："
+    for f in "${LITE_ARTIFACTS[@]}"; do
+        echo "    - $(basename "$f")"
+    done
+fi
+if [ "$HAS_CLIPPER" = "1" ] && [ "${#CLIPPER_ARTIFACTS[@]}" -gt 0 ]; then
+    echo "  ${C_GREEN}浏览器扩展产物${C_RESET}："
+    for f in "${CLIPPER_ARTIFACTS[@]}"; do
+        echo "    - $(basename "$f")"
+    done
+fi
 [ "$DO_GIT_TAG" = "1" ] && echo "  ${C_GREEN}git tag ${VERSION_TAG}${C_RESET}  ←  已推送到 GitHub"
 [ -n "$RELEASE_URL" ]   && echo "  ${C_GREEN}GitHub Release${C_RESET}  ←  ${RELEASE_URL}"
 
-echo "  总耗时        : ${TOTAL}s  (docker:${BUILD_DURATION}s push:${PUSH_DURATION}s pc:${PC_BUILD_DURATION}s android:${ANDROID_BUILD_DURATION}s fpk:${FPK_BUILD_DURATION}s)"
+echo "  总耗时        : ${TOTAL}s  (docker:${BUILD_DURATION}s push:${PUSH_DURATION}s pc:${PC_BUILD_DURATION}s android:${ANDROID_BUILD_DURATION}s fpk:${FPK_BUILD_DURATION}s lite:${LITE_BUILD_DURATION}s clipper:${CLIPPER_BUILD_DURATION}s)"
 [ -n "$DIGEST" ] && echo "  docker digest : ${DIGEST}"
 
 echo

@@ -83,6 +83,15 @@ VOLUME ["/app/data"]
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
+# ---- 版本/构建元信息（由 release.sh 通过 --build-arg 注入；本机 docker build 也兼容空值） ----
+# BUILD_DATE   : ISO8601 UTC，如 2026-05-09T10:23:01Z；run-time 通过 NOWEN_BUILD_TIME 暴露给 /api/version
+# APP_VERSION  : 形如 1.0.31，写入 NOWEN_APP_VERSION 兜底（即便镜像里 package.json 与发版号偏差也不会报错）
+# 这两个 ARG 都是可选的——空字符串场景下后端 resolveAppVersion()/resolveBuildTime() 仍会走原有 fallback。
+ARG BUILD_DATE=""
+ARG APP_VERSION=""
+ENV NOWEN_BUILD_TIME=${BUILD_DATE}
+ENV NOWEN_APP_VERSION=${APP_VERSION}
+
 ENV NODE_ENV=production
 ENV DB_PATH=/app/data/nowen-note.db
 ENV PORT=3001
