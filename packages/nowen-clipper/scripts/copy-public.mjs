@@ -4,16 +4,42 @@
  * 复制到 dist/，保证装载到浏览器时路径一致。
  *
  * 浏览器目标：
- *   - 默认（无参数 / --browser=chrome）：使用 public/manifest.json
- *   - --browser=firefox：使用 public/manifest.firefox.json，
- *     拷贝到 dist/manifest.json；不再保留多份 manifest，避免商店审核混淆。
+ *   - 默认（无参数 / --browser=chrome）：直接使用 public/manifest.json
+ *   - --browser=firefox：**从 Chrome manifest 程序化派生**一份 Firefox 清单
+ *     写入 dist/manifest.json，不再读取任何 manifest.firefox.json。
  *
- * 走这条单 manifest 路线（而不是同时输出两份 manifest）的原因：
+ * 为什么派生而不是维护两份：
+ *   之前的做法是让 public/manifest.firefox.json 与 public/manifest.json 并行存放，
+ *   两边都手动维护。结果出现了版本号漂移（0.1.0 vs 0.1.1）、权限漂移（Chrome 加了
+ *   debugger 但 FF 版忘了同步/过滤）等典型问题。本次改造：
+ *
+ *     Chrome manifest 是事实源（single source of truth）
+ *     → 构建 Firefox 时按已知差异点派生：
+ *         1) background.service_worker → background.scripts
+ *            Firefox MV3 尚未默认启用 service_worker 字段，加载时会报
+ *            "background.service_worker is currently disabled"。
+ *         2) 过滤掉 Firefox 不支持的权限（目前：debugger）。
+ *            代码侧已经对 chrome.debugger feature-detect 降级，去掉声明不影响功能。
+ *         3) 注入 browser_specific_settings.gecko（扩展 id + 最低版本），
+ *            否则 AMO 上传会报 missing application id。
+ *
+ *   这样后续只维护一份 Chrome manifest，FF 清单自动同步。
+ *
+ * 走"单 manifest 落盘"路线（而不是在 dist 里同时输出两份 manifest）的原因：
  *   浏览器扩展打包工具（web-ext / chrome.zip）只识别根目录下的 manifest.json，
  *   多余的 manifest.firefox.json 在 Chrome Webstore 校验时会触发"unknown manifest field"
  *   误报。所以构建期就一锤定音。
  */
-import { existsSync, mkdirSync, readdirSync, statSync, copyFileSync, rmSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  statSync,
+  copyFileSync,
+  readFileSync,
+  writeFileSync,
+  rmSync,
+} from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -54,16 +80,79 @@ function walk(from, to) {
 }
 walk(srcDir, dstDir);
 
-// 2. 按目标浏览器选择 manifest 源文件，统一落到 dist/manifest.json。
-const manifestSrc =
-  browser === "firefox"
-    ? join(srcDir, "manifest.firefox.json")
-    : join(srcDir, "manifest.json");
-if (!existsSync(manifestSrc)) {
-  console.error(`[copy-public] 缺少 ${manifestSrc}`);
+// 2. 按目标浏览器选择 manifest：
+//    - chrome  → 直接拷贝 public/manifest.json
+//    - firefox → 从 public/manifest.json 派生（见文件顶部注释）
+const chromeManifestPath = join(srcDir, "manifest.json");
+if (!existsSync(chromeManifestPath)) {
+  console.error(`[copy-public] 缺少 ${chromeManifestPath}`);
   process.exit(1);
 }
-copyFileSync(manifestSrc, join(dstDir, "manifest.json"));
+
+if (browser === "chrome") {
+  copyFileSync(chromeManifestPath, join(dstDir, "manifest.json"));
+} else {
+  // ---- Firefox 派生 ----
+  const chromeManifest = JSON.parse(readFileSync(chromeManifestPath, "utf8"));
+  const ff = deriveFirefoxManifest(chromeManifest);
+  writeFileSync(
+    join(dstDir, "manifest.json"),
+    JSON.stringify(ff, null, 2) + "\n",
+    "utf8",
+  );
+}
+
+/**
+ * 从 Chrome MV3 manifest 派生 Firefox MV3 manifest。
+ *
+ * 差异点：
+ *   1) background.service_worker → background.scripts（Firefox MV3 尚未默认启用
+ *      service_worker 字段；用 event page 的 scripts 形式，行为一致）。
+ *   2) permissions 过滤：剔除 Firefox 不支持或声明即拒收的权限（当前只有 debugger）。
+ *   3) browser_specific_settings.gecko：注入扩展 id 与 strict_min_version，
+ *      否则 AMO / web-ext 校验会报 missing application id。
+ *
+ * 其他字段（name/description/version/action/commands/host_permissions/content_scripts/
+ * web_accessible_resources/icons/options_ui）两边等价，直通即可。这里用浅拷贝 + 覆写
+ * 需要的字段，未显式覆写的字段原样透传——未来 Chrome manifest 加新字段自动生效，
+ * 若是 Firefox 不认的字段再按需加入 FF_UNSUPPORTED 黑名单。
+ *
+ * @param {Record<string, unknown>} chrome
+ * @returns {Record<string, unknown>}
+ */
+function deriveFirefoxManifest(chrome) {
+  // Firefox 不支持（或声明即拒）的权限；按需扩展。
+  const FF_UNSUPPORTED_PERMISSIONS = new Set(["debugger"]);
+
+  const out = { ...chrome };
+
+  // 1) background
+  if (chrome.background && typeof chrome.background === "object") {
+    const bg = { ...chrome.background };
+    if (bg.service_worker) {
+      bg.scripts = [bg.service_worker];
+      delete bg.service_worker;
+    }
+    out.background = bg;
+  }
+
+  // 2) permissions 过滤
+  if (Array.isArray(chrome.permissions)) {
+    out.permissions = chrome.permissions.filter(
+      (p) => !FF_UNSUPPORTED_PERMISSIONS.has(p),
+    );
+  }
+
+  // 3) gecko 标识（固定 id，升级不会触发"新扩展"身份断裂）
+  out.browser_specific_settings = {
+    gecko: {
+      id: "nowen-clipper@nowen-note",
+      strict_min_version: "121.0",
+    },
+  };
+
+  return out;
+}
 
 // 3. 顺手清掉历史构建可能残留的 manifest.firefox.json。
 const stale = join(dstDir, "manifest.firefox.json");
