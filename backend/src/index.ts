@@ -35,6 +35,8 @@ import workspacesRouter from "./routes/workspaces";
 import authRouter from "./routes/auth";
 import usersRouter from "./routes/users";
 import tokensRouter from "./routes/tokens";
+import versionRouter, { resolveAppVersion } from "./routes/version";
+import releasesRouter from "./routes/releases";
 import { seedDatabase } from "./db/seed";
 import { initApiTokensTable, looksLikeApiToken, resolveApiToken } from "./lib/api-tokens";
 import { getDb, closeDb } from "./db/schema";
@@ -145,7 +147,18 @@ app.use("/api/shared/*/verify", async (c, next) => {
 app.route("/api/shared", sharedRouter);
 
 // 健康检查（无需 JWT）
-app.get("/api/health", (c) => c.json({ status: "ok", version: "1.0.0" }));
+// version 字段动态读取根 package.json / ENV，避免常年停在 1.0.0 误导运维。
+app.get("/api/health", (c) => c.json({ status: "ok", version: resolveAppVersion() }));
+
+// 版本信息 & GitHub 最新 release（无需 JWT）
+//
+// 这两个接口需要在 JWT 中间件**之前**挂：
+//   - 前端 UpdateNotifier 在未登录状态也要能轮询版本；
+//   - 关于页 / 登录页都可能展示最新发布信息。
+// 故意放在 health 旁边；与 /api/auth 不同的是它们是完全公开的只读查询，
+// 不涉及写操作、不记录审计日志。
+app.route("/api/version", versionRouter);
+app.route("/api/releases", releasesRouter);
 
 // OpenAPI 规范（无需 JWT）
 app.get("/api/openapi.json", (c) => c.json(generateOpenAPISpec()));
@@ -521,7 +534,7 @@ if (process.env.DISABLE_MDNS !== "1") {
   try {
     publishMdns({
       port,
-      version: process.env.npm_package_version || "1.0.0",
+      version: resolveAppVersion(),
     });
   } catch (e) {
     console.warn("[discovery] publishMdns threw:", e);

@@ -8,7 +8,7 @@ const crypto = require("crypto");
 
 const { buildMenu, applyFormatState } = require("./menu");
 const { createTray, destroyTray, markQuitting, getIsQuitting } = require("./tray");
-const { initAutoUpdater, checkForUpdatesManually } = require("./updater");
+const { initAutoUpdater, checkForUpdatesManually, setUpdaterContext } = require("./updater");
 const { initLogger, getLogDir } = require("./logger");
 const { handleArgv, setupMacOpenFile, flushPending } = require("./fileAssoc");
 const { registerDiscoveryIpc, shutdown: shutdownDiscovery } = require("./discovery");
@@ -1027,6 +1027,8 @@ app.whenReady().then(async () => {
   initAutoUpdater({
     onQuitRequested: () => markQuitting(),
   });
+  // 把 userData 路径注入 updater，升级前 DB 备份需要从这里取
+  setUpdaterContext({ getUserDataPath });
 
   // 首次启动时传入的 .md 文件（Windows/Linux 命令行）
   handleArgv(process.argv, () => mainWindow);

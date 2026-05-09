@@ -400,9 +400,30 @@ export function runMigrations(db: Database.Database): number {
   const cur = getCurrentSchemaVersion(db);
 
   if (cur > CURRENT_SCHEMA_VERSION) {
+    // 严格拒绝降级：旧版程序打开新版 DB 时必须立即停机，绝不允许继续读写。
+    //
+    //   原因：
+    //     - 新版 DB 可能新增了列 / 触发器 / 索引，旧代码 INSERT 时漏填列、
+    //       UPDATE 时忽略触发器的副作用，轻则违反新版约束（约束失败整个事务
+    //       回滚）、重则写出"语法合法但语义破坏"的行（例如附件漏写
+    //       workspaceId 导致工作区不可见）。
+    //     - 拒绝降级没有误伤：用户要么升级程序、要么回滚 DB（从备份恢复）。
+    //
+    //   用户可采取的措施（日志里直接给出，减少排查时间）：
+    //     1) 升级 nowen-note 到能识别 schema v${cur} 的版本（查 CHANGELOG）；
+    //     2) 或从 /userData/backups/ 选一份 schema v${CURRENT_SCHEMA_VERSION}
+    //        及以下的备份执行恢复（后端启动会通过，但需注意数据会回滚）；
+    //     3) 若确认当前 DB 没有新版独占的数据（例如刚升级一次立刻回滚），
+    //        可用 sqlite3 CLI 手动 DELETE FROM schema_migrations WHERE
+    //        version > ${CURRENT_SCHEMA_VERSION}，但这属于有损操作，仅限
+    //        明确知道自己在做什么的运维。
     throw new Error(
       `[migrations] 数据库版本 ${cur} 高于当前程序支持的 ${CURRENT_SCHEMA_VERSION}。\n` +
-      `这通常是 "用旧版程序打开新版数据库" 造成的。请升级到对应版本的 nowen-note 后再启动。`,
+      `这通常是"用旧版程序打开新版数据库"造成的。为防止旧程序破坏数据，启动已被拒绝。\n` +
+      `处理建议：\n` +
+      `  1) 升级 nowen-note 到能识别 schema v${cur} 的版本；\n` +
+      `  2) 或从备份恢复一份 schema 版本 <= ${CURRENT_SCHEMA_VERSION} 的数据库；\n` +
+      `  3) 确认新库无独占数据时，可手动回滚 schema_migrations 表（有损，慎用）。`,
     );
   }
 

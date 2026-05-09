@@ -109,8 +109,12 @@ if (browser === "chrome") {
  *   1) background.service_worker → background.scripts（Firefox MV3 尚未默认启用
  *      service_worker 字段；用 event page 的 scripts 形式，行为一致）。
  *   2) permissions 过滤：剔除 Firefox 不支持或声明即拒收的权限（当前只有 debugger）。
- *   3) browser_specific_settings.gecko：注入扩展 id 与 strict_min_version，
- *      否则 AMO / web-ext 校验会报 missing application id。
+ *   3) browser_specific_settings.gecko：注入扩展 id、strict_min_version 与
+ *      data_collection_permissions。其中 data_collection_permissions 是 Firefox
+ *      自 2025 年起对所有新上传/新版本扩展强制要求的字段（AMO 校验会直接报错）。
+ *      Nowen Clipper 仅把用户主动剪藏的网页内容发送到用户自建的 nowen-note 后端，
+ *      扩展作者不接收任何数据，所以声明 required=["none"]。若未来加入任何 telemetry
+ *      / 崩溃上报等，必须同步更新这里（见 https://mzl.la/firefox-builtin-data-consent）。
  *
  * 其他字段（name/description/version/action/commands/host_permissions/content_scripts/
  * web_accessible_resources/icons/options_ui）两边等价，直通即可。这里用浅拷贝 + 覆写
@@ -144,10 +148,16 @@ function deriveFirefoxManifest(chrome) {
   }
 
   // 3) gecko 标识（固定 id，升级不会触发"新扩展"身份断裂）
+  //    data_collection_permissions 是 Firefox 128+ 才认识的字段，因此把
+  //    strict_min_version 提到 128.0；低于此版本的 Firefox 本来也不会校验该字段。
   out.browser_specific_settings = {
     gecko: {
       id: "nowen-clipper@nowen-note",
-      strict_min_version: "121.0",
+      strict_min_version: "128.0",
+      data_collection_permissions: {
+        // 扩展作者端不收集任何数据；用户内容仅发送到用户自建后端。
+        required: ["none"],
+      },
     },
   };
 

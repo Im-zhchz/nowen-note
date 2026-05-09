@@ -542,6 +542,52 @@ export const api = {
     return res.json();
   },
 
+  // ========== 版本信息（Public，无需 token） ==========
+  //
+  // 用途：
+  //   - UpdateNotifier 周期性轮询 /api/version，与前端构建期注入的 __APP_VERSION__
+  //     比对，不一致时弹"有新版本，点击刷新"横幅；
+  //   - AboutPanel 展示"当前版本 / 服务器版本 / 最新 release"；
+  //
+  // 注意：与大多数公开端点（settings / register/config）一致，这里**不**走通用
+  // request()——否则 401 时会误触发登出逻辑。失败统一 throw，让调用方自己决定
+  // 是否降级到"显示 unknown"。
+  getVersion: async (): Promise<{
+    appVersion: string;
+    schemaVersion: number | null;
+    codeSchemaVersion: number | null;
+    buildTime?: string;
+  }> => {
+    const res = await fetch(`${getBaseUrl()}/version`);
+    if (!res.ok) throw new Error(`版本信息获取失败: ${res.status}`);
+    return res.json();
+  },
+
+  // 取 GitHub 仓库最新 release（由后端做代理 + 60s 缓存，失败降级）。
+  // 后端永远返回 200：成功 { available: true, ... }；失败 { available: false, reason }。
+  getLatestRelease: async (): Promise<
+    | {
+        available: true;
+        tag: string;
+        version: string;
+        name: string;
+        htmlUrl: string;
+        publishedAt: string;
+        prerelease: boolean;
+        draft: boolean;
+        body?: string;
+      }
+    | { available: false; reason: string }
+  > => {
+    try {
+      const res = await fetch(`${getBaseUrl()}/releases/latest`);
+      if (!res.ok) return { available: false, reason: `HTTP ${res.status}` };
+      return res.json();
+    } catch (e) {
+      return { available: false, reason: e instanceof Error ? e.message : String(e) };
+    }
+  },
+
   // User
   getMe: () => request<User>("/me"),
 

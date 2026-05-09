@@ -98,6 +98,13 @@ interface NowenDesktopAPI {
   sendFormatState?: (state: FormatStateSnapshot | null) => void;
   isDesktop: true;
   platform: string;
+  /**
+   * 发布渠道（"lite" | "latest"）。由 preload 根据启动参数判定，
+   * 与 electron-builder publish.channel 对齐；旧版本 preload 不暴露此字段 → undefined。
+   */
+  releaseChannel?: "lite" | "latest";
+  /** Lite-only 发行版标识（旧版本 preload 可能没有，按 undefined 处理）。 */
+  isLiteOnly?: boolean;
 }
 
 function getBridge(): NowenDesktopAPI | null {
@@ -106,6 +113,27 @@ function getBridge(): NowenDesktopAPI | null {
 }
 
 export const isDesktop = (): boolean => !!getBridge();
+
+/**
+ * 获取桌面端发布渠道标识：
+ *   - "lite"    lite-only 发行版（electron-updater 仅从 latest-lite*.yml 拉取）
+ *   - "latest"  默认 full 版
+ *   - null      非 Electron 环境 / 旧版本 preload 未暴露 releaseChannel
+ *
+ * 兜底：若 preload 没注入 releaseChannel，但仍暴露了 isLiteOnly（过渡版本），
+ * 从 isLiteOnly 推导一下；否则返回 null。
+ */
+export function getReleaseChannel(): "lite" | "latest" | null {
+  const bridge = getBridge();
+  if (!bridge) return null;
+  if (bridge.releaseChannel === "lite" || bridge.releaseChannel === "latest") {
+    return bridge.releaseChannel;
+  }
+  if (typeof bridge.isLiteOnly === "boolean") {
+    return bridge.isLiteOnly ? "lite" : "latest";
+  }
+  return null;
+}
 
 /** 订阅菜单事件，返回反注册函数。非 Electron 环境返回 no-op。 */
 export function onMenuAction(

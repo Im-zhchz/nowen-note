@@ -96,6 +96,15 @@ contextBridge.exposeInMainWorld("nowenDesktop", {
   isLiteOnly: (process.argv || []).includes("--nowen-lite-only"),
 
   /**
+   * 发布渠道标识（AboutPanel 展示用）：
+   *   - "lite"    lite-only 发行版；electron-updater 只会从 latest-lite*.yml 拉取
+   *   - "latest"  默认 full 版
+   * 与 builder.config.js / builder.lite.config.js 里的 publish.channel 对齐。
+   * 前端可以据此在 "关于" 页展示 "发布渠道：lite"，方便排查"为什么我升不上 full"。
+   */
+  releaseChannel: (process.argv || []).includes("--nowen-lite-only") ? "lite" : "latest",
+
+  /**
    * 凭据存储（记住密码 / 自动登录）。
    * renderer 同步 / 异步都走这些接口；主进程用 safeStorage 加密落盘。
    *

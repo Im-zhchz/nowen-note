@@ -145,12 +145,22 @@ module.exports = {
   electronLanguages: ["en-US", "zh-CN"],
   // GitHub Releases 作为自动更新 feed
   // 发布时需设置 GH_TOKEN 环境变量；私有仓库需 private: true
+  //
+  // Channel 策略：
+  //   full 版发布走 electron-builder 默认的 "latest" channel（latest.yml），
+  //   lite 版在 builder.lite.config.js 显式声明 channel: "lite"（latest-lite.yml）。
+  //   两者完整互不影响：
+  //     - full 客户端只从 latest*.yml 拉取 → 永远收不到 lite 增量
+  //     - lite 客户端只从 latest-lite*.yml 拉取 → 永远收不到 full 增量
+  //   这样即便同一 GitHub Release 同时上传了 full + lite 二进制，自动更新
+  //   也不会出现"full 安装包被误升级成 lite"的灾难。
   publish: [
     {
       provider: "github",
       owner: "cropflre",
       repo: "nowen-note",
       releaseType: "release",
+      // channel 省略 = "latest"（保留 electron-builder 默认行为）
     },
   ],
   files: [

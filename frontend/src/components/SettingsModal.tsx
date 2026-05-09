@@ -1,7 +1,7 @@
 import React, { useState, useRef, useEffect, useCallback } from "react";
 import { createPortal } from "react-dom";
 import { motion, AnimatePresence } from "framer-motion";
-import { Palette, Shield, Database, X, Settings, Camera, Save, Loader2, Trash2, Upload, Type, Check, ChevronDown, Globe, Bot, Users, Info, ExternalLink, Heart, Sparkles } from "lucide-react";
+import { Palette, Shield, Database, X, Settings, Camera, Save, Loader2, Trash2, Upload, Type, Check, ChevronDown, Globe, Bot, Users, Info, ExternalLink, Heart, Sparkles, RefreshCw } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import ThemeToggle from "@/components/ThemeToggle";
 import SkinSwitcher from "@/components/SkinSwitcher";
@@ -12,6 +12,7 @@ import UserManagement from "@/components/UserManagement";
 import WhatsNewModal from "@/components/WhatsNewModal";
 import { useSiteSettings, BUILTIN_FONTS, getBuiltinFontName } from "@/hooks/useSiteSettings";
 import { api } from "@/lib/api";
+import { isDesktop, checkForUpdates, onUpdaterStatus, getReleaseChannel, type UpdaterPayload } from "@/lib/desktopBridge";
 import { CustomFont } from "@/types";
 import { cn } from "@/lib/utils";
 
@@ -55,6 +56,244 @@ class PanelErrorBoundary extends React.Component<
   }
 }
 
+/**
+ * VersionCompareCard — "关于"页的版本对比卡
+ *
+ * 展示：
+ *   - 当前客户端版本（编译期 __APP_VERSION__）
+ *   - 服务端版本（/api/version, 由后端从根 package.json 解析）
+ *   - GitHub 最新 release（后端 /api/releases/latest 代理，含 60s 缓存）
+ *
+ * 交互：
+ *   - 桌面端（Electron）额外渲染"检查更新"按钮，走 electron-updater；
+ *     同时订阅 updater 状态并在卡片下方滚动显示（checking / downloading %）。
+ *   - Web / 移动端没有桥接，只显示三个版本 + 仓库链接。
+ *
+ * 错误策略：
+ *   - 后端失败 → serverVersion 显示"unknown"并给"重试"按钮；
+ *   - release 失败 → 展示 fallback 文案 + 仓库链接；
+ *   - 都静默失败，不弹错误弹窗——"版本对比"本身是锦上添花，不要阻塞 About 渲染。
+ */
+function VersionCompareCard() {
+  const [serverVersion, setServerVersion] = useState<string | null>(null);
+  const [serverError, setServerError] = useState<string | null>(null);
+  const [release, setRelease] = useState<
+    | {
+        available: true;
+        tag: string;
+        version: string;
+        name: string;
+        htmlUrl: string;
+        publishedAt: string;
+        prerelease: boolean;
+        draft: boolean;
+        body?: string;
+      }
+    | { available: false; reason: string }
+    | null
+  >(null);
+  const [loading, setLoading] = useState(false);
+  const [updaterStatus, setUpdaterStatus] = useState<UpdaterPayload | null>(null);
+  const [reloadTick, setReloadTick] = useState(0);
+
+  const desktop = isDesktop();
+  const releaseChannel = getReleaseChannel();
+  const clientVersion = typeof __APP_VERSION__ === "string" ? __APP_VERSION__ : "0.0.0";
+
+  // 拉版本信息
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    setServerError(null);
+    Promise.allSettled([api.getVersion(), api.getLatestRelease()])
+      .then(([v, r]) => {
+        if (cancelled) return;
+        if (v.status === "fulfilled") {
+          setServerVersion(v.value.appVersion || null);
+        } else {
+          setServerError(v.reason instanceof Error ? v.reason.message : String(v.reason));
+        }
+        if (r.status === "fulfilled") {
+          setRelease(r.value);
+        } else {
+          setRelease({ available: false, reason: "request_failed" });
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [reloadTick]);
+
+  // 桌面端订阅 autoUpdater 状态
+  useEffect(() => {
+    if (!desktop) return;
+    const off = onUpdaterStatus((p) => setUpdaterStatus(p));
+    return off;
+  }, [desktop]);
+
+  const handleRetry = () => setReloadTick((t) => t + 1);
+  const handleCheckUpdates = async () => {
+    setUpdaterStatus({ status: "checking" });
+    try {
+      const res = await checkForUpdates();
+      if (!res.ok && res.reason) {
+        setUpdaterStatus({ status: "error", message: res.reason });
+      }
+    } catch (e) {
+      setUpdaterStatus({
+        status: "error",
+        message: e instanceof Error ? e.message : String(e),
+      });
+    }
+  };
+
+  // 比较结果：outdated = 客户端 < 服务端
+  const isOutdated =
+    !!serverVersion && serverVersion !== "0.0.0" && serverVersion !== clientVersion;
+  const hasNewerRelease =
+    release?.available &&
+    release.version !== clientVersion &&
+    release.version !== serverVersion;
+
+  return (
+    <div className="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-zinc-50/50 dark:bg-zinc-800/30 p-4 space-y-3">
+      <div className="flex items-center justify-between">
+        <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">版本信息</h3>
+        <button
+          type="button"
+          onClick={handleRetry}
+          disabled={loading}
+          className="flex items-center gap-1 text-xs text-zinc-500 dark:text-zinc-400 hover:text-accent-primary disabled:opacity-50"
+          title="重新拉取"
+        >
+          <RefreshCw size={12} className={loading ? "animate-spin" : ""} />
+          {loading ? "检查中" : "重新检查"}
+        </button>
+      </div>
+
+      <div className="grid grid-cols-[auto_1fr_auto] gap-x-3 gap-y-2 text-xs">
+        {/* 客户端 */}
+        <span className="text-zinc-500 dark:text-zinc-400">当前客户端</span>
+        <span className="font-mono text-zinc-900 dark:text-zinc-100">v{clientVersion}</span>
+        <span className="text-zinc-400 dark:text-zinc-600">
+          {typeof navigator !== "undefined" && navigator.userAgent.includes("Electron")
+            ? "Desktop"
+            : desktop
+              ? "Desktop"
+              : "Web"}
+        </span>
+
+        {/* 服务端 */}
+        <span className="text-zinc-500 dark:text-zinc-400">服务端</span>
+        <span className="font-mono text-zinc-900 dark:text-zinc-100">
+          {serverError ? (
+            <span className="text-amber-500">unknown</span>
+          ) : serverVersion ? (
+            <>v{serverVersion}</>
+          ) : (
+            <span className="text-zinc-400">—</span>
+          )}
+        </span>
+        <span className="text-right">
+          {isOutdated ? (
+            <span className="px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-600 dark:text-amber-400">
+              需刷新
+            </span>
+          ) : serverVersion ? (
+            <span className="text-emerald-500">匹配</span>
+          ) : null}
+        </span>
+
+        {/* GitHub 最新 release */}
+        <span className="text-zinc-500 dark:text-zinc-400">最新发布</span>
+        <span className="font-mono text-zinc-900 dark:text-zinc-100 truncate">
+          {release?.available ? (
+            <a
+              href={release.htmlUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-accent-primary hover:underline"
+              title={release.name || release.tag}
+            >
+              v{release.version}
+            </a>
+          ) : release && !release.available ? (
+            <span className="text-zinc-400">不可用</span>
+          ) : (
+            <span className="text-zinc-400">—</span>
+          )}
+        </span>
+        <span className="text-right">
+          {hasNewerRelease ? (
+            <span className="px-1.5 py-0.5 rounded bg-blue-500/15 text-blue-600 dark:text-blue-400">
+              可升级
+            </span>
+          ) : null}
+        </span>
+      </div>
+
+      {/* 桌面端：检查更新按钮 + autoUpdater 状态 */}
+      {desktop && (
+        <div className="pt-2 border-t border-zinc-200/60 dark:border-zinc-800/60 space-y-2">
+          {releaseChannel && (
+            <div className="flex items-center justify-between text-xs text-zinc-500 dark:text-zinc-400">
+              <span>发布渠道</span>
+              <span className="font-mono px-1.5 py-0.5 rounded bg-zinc-200/60 dark:bg-zinc-700/40 text-zinc-700 dark:text-zinc-200">
+                {releaseChannel}
+              </span>
+            </div>
+          )}
+          <button
+            type="button"
+            onClick={handleCheckUpdates}
+            disabled={updaterStatus?.status === "checking" || updaterStatus?.status === "downloading"}
+            className="w-full flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-lg bg-accent-primary text-white text-xs font-medium hover:opacity-90 disabled:opacity-60"
+          >
+            <RefreshCw
+              size={12}
+              className={
+                updaterStatus?.status === "checking" || updaterStatus?.status === "downloading"
+                  ? "animate-spin"
+                  : ""
+              }
+            />
+            检查桌面端更新
+          </button>
+          {updaterStatus && (
+            <div className="text-xs text-zinc-500 dark:text-zinc-400 text-center">
+              {renderUpdaterStatus(updaterStatus)}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function renderUpdaterStatus(p: UpdaterPayload): string {
+  switch (p.status) {
+    case "checking":
+      return "正在检查更新…";
+    case "not-available":
+      return "已是最新版本";
+    case "available":
+      return `发现新版本 v${p.version ?? "?"}，准备下载`;
+    case "downloading": {
+      const pct = typeof p.percent === "number" ? ` ${p.percent.toFixed(1)}%` : "";
+      return `正在下载${pct}`;
+    }
+    case "downloaded":
+      return `新版本 v${p.version ?? "?"} 已下载，将在下次重启时安装`;
+    case "error":
+      return `更新失败：${p.message || "未知错误"}`;
+    default:
+      return "";
+  }
+}
+
 function AboutPanel() {
   const { t } = useTranslation();
   const [showSponsor, setShowSponsor] = useState(false);
@@ -69,6 +308,9 @@ function AboutPanel() {
           {t('about.version')} {__APP_VERSION__}
         </span>
       </div>
+
+      {/* 版本对比卡（客户端 / 服务端 / GitHub 最新 release） */}
+      <VersionCompareCard />
 
       <div className="h-px bg-zinc-200 dark:bg-zinc-800" />
 
