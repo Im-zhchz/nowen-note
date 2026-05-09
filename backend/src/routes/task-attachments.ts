@@ -31,6 +31,7 @@ import { v4 as uuid } from "uuid";
 import fs from "fs";
 import path from "path";
 import { ensureAttachmentsDir, getAttachmentsDir, MIME_TO_EXT } from "./attachments";
+import { getUserWorkspaceRole, canManageResource } from "../middleware/acl";
 
 // 与 attachments 一致的 MIME 白名单（图片类）。
 // 任务附件场景几乎都是截图/示意图，先与笔记模块保持一致；后续若要支持文件
@@ -85,6 +86,7 @@ const app = new Hono();
  *
  * 请求：
  *   POST /api/task-attachments
+ *   query:    workspaceId?  ('personal' / <uuid>；仅"未指定 taskId 的孤儿态"生效)
  *   multipart/form-data：
  *     file:   File
  *     taskId: string  // 可选——新任务尚未创建时不传，前端创建 task 后再 PATCH 关联
@@ -93,7 +95,12 @@ const app = new Hono();
  *   { id, url, mimeType, size, filename }
  *   url = `/api/task-attachments/<id>`，前端写到 markdown 图片标记里。
  *
- * 权限：登录用户即可上传到自己名下；若传了 taskId，校验该 task 属于当前用户。
+ * 权限（Y3 工作区语义）：
+ *   - 若带 taskId：必须对该 task 有 canManageResource 权限，workspaceId 从 task 继承
+ *     （query 里的 workspaceId 被忽略以确保一致性）；
+ *   - 若不带 taskId（孤儿态）：workspaceId 来自 query（省略即个人空间）；
+ *     工作区必须当前用户为成员，否则 403；
+ *   - arbitrarily 指定 query workspaceId + taskId 且两者冲突时，以 task 为准。
  */
 app.post("/", async (c) => {
   const userId = c.req.header("X-User-Id") || "";
@@ -113,15 +120,23 @@ app.post("/", async (c) => {
     return c.json({ error: "file 字段缺失或非文件" }, 400);
   }
 
-  // ACL：若指定 taskId，必须属于当前用户；不传 taskId 表示"待绑定的孤儿"，
-  // 由前端在 createTask 后调用 PATCH 关联，超时未关联走清理脚本。
+  // 解析 workspaceId：有 taskId 从 task 行继承；否则走 query。
+  let effectiveWorkspaceId: string | null = null;
   if (taskId) {
     const task = db
-      .prepare("SELECT userId FROM tasks WHERE id = ?")
-      .get(taskId) as { userId: string } | undefined;
+      .prepare("SELECT userId, workspaceId FROM tasks WHERE id = ?")
+      .get(taskId) as { userId: string; workspaceId: string | null } | undefined;
     if (!task) return c.json({ error: "任务不存在" }, 404);
-    if (task.userId !== userId) {
+    if (!canManageResource(task.userId, task.workspaceId, userId)) {
       return c.json({ error: "无权向该任务上传附件", code: "FORBIDDEN" }, 403);
+    }
+    effectiveWorkspaceId = task.workspaceId;
+  } else {
+    const raw = c.req.query("workspaceId");
+    if (raw && raw !== "personal") {
+      const role = getUserWorkspaceRole(raw, userId);
+      if (!role) return c.json({ error: "无权访问该工作区", code: "FORBIDDEN" }, 403);
+      effectiveWorkspaceId = raw;
     }
   }
 
@@ -151,9 +166,9 @@ app.post("/", async (c) => {
 
   try {
     db.prepare(
-      `INSERT INTO task_attachments (id, taskId, userId, filename, mimeType, size, path)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-    ).run(id, taskId, userId, file.name || filename, mime, file.size, filename);
+      `INSERT INTO task_attachments (id, taskId, userId, workspaceId, filename, mimeType, size, path)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(id, taskId, userId, effectiveWorkspaceId, file.name || filename, mime, file.size, filename);
   } catch (err: any) {
     try { fs.unlinkSync(savePath); } catch { /* ignore */ }
     return c.json({ error: `写入数据库失败: ${err?.message || err}` }, 500);
@@ -173,7 +188,11 @@ app.post("/", async (c) => {
 
 /**
  * 把孤儿附件关联到具体 task（前端在 createTask 之后调用）。
- * 同时校验当前用户对该 task 的所有权。
+ * Y3:
+ *   - 附件原始 workspaceId（上传时记录）与目标 task 的 workspaceId 不一致时，
+ *     同步对齐到 task，保证"附件与任务同域"；
+ *   - 权限：对目标 task 有 canManageResource；对附件仍要求上传者本人
+ *     （避免跨用户盗绑：A 上传的悬空图不该被 B 绑到 B 自己的 task）。
  */
 app.patch("/:id/bind", async (c) => {
   const userId = c.req.header("X-User-Id") || "";
@@ -194,20 +213,25 @@ app.patch("/:id/bind", async (c) => {
   }
 
   const task = db
-    .prepare("SELECT userId FROM tasks WHERE id = ?")
-    .get(taskId) as { userId: string } | undefined;
+    .prepare("SELECT userId, workspaceId FROM tasks WHERE id = ?")
+    .get(taskId) as { userId: string; workspaceId: string | null } | undefined;
   if (!task) return c.json({ error: "任务不存在" }, 404);
-  if (task.userId !== userId) {
+  if (!canManageResource(task.userId, task.workspaceId, userId)) {
     return c.json({ error: "无权操作该任务", code: "FORBIDDEN" }, 403);
   }
 
-  db.prepare("UPDATE task_attachments SET taskId = ? WHERE id = ?").run(taskId, id);
+  db.prepare("UPDATE task_attachments SET taskId = ?, workspaceId = ? WHERE id = ?")
+    .run(taskId, task.workspaceId, id);
   return c.json({ success: true });
 });
 
 /**
  * 删除附件。一般在用户主动从 task.title 里去掉图片时由前端调用；
  * task 被删除时数据库 ON DELETE CASCADE 自动清行，物理文件靠定期清理脚本扫描。
+ *
+ * Y3 权限：
+ *   - 已绑定 task 的附件：按 canManageResource —— 创建者本人 + admin/owner 可删；
+ *   - 悬空附件（无 taskId）：仍仅限上传者本人可删（未归属任何工作区语义层）。
  */
 app.delete("/:id", (c) => {
   const db = getDb();
@@ -215,11 +239,30 @@ app.delete("/:id", (c) => {
   const id = c.req.param("id");
 
   const row = db
-    .prepare("SELECT id, userId, path FROM task_attachments WHERE id = ?")
-    .get(id) as { id: string; userId: string; path: string } | undefined;
+    .prepare("SELECT id, userId, taskId, workspaceId, path FROM task_attachments WHERE id = ?")
+    .get(id) as
+    | { id: string; userId: string; taskId: string | null; workspaceId: string | null; path: string }
+    | undefined;
   if (!row) return c.json({ error: "附件不存在" }, 404);
-  if (row.userId !== userId) {
-    return c.json({ error: "无权删除该附件", code: "FORBIDDEN" }, 403);
+
+  if (row.taskId) {
+    // 已绑定 → 走 canManageResource，允许 admin/owner 或原上传者删除。
+    // 需要获取 task 的 userId（canManageResource 按创建者本人判断）；用附件
+    // 行的 userId 足以代表"上传者"，但我们要的是"任务创建者"这一维度——
+    // 读一次 task 行以免混淆。
+    const task = db
+      .prepare("SELECT userId, workspaceId FROM tasks WHERE id = ?")
+      .get(row.taskId) as { userId: string; workspaceId: string | null } | undefined;
+    // task 行可能已被删：此时 DB 的 CASCADE 应该已经把附件也清了，但仍可能
+    // 有一瞬的竞态。保守按"上传者本人"判定。
+    const ok = task
+      ? canManageResource(task.userId, task.workspaceId, userId) || row.userId === userId
+      : row.userId === userId;
+    if (!ok) return c.json({ error: "无权删除该附件", code: "FORBIDDEN" }, 403);
+  } else {
+    if (row.userId !== userId) {
+      return c.json({ error: "无权删除该附件", code: "FORBIDDEN" }, 403);
+    }
   }
 
   const absPath = path.join(getAttachmentsDir(), row.path);

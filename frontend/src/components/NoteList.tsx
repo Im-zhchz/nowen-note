@@ -1,13 +1,13 @@
 import React, { useEffect, useCallback, useState, useRef, useMemo } from "react";
 import { createPortal } from "react-dom";
 import { motion, AnimatePresence } from "framer-motion";
-import { Plus, Pin, PinOff, Star, StarOff, Clock, FileText, Trash2, ArchiveRestore, Menu, FolderInput, ChevronRight, ChevronDown, ChevronLeft, Folder, X, Check, Lock, Unlock, CalendarDays, RefreshCw, Share2, GripVertical, Download, ArrowUpDown, ArrowUp, ArrowDown, Image as ImageIcon, Printer } from "lucide-react";
+import { Plus, Pin, PinOff, Star, StarOff, Clock, FileText, Trash2, ArchiveRestore, Menu, FolderInput, ChevronRight, ChevronDown, ChevronLeft, Folder, X, Check, Lock, Unlock, CalendarDays, RefreshCw, Share2, GripVertical, Download, ArrowUpDown, ArrowUp, ArrowDown, Image as ImageIcon, Printer, User as UserIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import ContextMenu, { ContextMenuItem } from "@/components/ContextMenu";
 import { useContextMenu } from "@/hooks/useContextMenu";
 import { useApp, useAppActions } from "@/store/AppContext";
-import { api } from "@/lib/api";
+import { api, getCurrentWorkspace } from "@/lib/api";
 import { NoteListItem, Notebook } from "@/types";
 import { cn } from "@/lib/utils";
 import { useTranslation } from "react-i18next";
@@ -720,6 +720,11 @@ const NoteCard = React.memo(React.forwardRef<HTMLDivElement, {
   const preview = note.contentText?.slice(0, 100) || "";
   const { t } = useTranslation();
   const wordCount = note.contentText?.length || 0;
+  // 工作区视图下笔记可能由不同成员创建，需要在卡片底部展示创建者；
+  // 个人空间下创建者一定是当前用户，留白即可。creatorName 由后端 list 接口
+  // LEFT JOIN users 注入，老后端无该字段时退化为不展示。
+  const showCreator =
+    !!note.creatorName && getCurrentWorkspace() !== "personal";
 
   return (
     <motion.div
@@ -791,17 +796,28 @@ const NoteCard = React.memo(React.forwardRef<HTMLDivElement, {
           <p className="text-xs text-tx-tertiary mt-1.5 line-clamp-2 leading-relaxed break-all">{preview}</p>
         )}
 
-        {/* 底部元信息行 */}
-        <div className="flex items-center justify-between mt-2 text-tx-tertiary">
-          <div className="flex items-center gap-1.5">
+        {/* 底部元信息行
+            - 左侧：更新时间（始终显示）
+            - 右侧：工作区下显示创建者（最高优先级），否则 hover 时显示字数
+            两者互斥渲染——卡片宽度有限，避免徽标挤压标题/预览。 */}
+        <div className="flex items-center justify-between mt-2 text-tx-tertiary gap-2">
+          <div className="flex items-center gap-1.5 min-w-0">
             <Clock size={10} />
             <span className="text-[10px]">{formatTime(note.updatedAt, t)}</span>
           </div>
-          {wordCount > 0 && (
+          {showCreator ? (
+            <span
+              className="flex items-center gap-1 text-[10px] text-tx-secondary/80 truncate max-w-[40%]"
+              title={t('common.createdBy', { name: note.creatorName })}
+            >
+              <UserIcon size={10} className="shrink-0" />
+              <span className="truncate">{note.creatorName}</span>
+            </span>
+          ) : wordCount > 0 ? (
             <span className="text-[10px] opacity-0 group-hover:opacity-100 transition-opacity tabular-nums">
               {wordCount > 999 ? `${(wordCount / 1000).toFixed(1)}k` : wordCount} {t('common.chars') || '字'}
             </span>
-          )}
+          ) : null}
         </div>
       </div>
     </motion.div>

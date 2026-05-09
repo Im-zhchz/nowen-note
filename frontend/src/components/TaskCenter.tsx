@@ -3,12 +3,13 @@ import { motion, AnimatePresence } from "framer-motion";
 import {
   CheckCircle2, Circle, Flag, Calendar, Plus, ListTodo,
   CalendarDays, AlertTriangle, CheckCheck, Inbox, X,
-  Trash2, ImagePlus, Link as LinkIcon, ExternalLink, Loader2
+  Trash2, ImagePlus, Link as LinkIcon, ExternalLink, Loader2,
+  User as UserIcon
 } from "lucide-react";
 import { format, isToday, isPast, isTomorrow, isThisWeek, parseISO } from "date-fns";
 import { zhCN, enUS } from "date-fns/locale";
 import { useTranslation } from "react-i18next";
-import { api } from "@/lib/api";
+import { api, getCurrentWorkspace } from "@/lib/api";
 import { Task, TaskFilter, TaskPriority, TaskStats } from "@/types";
 import { cn } from "@/lib/utils";
 import { toast } from "@/lib/toast";
@@ -201,6 +202,10 @@ const TaskRow = React.forwardRef<HTMLDivElement, {
     1: { label: t('tasks.low'), color: "text-blue-400", flagClass: "text-blue-400" },
   };
   const pri = PRIORITY_CONFIG[task.priority] || PRIORITY_CONFIG[2];
+  // 工作区视图下任务可由不同成员创建，标题下面加一行 creator 徽标；
+  // 个人空间下创建者一定是自己，省略。
+  const showCreator =
+    !!task.creatorName && getCurrentWorkspace() !== "personal";
 
   return (
     <motion.div
@@ -235,22 +240,30 @@ const TaskRow = React.forwardRef<HTMLDivElement, {
         )}
       </button>
 
-      {/* Title
-          - `min-w-0` 再次不可少：flex 1 子项同样需要打破默认 min-width:auto
-          - `line-clamp-2` 最多展示 2 行，多余…省略（点击进详情看全文）
-          - `break-all` 对连续无空格的 URL / 纯英文长串也能强制折行，
-            比 `break-words` 更可靠；副作用是中英文词会被拆开，但任务标题场景可接受
-          - 注意：当 title 含图片/链接 token 时由 TitleView 接管渲染，
-            `line-clamp-2` 仍然会作用于整段内容，超长会自动收缩 */}
-      <span
-        className={cn(
-          "flex-1 min-w-0 text-sm leading-relaxed break-all line-clamp-2 transition-all",
-          isCompleted ? "line-through text-tx-tertiary" : "text-tx-primary"
+      {/* Title + 创建者：用列布局承载多行
+          - 外层 `flex-1 min-w-0`：把宽度让给主标题区域，仍让右侧徽标区不被挤压；
+          - 内部用 flex-col：标题在上、creator 徽标在下（仅工作区可见）。
+            创建者徽标用更弱的色阶（tx-tertiary）+ 10px 字号，避免抢标题视线。 */}
+      <div className="flex-1 min-w-0 flex flex-col gap-0.5">
+        <span
+          className={cn(
+            "text-sm leading-relaxed break-all line-clamp-2 transition-all",
+            isCompleted ? "line-through text-tx-tertiary" : "text-tx-primary"
+          )}
+          title={task.title}
+        >
+          <TitleView title={task.title} compact isCompleted={isCompleted} />
+        </span>
+        {showCreator && (
+          <span
+            className="flex items-center gap-1 text-[10px] text-tx-tertiary truncate"
+            title={t('common.createdBy', { name: task.creatorName })}
+          >
+            <UserIcon size={10} className="shrink-0" />
+            <span className="truncate">{task.creatorName}</span>
+          </span>
         )}
-        title={task.title}
-      >
-        <TitleView title={task.title} compact isCompleted={isCompleted} />
-      </span>
+      </div>
 
       {/* Badges —— items-start 之后要用 mt-0.5 对齐到首行 */}
       <div className="flex items-center gap-2 flex-shrink-0 mt-0.5">
@@ -637,6 +650,16 @@ export default function TaskCenter() {
 
   useEffect(() => {
     loadTasks();
+  }, [loadTasks]);
+
+  // 工作区切换：关闭详情面板并重新拉当前筛选下的任务列表
+  useEffect(() => {
+    const onWs = () => {
+      setSelectedTask(null);
+      loadTasks();
+    };
+    window.addEventListener("nowen:workspace-changed", onWs);
+    return () => window.removeEventListener("nowen:workspace-changed", onWs);
   }, [loadTasks]);
 
   const handleToggle = async (id: string) => {

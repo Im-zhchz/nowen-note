@@ -44,7 +44,12 @@ import {
   getAttachmentsDir,
   MIME_TO_EXT,
 } from "./attachments";
-import { resolveNotePermission, hasPermission } from "../middleware/acl";
+import {
+  resolveNotePermission,
+  hasPermission,
+  getUserWorkspaceRole,
+  requireWorkspaceFeature,
+} from "../middleware/acl";
 
 const app = new Hono();
 
@@ -143,12 +148,102 @@ function resolveOrderBy(sort: string | undefined): string {
   }
 }
 
+/**
+ * 解析 list/stats 的 scope：personal / workspace。
+ *   - 没传 workspaceId ⇒ 个人空间：仅当前用户自己上传的附件
+ *     （attachments.userId = ? AND attachments.workspaceId IS NULL）
+ *   - 传了 workspaceId ⇒ 工作区：必须是成员；按 attachments.workspaceId 过滤，
+ *     所有成员可见全部附件（与 diary/tasks 的集合接口语义一致）
+ */
+function resolveFilesScope(
+  workspaceIdRaw: string,
+  userId: string,
+): { scope: "personal" | "workspace"; workspaceId: string | null; error?: string } {
+  const workspaceId = workspaceIdRaw?.trim() || "";
+  if (!workspaceId) return { scope: "personal", workspaceId: null };
+  const role = getUserWorkspaceRole(workspaceId, userId);
+  if (!role) return { scope: "workspace", workspaceId, error: "无权访问该工作区" };
+  return { scope: "workspace", workspaceId };
+}
+
+/**
+ * 计算"无引用"（unreferenced / 孤儿）附件 id 集合。
+ *
+ * 定义：attachments 行存在、noteId 对应的 note 也存在，但 `/api/attachments/<id>`
+ * 这个 URL 在 scope 内**所有 notes.content** 里都扫不到。
+ *
+ * 与 `/api/data-file/cleanup-orphans` 的"内容孤儿"定义保持一致（包含 24h 宽限期），
+ * 这样用户在"文件管理 → 孤儿"tab 里看到的集合 ≈ "清理孤儿"按钮会回收的那批。
+ *
+ * 性能：一次性把 scope 内的 notes.content 拼成单个 haystack 字符串，再对每个
+ * 附件 id 做 `indexOf`。attachments id 是 uuid 不会误匹配。O(M + N*L) 但 L 是
+ * 常数级（uuid 长度），大库仍可接受；比每个 id 单独跑一次 LIKE '%..%' 快数百倍。
+ */
+function buildUnreferencedSet(
+  db: ReturnType<typeof getDb>,
+  scope: { scope: "personal" | "workspace"; workspaceId: string | null },
+  userId: string,
+): Set<string> {
+  // 宽限期：createdAt 距今不足 24h 的附件不算孤儿（刚上传还没 save content 也会先进 holder note）
+  const GRACE_MS = 24 * 3600 * 1000;
+  const cutoffMs = Date.now() - GRACE_MS;
+
+  // 1) 拉 scope 内的 haystack（仅 content 非空的 note，减少 join 字符串开销）
+  const contentRows = (scope.scope === "workspace"
+    ? db
+        .prepare(
+          `SELECT content FROM notes
+            WHERE workspaceId = ? AND content IS NOT NULL AND content <> ''`,
+        )
+        .all(scope.workspaceId!)
+    : db
+        .prepare(
+          `SELECT content FROM notes
+            WHERE userId = ? AND workspaceId IS NULL
+              AND content IS NOT NULL AND content <> ''`,
+        )
+        .all(userId)) as { content: string }[];
+  const haystack = contentRows.map((r) => r.content).join("\n");
+
+  // 2) 拉 scope 内的候选附件（只要 noteId 对应 note 还在）
+  const candidates = (scope.scope === "workspace"
+    ? db
+        .prepare(
+          `SELECT a.id, a.createdAt FROM attachments a
+            INNER JOIN notes n ON n.id = a.noteId
+            WHERE a.workspaceId = ?`,
+        )
+        .all(scope.workspaceId!)
+    : db
+        .prepare(
+          `SELECT a.id, a.createdAt FROM attachments a
+            INNER JOIN notes n ON n.id = a.noteId
+            WHERE a.userId = ? AND a.workspaceId IS NULL`,
+        )
+        .all(userId)) as { id: string; createdAt: string }[];
+
+  // 3) 扫描
+  const orphanIds = new Set<string>();
+  for (const r of candidates) {
+    const created = new Date(
+      r.createdAt && r.createdAt.includes("T")
+        ? r.createdAt
+        : (r.createdAt || "").replace(" ", "T") + "Z",
+    ).getTime();
+    if (Number.isFinite(created) && created > cutoffMs) continue;
+    if (haystack.indexOf(`/api/attachments/${r.id}`) >= 0) continue;
+    orphanIds.add(r.id);
+  }
+  return orphanIds;
+}
+
 // ---------------------------------------------------------------------------
 // GET /api/files
 // 列表 + 搜索 + 筛选 + 分页
 //
 // Query 参数：
 //   category   "all" | "image" | "file"                    —— 大类筛选
+//   filter     "unreferenced"                              —— 视图筛选（孤儿视图）
 //   mime       精确 MIME（如 image/png）                    —— 细分筛选
 //   notebookId 所属笔记本 id                                —— 按笔记本筛
 //   q          文件名关键字（ILIKE）                         —— 搜索
@@ -156,15 +251,25 @@ function resolveOrderBy(sort: string | undefined): string {
 //   page       1 起，默认 1
 //   pageSize   默认 50，最大 200
 //
+// filter=unreferenced 语义：
+//   返回 scope 内所有"没有任何 notes.content 引用"的附件（含 24h 宽限期）。
+//   与 category 正交——可以同时 filter=unreferenced + category=image 得到"孤儿图片"。
+//   实现：一次性构建 scope 内 haystack，计算 orphan id 集合，再用 `a.id IN (...)`
+//   注入 WHERE。大库场景请配合 page/pageSize 分页，避免 IN 列表过长。
+//
 // 响应：
 //   { items: FileOut[], total: number, page, pageSize }
 // ---------------------------------------------------------------------------
-app.get("/", (c) => {
+app.get("/", requireWorkspaceFeature("files"), (c) => {
   const userId = c.req.header("X-User-Id") || "";
   if (!userId) return c.json({ error: "未授权" }, 401);
   const db = getDb();
 
+  const scope = resolveFilesScope(c.req.query("workspaceId") || "", userId);
+  if (scope.error) return c.json({ error: scope.error, code: "FORBIDDEN" }, 403);
+
   const category = (c.req.query("category") || "all").toLowerCase();
+  const filter = (c.req.query("filter") || "").toLowerCase();
   const mime = c.req.query("mime") || "";
   const notebookId = c.req.query("notebookId") || "";
   const q = (c.req.query("q") || "").trim();
@@ -175,8 +280,19 @@ app.get("/", (c) => {
     Math.max(1, Number(c.req.query("pageSize") || 50)),
   );
 
-  const whereParts: string[] = ["a.userId = ?"];
-  const params: (string | number)[] = [userId];
+  // scope 决定可见范围：
+  //   personal  → 自己的附件 AND workspaceId IS NULL
+  //   workspace → 该工作区的全部附件（不论上传者），成员资格已在上方 scope 校验
+  const whereParts: string[] = [];
+  const params: (string | number)[] = [];
+  if (scope.scope === "workspace") {
+    whereParts.push("a.workspaceId = ?");
+    params.push(scope.workspaceId!);
+  } else {
+    whereParts.push("a.userId = ?");
+    whereParts.push("a.workspaceId IS NULL");
+    params.push(userId);
+  }
 
   if (category === "image") {
     whereParts.push("a.mimeType LIKE 'image/%'");
@@ -198,6 +314,19 @@ app.get("/", (c) => {
   if (q) {
     whereParts.push("a.filename LIKE ? COLLATE NOCASE");
     params.push(`%${q}%`);
+  }
+
+  // filter=unreferenced：把 orphan id 集合注入 WHERE
+  // 空集也要落成 `1=0` 而不是省略条件，避免返回全部附件
+  if (filter === "unreferenced") {
+    const orphanIds = Array.from(buildUnreferencedSet(db, scope, userId));
+    if (orphanIds.length === 0) {
+      whereParts.push("1 = 0");
+    } else {
+      const placeholders = orphanIds.map(() => "?").join(",");
+      whereParts.push(`a.id IN (${placeholders})`);
+      for (const id of orphanIds) params.push(id);
+    }
   }
 
   const whereSql = whereParts.join(" AND ");
@@ -244,24 +373,42 @@ app.get("/", (c) => {
 //   { total, totalBytes,
 //     images: { count, bytes },
 //     files:  { count, bytes },
+//     unreferenced: { count, bytes },   —— 孤儿视图徽标（含 24h 宽限期）
 //     byMime: [{ mime, count, bytes }] }
 // ---------------------------------------------------------------------------
-app.get("/stats", (c) => {
+app.get("/stats", requireWorkspaceFeature("files"), (c) => {
   const userId = c.req.header("X-User-Id") || "";
   if (!userId) return c.json({ error: "未授权" }, 401);
   const db = getDb();
 
+  const scope = resolveFilesScope(c.req.query("workspaceId") || "", userId);
+  if (scope.error) return c.json({ error: scope.error, code: "FORBIDDEN" }, 403);
+
   // 一次性聚合：按 mimeType 分组，再在 JS 侧拆图片 / 文件大类。
-  // 只有当前用户的附件才参与统计。
-  const rows = db
-    .prepare(
-      `SELECT mimeType AS mime, COUNT(*) AS count, COALESCE(SUM(size), 0) AS bytes
-         FROM attachments
-        WHERE userId = ?
-        GROUP BY mimeType
-        ORDER BY count DESC`,
-    )
-    .all(userId) as { mime: string; count: number; bytes: number }[];
+  // scope: personal → 当前用户自己的非工作区附件；workspace → 整个工作区。
+  const { sql, param } =
+    scope.scope === "workspace"
+      ? {
+          sql: `SELECT mimeType AS mime, COUNT(*) AS count, COALESCE(SUM(size), 0) AS bytes
+                  FROM attachments
+                 WHERE workspaceId = ?
+                 GROUP BY mimeType
+                 ORDER BY count DESC`,
+          param: scope.workspaceId!,
+        }
+      : {
+          sql: `SELECT mimeType AS mime, COUNT(*) AS count, COALESCE(SUM(size), 0) AS bytes
+                  FROM attachments
+                 WHERE userId = ? AND workspaceId IS NULL
+                 GROUP BY mimeType
+                 ORDER BY count DESC`,
+          param: userId,
+        };
+  const rows = db.prepare(sql).all(param) as {
+    mime: string;
+    count: number;
+    bytes: number;
+  }[];
 
   let total = 0;
   let totalBytes = 0;
@@ -281,11 +428,30 @@ app.get("/stats", (c) => {
     }
   }
 
+  // 无引用（孤儿）视图徽标：与 filter=unreferenced 用同一份判定
+  // 大库上这会额外扫一遍 notes.content；如果性能成为瓶颈可按需做短 TTL 缓存。
+  const orphanIds = buildUnreferencedSet(db, scope, userId);
+  let unreferencedCount = 0;
+  let unreferencedBytes = 0;
+  if (orphanIds.size > 0) {
+    const ids = Array.from(orphanIds);
+    const placeholders = ids.map(() => "?").join(",");
+    const sumRow = db
+      .prepare(
+        `SELECT COUNT(*) AS c, COALESCE(SUM(size), 0) AS b
+           FROM attachments WHERE id IN (${placeholders})`,
+      )
+      .get(...ids) as { c: number; b: number } | undefined;
+    unreferencedCount = sumRow?.c ?? 0;
+    unreferencedBytes = sumRow?.b ?? 0;
+  }
+
   return c.json({
     total,
     totalBytes,
     images: { count: imageCount, bytes: imageBytes },
     files: { count: fileCount, bytes: fileBytes },
+    unreferenced: { count: unreferencedCount, bytes: unreferencedBytes },
     byMime: rows,
   });
 });
@@ -303,11 +469,12 @@ app.get("/stats", (c) => {
 //     ]
 //   }
 //
-// 注意：
-//   - 只返回当前用户名下、未删除（或在回收站）的笔记。工作区共享笔记暂不纳入
-//     反向引用扫描——跨用户搜 content 的成本与隐私代价较高，后续单独接入。
-//   - 扫描用 `indexOf('/api/attachments/<id>') >= 0`，附件 id 是 uuid，不会
-//     与其它字符串碰撞。
+// 可见性（Y4）：
+//   - attachments.workspaceId IS NULL → 仅上传者本人可见；
+//   - attachments.workspaceId = X     → X 的成员可见。
+//   反向引用扫描按同一 scope 限定：个人附件只扫本人笔记；工作区附件扫同工作区
+//   的全部笔记（不限于上传者）。扫描用 `LIKE '%/api/attachments/<id>%'`，附件 id
+//   是 uuid，不会误匹配。
 // ---------------------------------------------------------------------------
 app.get("/:id", (c) => {
   const userId = c.req.header("X-User-Id") || "";
@@ -318,32 +485,50 @@ app.get("/:id", (c) => {
   const base = db
     .prepare(
       `SELECT a.id, a.filename, a.mimeType, a.size, a.path, a.createdAt,
-              a.noteId, a.userId,
+              a.noteId, a.userId, a.workspaceId,
               n.title AS noteTitle, n.notebookId, n.isTrashed,
               nb.name AS notebookName, nb.icon AS notebookIcon
          FROM attachments a
          LEFT JOIN notes n ON n.id = a.noteId
          LEFT JOIN notebooks nb ON nb.id = n.notebookId
-        WHERE a.id = ? AND a.userId = ?`,
+        WHERE a.id = ?`,
     )
-    .get(id, userId) as (FileRow & { userId: string }) | undefined;
+    .get(id) as (FileRow & { userId: string; workspaceId: string | null }) | undefined;
 
   if (!base) return c.json({ error: "文件不存在" }, 404);
 
-  // 反向引用扫描：LIKE '%pattern%' 利用 SQLite 的顺序扫描，无需预先建倒排。
-  // 仅扫描当前用户自己的笔记；已删真删的笔记不可能返回。
+  // 可见性判定：个人附件仅本人；工作区附件要求该工作区成员资格。
+  if (!base.workspaceId) {
+    if (base.userId !== userId) {
+      return c.json({ error: "文件不存在" }, 404);
+    }
+  } else {
+    if (!getUserWorkspaceRole(base.workspaceId, userId)) {
+      return c.json({ error: "文件不存在" }, 404);
+    }
+  }
+
+  // 反向引用扫描：LIKE '%pattern%' 顺序扫描，无需预先建倒排。
   const pattern = `%/api/attachments/${id}%`;
   const refRows = db
     .prepare(
-      `SELECT n.id, n.title, n.notebookId, n.isTrashed, n.updatedAt,
-              nb.name AS notebookName, nb.icon AS notebookIcon
-         FROM notes n
-         LEFT JOIN notebooks nb ON nb.id = n.notebookId
-        WHERE n.userId = ?
-          AND n.content LIKE ?
-        ORDER BY n.updatedAt DESC`,
+      base.workspaceId
+        ? `SELECT n.id, n.title, n.notebookId, n.isTrashed, n.updatedAt,
+                  nb.name AS notebookName, nb.icon AS notebookIcon
+             FROM notes n
+             LEFT JOIN notebooks nb ON nb.id = n.notebookId
+            WHERE n.workspaceId = ?
+              AND n.content LIKE ?
+            ORDER BY n.updatedAt DESC`
+        : `SELECT n.id, n.title, n.notebookId, n.isTrashed, n.updatedAt,
+                  nb.name AS notebookName, nb.icon AS notebookIcon
+             FROM notes n
+             LEFT JOIN notebooks nb ON nb.id = n.notebookId
+            WHERE n.userId = ? AND n.workspaceId IS NULL
+              AND n.content LIKE ?
+            ORDER BY n.updatedAt DESC`,
     )
-    .all(userId, pattern) as {
+    .all(base.workspaceId ?? userId, pattern) as {
       id: string;
       title: string;
       notebookId: string | null;
@@ -584,15 +769,21 @@ function pickExt(filename: string | undefined, mime: string): string {
 }
 
 /**
- * 获取（或懒创建）用户的"未归档文件" holder note。
+ * 获取（或懒创建）某 scope 的"未归档文件" holder note。
  *
- * 策略：
- *   1. 查是否已有 name='文件管理（自动）' 的 notebook；无则建；
- *   2. 在该 notebook 下查是否已有 isArchived=1 且 title='未归档文件' 的 note；
- *      无则建。
- *   3. 所有写入都放在单 transaction 里，保证并发安全。
+ * scope：
+ *   - workspaceId = null  → 个人空间版本（老语义）
+ *   - workspaceId = X     → 工作区 X 版本；notebook/note 同样挂在当前用户名下
+ *     （ownership = 上传者），但 workspaceId 填 X；这样工作区关闭/迁移时数据
+ *     归属与其它工作区资源一致。
+ *
+ * 约定：同一 scope 下只会有一个 holder（userId + workspaceId + name 三元组唯一）。
+ * 所有写入都在单 transaction 里，保证并发安全。
  */
-function ensureHolderNote(userId: string): { notebookId: string; noteId: string } {
+function ensureHolderNote(
+  userId: string,
+  workspaceId: string | null,
+): { notebookId: string; noteId: string } {
   const db = getDb();
 
   const HOLDER_NOTEBOOK_NAME = "文件管理（自动）";
@@ -602,20 +793,26 @@ function ensureHolderNote(userId: string): { notebookId: string; noteId: string 
   let noteId = "";
 
   const tx = db.transaction(() => {
-    // notebooks.userId 表示所有权；个人空间 workspaceId IS NULL。
-    const nbRow = db
-      .prepare(
-        "SELECT id FROM notebooks WHERE userId = ? AND name = ? AND workspaceId IS NULL LIMIT 1",
-      )
-      .get(userId, HOLDER_NOTEBOOK_NAME) as { id: string } | undefined;
+    // 个人空间 workspaceId IS NULL；工作区按 workspaceId 精确匹配
+    const nbRow = (workspaceId
+      ? db
+          .prepare(
+            "SELECT id FROM notebooks WHERE userId = ? AND name = ? AND workspaceId = ? LIMIT 1",
+          )
+          .get(userId, HOLDER_NOTEBOOK_NAME, workspaceId)
+      : db
+          .prepare(
+            "SELECT id FROM notebooks WHERE userId = ? AND name = ? AND workspaceId IS NULL LIMIT 1",
+          )
+          .get(userId, HOLDER_NOTEBOOK_NAME)) as { id: string } | undefined;
     if (nbRow) {
       notebookId = nbRow.id;
     } else {
       notebookId = uuid();
       db.prepare(
         `INSERT INTO notebooks (id, userId, parentId, name, description, icon, sortOrder, isExpanded, workspaceId)
-         VALUES (?, ?, NULL, ?, '', '📁', 9999, 0, NULL)`,
-      ).run(notebookId, userId, HOLDER_NOTEBOOK_NAME);
+         VALUES (?, ?, NULL, ?, '', '📁', 9999, 0, ?)`,
+      ).run(notebookId, userId, HOLDER_NOTEBOOK_NAME, workspaceId);
     }
 
     const noteRow = db
@@ -630,9 +827,9 @@ function ensureHolderNote(userId: string): { notebookId: string; noteId: string 
     } else {
       noteId = uuid();
       db.prepare(
-        `INSERT INTO notes (id, userId, notebookId, title, content, contentText, isArchived)
-         VALUES (?, ?, ?, ?, '{}', '', 1)`,
-      ).run(noteId, userId, notebookId, HOLDER_NOTE_TITLE);
+        `INSERT INTO notes (id, userId, notebookId, title, content, contentText, isArchived, workspaceId)
+         VALUES (?, ?, ?, ?, '{}', '', 1, ?)`,
+      ).run(noteId, userId, notebookId, HOLDER_NOTE_TITLE, workspaceId);
     }
   });
   tx();
@@ -640,9 +837,12 @@ function ensureHolderNote(userId: string): { notebookId: string; noteId: string 
   return { notebookId, noteId };
 }
 
-app.post("/upload", async (c) => {
+app.post("/upload", requireWorkspaceFeature("files"), async (c) => {
   const userId = c.req.header("X-User-Id") || "";
   if (!userId) return c.json({ error: "未授权" }, 401);
+
+  const scope = resolveFilesScope(c.req.query("workspaceId") || "", userId);
+  if (scope.error) return c.json({ error: scope.error, code: "FORBIDDEN" }, 403);
 
   let body: Record<string, unknown>;
   try {
@@ -665,7 +865,7 @@ app.post("/upload", async (c) => {
     return c.json({ error: `出于安全考虑，不支持该类型: ${mime}` }, 415);
   }
 
-  const { noteId } = ensureHolderNote(userId);
+  const { noteId } = ensureHolderNote(userId, scope.workspaceId);
 
   ensureAttachmentsDir();
   const id = uuid();
@@ -685,8 +885,8 @@ app.post("/upload", async (c) => {
   try {
     const db = getDb();
     db.prepare(
-      `INSERT INTO attachments (id, noteId, userId, filename, mimeType, size, path)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO attachments (id, noteId, userId, filename, mimeType, size, path, workspaceId)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
       id,
       noteId,
@@ -695,6 +895,7 @@ app.post("/upload", async (c) => {
       mime,
       file.size,
       `${id}.${ext}`,
+      scope.workspaceId,
     );
   } catch (err) {
     // DB 写失败时把已落盘文件清掉，避免孤儿

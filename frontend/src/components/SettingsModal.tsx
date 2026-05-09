@@ -1,7 +1,7 @@
 import React, { useState, useRef, useEffect, useCallback } from "react";
 import { createPortal } from "react-dom";
 import { motion, AnimatePresence } from "framer-motion";
-import { Palette, Shield, Database, X, Settings, Camera, Save, Loader2, Trash2, Upload, Type, Check, ChevronDown, Globe, Bot, Users, Info, ExternalLink, Heart } from "lucide-react";
+import { Palette, Shield, Database, X, Settings, Camera, Save, Loader2, Trash2, Upload, Type, Check, ChevronDown, Globe, Bot, Users, Info, ExternalLink, Heart, Sparkles } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import ThemeToggle from "@/components/ThemeToggle";
 import SkinSwitcher from "@/components/SkinSwitcher";
@@ -9,6 +9,7 @@ import SecuritySettings from "@/components/SecuritySettings";
 import DataManager from "@/components/DataManager";
 import AISettingsPanel from "@/components/AISettingsPanel";
 import UserManagement from "@/components/UserManagement";
+import WhatsNewModal from "@/components/WhatsNewModal";
 import { useSiteSettings, BUILTIN_FONTS, getBuiltinFontName } from "@/hooks/useSiteSettings";
 import { api } from "@/lib/api";
 import { CustomFont } from "@/types";
@@ -57,6 +58,7 @@ class PanelErrorBoundary extends React.Component<
 function AboutPanel() {
   const { t } = useTranslation();
   const [showSponsor, setShowSponsor] = useState(false);
+  const [showWhatsNew, setShowWhatsNew] = useState(false);
   return (
     <div className="space-y-6">
       {/* 标题区 */}
@@ -109,6 +111,30 @@ function AboutPanel() {
           {t('about.github')}
         </a>
       </div>
+
+      {/* 更新日志 */}
+      <button
+        type="button"
+        onClick={() => setShowWhatsNew(true)}
+        className="w-full flex items-center justify-between p-4 rounded-xl border border-zinc-200 dark:border-zinc-800 bg-zinc-50/50 dark:bg-zinc-800/30 hover:bg-zinc-100/60 dark:hover:bg-zinc-800/50 transition-colors text-left"
+      >
+        <div className="flex items-center gap-3">
+          <span className="flex items-center justify-center w-8 h-8 rounded-lg bg-accent-primary/10 text-accent-primary">
+            <Sparkles size={16} />
+          </span>
+          <div>
+            <div className="text-sm font-medium text-zinc-700 dark:text-zinc-300">
+              {t('about.changelog')}
+            </div>
+            <div className="text-xs text-zinc-500 dark:text-zinc-400 mt-0.5">
+              {t('about.changelogDesc')}
+            </div>
+          </div>
+        </div>
+        <span className="text-xs text-zinc-500 dark:text-zinc-400 shrink-0">
+          {t('about.viewChangelog')}
+        </span>
+      </button>
 
       {/* 支持作者 / 打赏 */}
       <div className="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-zinc-50/50 dark:bg-zinc-800/30 overflow-hidden">
@@ -163,6 +189,12 @@ function AboutPanel() {
       <p className="text-center text-xs text-zinc-400 dark:text-zinc-600">
         {t('about.madeWith')}
       </p>
+
+      {/* 更新日志 Modal —— 用户点"查看更新"按钮时唤起 */}
+      <WhatsNewModal
+        open={showWhatsNew}
+        onClose={() => setShowWhatsNew(false)}
+      />
     </div>
   );
 }
@@ -616,6 +648,9 @@ const SettingsModal = React.forwardRef<HTMLDivElement, SettingsModalProps>(
     { id: "ai" as const, label: t('settings.ai'), icon: Bot },
     { id: "security" as const, label: t('settings.security'), icon: Shield },
     ...(isAdmin ? [{ id: "users" as const, label: t('settings.users'), icon: Users }] : []),
+    // 「数据管理」内部已用二级 tab 拆出「数据库」子页（即 DataFileSection：磁盘
+    // 占用 / 数据库导入导出 / 清理孤儿 / VACUUM），无需在顶层再开一个独立面板，
+    // 否则会与 dataManagement → database 子 tab 内容完全重复，引发用户困惑。
     { id: "data" as const, label: t('settings.dataManagement'), icon: Database },
     { id: "about" as const, label: t('about.title'), icon: Info },
   ];

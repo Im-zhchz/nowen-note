@@ -48,20 +48,36 @@ app.get("/", (c) => {
       : "manual";
   const sortDir: "ASC" | "DESC" = sortOrderRaw === "asc" ? "ASC" : "DESC";
 
-  let query = `SELECT id, userId, notebookId, workspaceId, title, contentText, isPinned, isFavorite, isLocked,
-    isArchived, isTrashed, version, createdAt, updatedAt FROM notes WHERE 1=1`;
-  const params: any[] = [];
+  // Phase 2/Y1: isFavorite 不再来自 notes 列，而是按"当前请求用户是否在 favorites 表中收藏"
+  // 动态计算（EXISTS 子查询，结果仍是 0/1，前端契约 Note.isFavorite: number 不变）。
+  // 这样同一条工作区笔记在不同成员视角下的收藏状态互不影响。
+  //
+  // creatorName: LEFT JOIN users 取创建者用户名。
+  //   - 工作区下笔记可由不同成员创建，前端列表需要标注"谁建的"，避免每个客户端再
+  //     按 userId 反查成员表；
+  //   - LEFT JOIN（而非 INNER JOIN）兜底"用户已被删除但 ON DELETE CASCADE 还没跑完"
+  //     的极端窗口期 → 名字给 null，前端按"未知用户"渲染；
+  //   - users.username 已有 UNIQUE 索引，单行 join 代价可忽略。
+  let query = `SELECT notes.id, notes.userId, notes.notebookId, notes.workspaceId, notes.title,
+    notes.contentText, notes.isPinned,
+    CASE WHEN EXISTS(SELECT 1 FROM favorites f WHERE f.noteId = notes.id AND f.userId = ?) THEN 1 ELSE 0 END AS isFavorite,
+    notes.isLocked, notes.isArchived, notes.isTrashed, notes.version, notes.createdAt, notes.updatedAt,
+    users.username AS creatorName
+    FROM notes
+    LEFT JOIN users ON users.id = notes.userId
+    WHERE 1=1`;
+  const params: any[] = [userId];
 
   // Scope 过滤
   if (workspaceId && workspaceId !== "personal") {
     // 指定工作区：必须是成员
     const role = getUserWorkspaceRole(workspaceId, userId);
     if (!role) return c.json({ error: "无权访问该工作区" }, 403);
-    query += " AND workspaceId = ?";
+    query += " AND notes.workspaceId = ?";
     params.push(workspaceId);
   } else {
     // 个人空间（默认或 'personal'）
-    query += " AND userId = ? AND workspaceId IS NULL";
+    query += " AND notes.userId = ? AND notes.workspaceId IS NULL";
     params.push(userId);
   }
 
@@ -71,13 +87,16 @@ app.get("/", (c) => {
     `).all(search) as { rowid: number }[];
     if (ftsResults.length === 0) return c.json([]);
     const rowids = ftsResults.map((r) => r.rowid).join(",");
-    query += ` AND rowid IN (${rowids})`;
+    query += ` AND notes.rowid IN (${rowids})`;
   } else if (isTrashed === "1") {
-    query += " AND isTrashed = 1";
+    query += " AND notes.isTrashed = 1";
   } else if (isFavorite === "1") {
-    query += " AND isFavorite = 1 AND isTrashed = 0";
+    // Y1: 收藏过滤从"notes.isFavorite = 1"改为"当前用户在 favorites 中有该笔记记录"
+    query += ` AND notes.isTrashed = 0
+      AND EXISTS(SELECT 1 FROM favorites f2 WHERE f2.noteId = notes.id AND f2.userId = ?)`;
+    params.push(userId);
   } else if (tagId) {
-    query += " AND isTrashed = 0 AND id IN (SELECT noteId FROM note_tags WHERE tagId = ?)";
+    query += " AND notes.isTrashed = 0 AND notes.id IN (SELECT noteId FROM note_tags WHERE tagId = ?)";
     params.push(tagId);
   } else if (notebookId) {
     // 递归收集 notebookId 自身 + 全部后代笔记本，使笔记列表能展示子笔记本下的笔记
@@ -97,19 +116,19 @@ app.get("/", (c) => {
       return c.json([]);
     }
     const placeholders = ids.map(() => "?").join(",");
-    query += ` AND notebookId IN (${placeholders}) AND isTrashed = 0`;
+    query += ` AND notes.notebookId IN (${placeholders}) AND notes.isTrashed = 0`;
     params.push(...ids);
   } else {
-    query += " AND isTrashed = 0";
+    query += " AND notes.isTrashed = 0";
   }
 
   // 日期范围筛选
   if (dateFrom) {
-    query += " AND updatedAt >= ?";
+    query += " AND notes.updatedAt >= ?";
     params.push(dateFrom + " 00:00:00");
   }
   if (dateTo) {
-    query += " AND updatedAt <= ?";
+    query += " AND notes.updatedAt <= ?";
     params.push(dateTo + " 23:59:59");
   }
 
@@ -119,12 +138,12 @@ app.get("/", (c) => {
   //   - title 用 COLLATE NOCASE 让 ABC/abc 不分大小写；中文为 UTF-8 字节序，足够稳定；
   //   - 兜底再加 id 让相等键的顺序不抖动。
   if (sortBy === "manual") {
-    query += " ORDER BY isPinned DESC, sortOrder ASC, updatedAt DESC, id ASC";
+    query += " ORDER BY notes.isPinned DESC, notes.sortOrder ASC, notes.updatedAt DESC, notes.id ASC";
   } else if (sortBy === "title") {
-    query += ` ORDER BY isPinned DESC, title COLLATE NOCASE ${sortDir}, id ASC`;
+    query += ` ORDER BY notes.isPinned DESC, notes.title COLLATE NOCASE ${sortDir}, notes.id ASC`;
   } else {
     // updatedAt | createdAt
-    query += ` ORDER BY isPinned DESC, ${sortBy} ${sortDir}, id ASC`;
+    query += ` ORDER BY notes.isPinned DESC, notes.${sortBy} ${sortDir}, notes.id ASC`;
   }
   const notes = db.prepare(query).all(...params);
   return c.json(notes);
@@ -162,6 +181,30 @@ app.delete("/trash/empty", (c) => {
     console.warn("[notes.trash/empty] deleteAttachmentFilesByNoteIds failed:", e);
   }
 
+  // ⚠ 同理：算"将释放的字节数"也必须在 DELETE 之前，CASCADE 一执行就查不到了。
+  // 用 attachments.size + notes 正文长度共同估算，作为 VACUUM 阈值的判定依据。
+  let freedBytesEstimate = 0;
+  try {
+    const attBytes = db
+      .prepare(
+        `SELECT COALESCE(SUM(size), 0) AS bytes FROM attachments WHERE noteId IN (${placeholders})`,
+      )
+      .get(...ids) as { bytes: number } | undefined;
+    freedBytesEstimate += attBytes?.bytes || 0;
+    const noteBytes = db
+      .prepare(
+        `SELECT COALESCE(SUM(
+           COALESCE(LENGTH(content), 0) +
+           COALESCE(LENGTH(contentText), 0) +
+           COALESCE(LENGTH(title), 0)
+         ), 0) AS bytes FROM notes WHERE id IN (${placeholders})`,
+      )
+      .get(...ids) as { bytes: number } | undefined;
+    freedBytesEstimate += noteBytes?.bytes || 0;
+  } catch {
+    /* ignore — 估算失败就按 0 处理，后续不会触发 VACUUM */
+  }
+
   const deleteMany = db.transaction((list: string[]) => {
     db.prepare(`DELETE FROM notes WHERE id IN (${placeholders})`).run(...list);
   });
@@ -172,10 +215,52 @@ app.delete("/trash/empty", (c) => {
     try { yDestroyDoc(id); } catch {}
   }
 
-  emitWebhook("note.trash_emptied", userId, { count: ids.length, removedFiles });
-  logAudit(userId, "note", "trash_empty", { count: ids.length, noteIds: ids, removedFiles });
+  // ---- 回收磁盘空间 ----
+  // 背景：SQLite 的 DELETE 只把 page 标成 free，不会归还给操作系统。用户
+  // 反馈"清空回收站后占用没减少"，根因就在这里。
+  //
+  // 两步策略：
+  //   1) 始终做一次 wal_checkpoint(TRUNCATE) —— 把 WAL 并回主文件并截断，
+  //      立刻缩小 -wal 文件体积（"数据库占用"指标最直观的那一块）；零成本。
+  //   2) 仅当本次释放体量 > 阈值（默认 50MB）才做 VACUUM —— VACUUM 要独占锁
+  //      且要重写整个主库，小体量不值当做。
 
-  return c.json({ success: true, count: ids.length, skipped, removedFiles });
+  // wal_checkpoint 总是做（极廉价，且能让 -wal 大小立刻降下来）
+  let walTruncated = false;
+  try {
+    db.pragma("wal_checkpoint(TRUNCATE)");
+    walTruncated = true;
+  } catch (e) {
+    console.warn("[notes.trash/empty] wal_checkpoint failed:", e);
+  }
+
+  // 超阈值才 VACUUM（默认 50MB，可通过环境变量调整）
+  const VACUUM_THRESHOLD = Number(process.env.TRASH_VACUUM_THRESHOLD_BYTES || 50 * 1024 * 1024);
+  let vacuumed = false;
+  if (freedBytesEstimate >= VACUUM_THRESHOLD && ids.length > 0) {
+    try {
+      db.exec("VACUUM");
+      vacuumed = true;
+      // VACUUM 后再做一次 checkpoint 把遗留变更落盘
+      try { db.pragma("wal_checkpoint(TRUNCATE)"); } catch { /* ignore */ }
+    } catch (e) {
+      console.warn("[notes.trash/empty] VACUUM failed:", e);
+    }
+  }
+
+  emitWebhook("note.trash_emptied", userId, { count: ids.length, removedFiles, vacuumed });
+  logAudit(userId, "note", "trash_empty", { count: ids.length, noteIds: ids, removedFiles, vacuumed });
+
+  return c.json({
+    success: true,
+    count: ids.length,
+    skipped,
+    removedFiles,
+    // 让前端能感知"确实做了 checkpoint / VACUUM"，用于 toast 提示
+    walTruncated,
+    vacuumed,
+    freedBytesEstimate,
+  });
 });
 
 // 批量更新笔记排序（仅对有 write 权限的笔记生效）
@@ -225,11 +310,15 @@ app.get("/:id", (c) => {
   // slim 模式：只取元数据字段，不含 content / contentText。
   //   前端在"只想要 version"的路径（optimisticLockApi.makeFetchLatestNoteVersion、
   //   EditorPane 的 409 重试）用这个。
+  // Y1: isFavorite 统一按 per-user 动态计算（EXISTS favorites 表），
+  //   物理列 notes.isFavorite 已停止写入，不再用作来源。
+  const favExpr = `CASE WHEN EXISTS(SELECT 1 FROM favorites f WHERE f.noteId = notes.id AND f.userId = ?) THEN 1 ELSE 0 END AS isFavorite`;
   const selectCols = slim
-    ? `id, userId, notebookId, workspaceId, title, isPinned, isFavorite, isLocked,
+    ? `id, userId, notebookId, workspaceId, title, isPinned, ${favExpr}, isLocked,
        isArchived, isTrashed, version, sortOrder, createdAt, updatedAt, trashedAt`
-    : "*";
-  const note = db.prepare(`SELECT ${selectCols} FROM notes WHERE id = ?`).get(id);
+    : `id, userId, notebookId, workspaceId, title, content, contentText, isPinned, ${favExpr},
+       isLocked, isArchived, isTrashed, version, sortOrder, createdAt, updatedAt, trashedAt`;
+  const note = db.prepare(`SELECT ${selectCols} FROM notes WHERE id = ?`).get(userId, id);
   if (!note) return c.json({ error: "Note not found" }, 404);
 
   const tags = db.prepare(`
@@ -277,7 +366,7 @@ app.post("/", async (c) => {
   // 短路保证常规无内联图的创建零额外成本。
   if (typeof body.content === "string" && body.content.indexOf("data:image") >= 0) {
     try {
-      const r = extractInlineBase64Images(body.content, userId, id);
+      const r = extractInlineBase64Images(body.content, userId, id, inheritedWorkspaceId);
       if (r.replacedCount > 0) {
         db.prepare("UPDATE notes SET content = ? WHERE id = ?").run(r.content, id);
       }
@@ -287,9 +376,13 @@ app.post("/", async (c) => {
     }
   }
 
-  const note = db.prepare("SELECT * FROM notes WHERE id = ?").get(id);
-
-  emitWebhook("note.created", userId, { noteId: id, title: body.title || "无标题笔记" });
+  // Y1: SELECT 时 isFavorite 按 per-user 动态计算；新建笔记当前用户尚未收藏，结果必为 0。
+  const note = db.prepare(`
+    SELECT id, userId, notebookId, workspaceId, title, content, contentText, isPinned,
+      CASE WHEN EXISTS(SELECT 1 FROM favorites f WHERE f.noteId = notes.id AND f.userId = ?) THEN 1 ELSE 0 END AS isFavorite,
+      isLocked, isArchived, isTrashed, version, sortOrder, createdAt, updatedAt, trashedAt
+    FROM notes WHERE id = ?
+  `).get(userId, id);
   logAudit(userId, "note", "create", { noteId: id, title: body.title }, { targetType: "note", targetId: id });
 
   return c.json({ ...note as any, tags: [] }, 201);
@@ -303,7 +396,7 @@ app.put("/:id", async (c) => {
   const body = await c.req.json();
 
   // 权限校验
-  const { permission } = resolveNotePermission(id, userId);
+  const { permission, workspaceId: noteWorkspaceId } = resolveNotePermission(id, userId);
 
   // 根据变更字段决定所需权限
   const writeFields = ["title", "content", "contentText", "notebookId", "isPinned", "isFavorite",
@@ -424,7 +517,7 @@ app.put("/:id", async (c) => {
   //     纯文本不含 base64，本身不受影响，FTS 重排逻辑（notes_au）也不会被打扰。
   if (typeof body.content === "string" && body.content.indexOf("data:image") >= 0) {
     try {
-      const r = extractInlineBase64Images(body.content, userId, id);
+      const r = extractInlineBase64Images(body.content, userId, id, noteWorkspaceId);
       if (r.replacedCount > 0) {
         body.content = r.content;
       }
@@ -442,7 +535,24 @@ app.put("/:id", async (c) => {
     fields.push("workspaceId = ?"); params.push(newWorkspaceId ?? null);
   }
   if (body.isPinned !== undefined) { fields.push("isPinned = ?"); params.push(body.isPinned); }
-  if (body.isFavorite !== undefined) { fields.push("isFavorite = ?"); params.push(body.isFavorite); }
+  // Y1: isFavorite 不再写 notes 列，改为操作 favorites 表（per-user 语义）。
+  // 权限检查已在上面的 writeFields 里做过（仍需 write 权限才能切换自己的收藏）。
+  // 幂等：truthy → INSERT OR IGNORE；falsy → DELETE。
+  // 同一笔记的 workspaceId 从 notes 取，保持 favorites.workspaceId 与笔记同步，便于工作区维度统计。
+  if (body.isFavorite !== undefined) {
+    const favRow = db.prepare("SELECT workspaceId FROM notes WHERE id = ?").get(id) as
+      | { workspaceId: string | null }
+      | undefined;
+    const favWsId = favRow?.workspaceId ?? null;
+    if (body.isFavorite) {
+      db.prepare(`
+        INSERT OR IGNORE INTO favorites (userId, noteId, workspaceId, createdAt)
+        VALUES (?, ?, ?, datetime('now'))
+      `).run(userId, id, favWsId);
+    } else {
+      db.prepare("DELETE FROM favorites WHERE userId = ? AND noteId = ?").run(userId, id);
+    }
+  }
   if (body.isLocked !== undefined) { fields.push("isLocked = ?"); params.push(body.isLocked); }
   if (body.isArchived !== undefined) { fields.push("isArchived = ?"); params.push(body.isArchived); }
   if (body.isTrashed !== undefined) {
@@ -454,14 +564,28 @@ app.put("/:id", async (c) => {
   const contentFieldNames = ["title", "content", "contentText", "notebookId"];
   const hasContentFieldChange = contentFieldNames.some((f) => body[f] !== undefined);
 
-  fields.push("version = version + 1");
-  if (hasContentFieldChange) {
-    fields.push("updatedAt = datetime('now')");
-  }
-  params.push(id);
+  // Y1: 判断本次 PUT 是否"只切换了 favorites"——此时 fields 数组会是空的。
+  // 切换 favorites 属于 per-user 操作，不应该 bump notes.version（会误触发其他协作者
+  // 的乐观锁刷新），也不应广播 note.updated。因此仅当确有 notes 列要改时才 UPDATE。
+  const hasNoteColumnChange = fields.length > 0;
 
-  db.prepare(`UPDATE notes SET ${fields.join(", ")} WHERE id = ?`).run(...params);
-  const note = db.prepare("SELECT * FROM notes WHERE id = ?").get(id);
+  if (hasNoteColumnChange) {
+    fields.push("version = version + 1");
+    if (hasContentFieldChange) {
+      fields.push("updatedAt = datetime('now')");
+    }
+    params.push(id);
+    db.prepare(`UPDATE notes SET ${fields.join(", ")} WHERE id = ?`).run(...params);
+  }
+
+  // Y1: 返回值里 isFavorite 按当前用户动态计算（EXISTS favorites 表），
+  // 物理列 notes.isFavorite 已停止写入。
+  const note = db.prepare(`
+    SELECT id, userId, notebookId, workspaceId, title, content, contentText, isPinned,
+      CASE WHEN EXISTS(SELECT 1 FROM favorites f WHERE f.noteId = notes.id AND f.userId = ?) THEN 1 ELSE 0 END AS isFavorite,
+      isLocked, isArchived, isTrashed, version, sortOrder, createdAt, updatedAt, trashedAt
+    FROM notes WHERE id = ?
+  `).get(userId, id);
 
   // syncToYjs：调用方（目前是 EditorPane RTE→MD 切换）显式要求把 body.content 作为
   // markdown 同步写入 y room 的 yText。这里必须在 REST 落库成功之后才做，因为：
@@ -495,25 +619,29 @@ app.put("/:id", async (c) => {
   `).all(id);
 
   // Phase 2: 实时广播（失败不阻塞返回）
-  try {
-    const n = note as any;
-    if (body.isTrashed === 1) {
-      // 放入回收站，视作"删除"
-      broadcastNoteDeleted(id, {
-        actorUserId: userId,
-        trashed: true,
-      });
-    } else {
-      broadcastNoteUpdated(id, {
-        version: n.version,
-        updatedAt: n.updatedAt,
-        title: n.title,
-        contentText: n.contentText,
-        actorUserId: userId,
-      });
+  // Y1: 仅切换 favorites 时不广播——per-user 操作对其他协作者无意义，广播会引发
+  // 不必要的前端重渲染/乐观锁刷新。
+  if (hasNoteColumnChange) {
+    try {
+      const n = note as any;
+      if (body.isTrashed === 1) {
+        // 放入回收站，视作"删除"
+        broadcastNoteDeleted(id, {
+          actorUserId: userId,
+          trashed: true,
+        });
+      } else {
+        broadcastNoteUpdated(id, {
+          version: n.version,
+          updatedAt: n.updatedAt,
+          title: n.title,
+          contentText: n.contentText,
+          actorUserId: userId,
+        });
+      }
+    } catch (e) {
+      console.warn("[notes.put] broadcast failed:", e);
     }
-  } catch (e) {
-    console.warn("[notes.put] broadcast failed:", e);
   }
 
   return c.json({ ...note as any, tags });

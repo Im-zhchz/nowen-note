@@ -14,6 +14,7 @@ import SharedNoteView from "@/components/SharedNoteView";
 import LoginPage from "@/components/LoginPage";
 import QuickLoginGate from "@/components/QuickLoginGate";
 import QuickLoginEnrollDialog from "@/components/QuickLoginEnrollDialog";
+import WhatsNewModal, { useWhatsNew } from "@/components/WhatsNewModal";
 import { AppProvider, useApp, useAppActions, MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH, DEFAULT_SIDEBAR_WIDTH, MIN_NOTELIST_WIDTH, MAX_NOTELIST_WIDTH, DEFAULT_NOTELIST_WIDTH } from "@/store/AppContext";
 import { ThemeProvider } from "@/components/ThemeProvider";
 import { SiteSettingsProvider, useSiteSettings } from "@/hooks/useSiteSettings";
@@ -595,6 +596,12 @@ function AuthGate() {
   /** 当前 token（用于引导对话框写入 secure storage） */
   const [activeToken, setActiveToken] = useState<string>("");
 
+  // 「更新日志」首次升级自动弹窗。
+  //   - 仅在已登录分支生效（enable=!!user），未登录态不打扰；
+  //   - useWhatsNew 内部对比 localStorage.nowen-seen-version 与 __APP_VERSION__，
+  //     不一致才返回 shouldShow=true，关闭后立即写回，下一次升级才再弹。
+  const [showWhatsNew, markWhatsNewSeen] = useWhatsNew(!!user);
+
   const handleDisconnect = () => {
     clearServerUrl();
     // L10: 断开服务器相当于登出 + 切换服务器，通知其他 tab
@@ -675,6 +682,14 @@ function AuthGate() {
             onClose={() => setJustPasswordLogin(false)}
           />
         )}
+        {/* 首次升级到新版本自动弹「更新日志」。
+            useWhatsNew 决定是否该弹；onClose 调 markSeen 写回 localStorage，
+            下一次升版前都不会再弹。 */}
+        <WhatsNewModal
+          open={showWhatsNew}
+          onClose={markWhatsNewSeen}
+          highlightVersion={__APP_VERSION__}
+        />
       </TooltipProvider>
     </AppProvider>
   );

@@ -538,6 +538,25 @@ function initSchema(db: Database.Database) {
     db.exec("CREATE INDEX IF NOT EXISTS idx_notes_workspace ON notes(workspaceId);");
   }
 
+  // tags 表增加 workspaceId 字段（NULL 表示归属于用户的个人空间）
+  // -----------------------------------------------------------------
+  // 设计要点：
+  //   - 与 notebooks / notes 同款：workspaceId 是 TEXT，NULL 视为个人空间。
+  //   - 不加 FOREIGN KEY：SQLite 的 ALTER TABLE ADD COLUMN 不支持带 FK 的列；
+  //     业务层维护引用完整性即可（删除 workspace 时同步清理 / 转个人）。
+  //   - 不动 UNIQUE(userId, name)：保留"同用户标签名全局唯一"的现有约束，
+  //     避免重建表。语义上：标签是用户自己的分类体系，而 workspaceId
+  //     仅决定它在哪个空间里可见。
+  //   - 已存在的标签 ALTER 后 workspaceId 自动为 NULL → 全部归到个人空间，
+  //     符合"标签隔离迁移到个人空间"的策略，零数据丢失。
+  try {
+    db.prepare("SELECT workspaceId FROM tags LIMIT 1").get();
+  } catch {
+    db.prepare("ALTER TABLE tags ADD COLUMN workspaceId TEXT").run();
+    db.exec("CREATE INDEX IF NOT EXISTS idx_tags_workspace ON tags(workspaceId);");
+    db.exec("CREATE INDEX IF NOT EXISTS idx_tags_user_workspace ON tags(userId, workspaceId);");
+  }
+
   // 数据库迁移：为已有表添加新字段
   try {
     db.prepare("SELECT isLocked FROM notes LIMIT 1").get();

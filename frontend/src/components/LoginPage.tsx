@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { Loader2, Lock, User, BookOpen, CheckCircle2, AlertCircle, Mail, UserPlus, ShieldCheck } from "lucide-react";
 import { useTranslation } from "react-i18next";
@@ -6,6 +6,12 @@ import { getServerUrl, setServerUrl, clearServerUrl, testServerConnection, fetch
 import { buildServerUrl, parseServerUrl, type ServerAddressParts } from "@/lib/serverUrl";
 import ServerAddressInput from "@/components/ServerAddressInput";
 import LanDiscoveryPanel from "@/components/LanDiscoveryPanel";
+import {
+  loadRememberedCredentials,
+  saveRememberedCredentials,
+  clearRememberedCredentials,
+  canPersistPassword,
+} from "@/lib/rememberLogin";
 
 interface LoginPageProps {
   onLogin: (token: string, user: any) => void;
@@ -42,6 +48,16 @@ export default function LoginPage({ onLogin, isClientMode = false, onDisconnect 
     baseUrl: string; // 用于 2fa/verify 的 origin，保持与登录阶段一致
   } | null>(null);
   const [twoFactorCode, setTwoFactorCode] = useState("");
+  // 「记住密码 / 自动登录」
+  //   - rememberMe：登录成功后把密码加密保存；下次打开自动预填
+  //   - autoLogin：在 rememberMe 基础上，打开 App 自动触发登录（无需再点按钮）
+  //   - canSavePassword：当前运行环境是否能安全保存密码（Web=false，Electron 要看 safeStorage）
+  //   - triedAutoLoginRef：确保"自动登录"只触发一次，避免失败后无限自动重试
+  const [rememberMe, setRememberMe] = useState(false);
+  const [autoLogin, setAutoLogin] = useState(false);
+  const [canSavePassword, setCanSavePassword] = useState(false);
+  const triedAutoLoginRef = useRef(false);
+  const formRef = useRef<HTMLFormElement | null>(null);
   const { t } = useTranslation();
 
   // 回填上次的服务器地址（兼容旧版：localStorage 里可能存的是完整 URL 字符串）
@@ -78,6 +94,56 @@ export default function LoginPage({ onLogin, isClientMode = false, onDisconnect 
     };
   }, [isClientMode, serverStatus]);
 
+  // 探测当前环境是否能落盘密码（决定"记住密码"开关是否显示）
+  useEffect(() => {
+    let alive = true;
+    canPersistPassword().then((v) => {
+      if (alive) setCanSavePassword(v);
+    });
+    return () => { alive = false; };
+  }, []);
+
+  // 启动时读取"记住的凭据"→ 预填 + 视情况触发自动登录
+  //
+  // 关键：本 effect 只跑一次（mount），后续用户编辑不会再覆盖输入。
+  //   - 仅当拿到非空凭据才预填；
+  //   - 若设置了 autoLogin 且 hasPassword，等服务器地址就绪后自动点一次"登录"；
+  //   - triedAutoLoginRef 防止失败后无限重试。
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const cred = await loadRememberedCredentials();
+      if (cancelled || !cred) return;
+      if (cred.username) setUsername(cred.username);
+      if (cred.password) setPassword(cred.password);
+      if (cred.serverUrl && isClientMode) {
+        setServerParts(parseServerUrl(cred.serverUrl));
+        // 不直接标 ok：等 resolveBaseUrl 或 blur 再探测
+      }
+      setRememberMe(!!cred.username); // 有保存就默认勾上
+      setAutoLogin(!!cred.autoLogin);
+
+      if (cred.autoLogin && cred.hasPassword && cred.username && cred.password) {
+        // 延后一帧等 state 刷到输入框，再 requestSubmit 走正常流程
+        // （走 handleSubmit 可以复用 serverCheck + 2FA + 错误显示的整套逻辑）
+        if (triedAutoLoginRef.current) return;
+        triedAutoLoginRef.current = true;
+        setTimeout(() => {
+          if (cancelled) return;
+          try {
+            formRef.current?.requestSubmit();
+          } catch {
+            /* ignore */
+          }
+        }, 120);
+      }
+    })();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // 服务器地址框 onBlur 时主动探测一次连通性，提前把 serverStatus 落到 ok/fail，
+  // 让用户在点"登录"之前就能看到红/绿状态灯。
   const handleServerBlur = async () => {
     if (!isClientMode) return;
     const url = buildServerUrl(serverParts);
@@ -111,6 +177,25 @@ export default function LoginPage({ onLogin, isClientMode = false, onDisconnect 
     return url;
   };
 
+  /**
+   * 根据当前复选框状态持久化「记住密码 / 自动登录」。
+   * 放一个独立函数是因为既要在普通登录成功后调用，也要在 2FA 一阶段成功后调用，
+   * 避免两处 copy-paste。
+   */
+  const persistRememberState = async (baseUrl: string) => {
+    try {
+      await saveRememberedCredentials({
+        remember: rememberMe,
+        autoLogin: rememberMe && autoLogin,
+        serverUrl: baseUrl || "",
+        username,
+        password: canSavePassword ? password : "",
+      });
+    } catch (e) {
+      console.warn("[LoginPage] persist remember failed:", e);
+    }
+  };
+
   const handleLoginSubmit = async () => {
     const baseUrl = await resolveBaseUrl();
     if (baseUrl === null) return;
@@ -124,18 +209,36 @@ export default function LoginPage({ onLogin, isClientMode = false, onDisconnect 
     const data = await res.json();
     if (!res.ok) {
       setError(data.error || t("auth.loginFailed"));
+      // 登录失败：关闭本轮自动登录；若之前配置了自动登录，把 autoLogin 关掉防止死循环
+      // （但保留用户名用于下次预填）
+      if (autoLogin) {
+        setAutoLogin(false);
+        await saveRememberedCredentials({
+          remember: rememberMe,
+          autoLogin: false,
+          serverUrl: baseUrl,
+          username,
+          password: "", // 密码可能错了，别再保留
+        });
+      }
       return;
     }
     // Phase 6: 2FA 两阶段 —— 后端返回 requires2FA 时，跳转到 2FA 面板
     //   ticket 只有 5 分钟有效期，仅能用于 /auth/2fa/verify；前端不把它写进 localStorage
     //   以减少 XSS 暴露面，切到 2FA 面板后保存在组件 state 里即可。
+    //
+    //   此时"一阶段密码校验"已经通过，记住密码/自动登录可以先落盘——
+    //   下次自动登录仍会回到 2FA 面板，由用户输动态码。
     if (data.requires2FA && data.ticket) {
+      await persistRememberState(baseUrl);
       setTwoFactor({ ticket: data.ticket, username: data.username || username, baseUrl });
       setPassword(""); // 清掉内存里的密码
       setTwoFactorCode("");
       return;
     }
     localStorage.setItem("nowen-token", data.token);
+    // 持久化「记住密码 / 自动登录」配置（两者同时可独立开关）
+    await persistRememberState(baseUrl);
     onLogin(data.token, data.user);
   };
 
@@ -227,6 +330,8 @@ export default function LoginPage({ onLogin, isClientMode = false, onDisconnect 
   const handleDisconnect = () => {
     clearServerUrl();
     localStorage.removeItem("nowen-token");
+    // 断开服务器 = 凭据不再有意义，一并清掉防止下次自动登录打到错误服务器
+    void clearRememberedCredentials();
     setServerParts({ protocol: "http", host: "", port: "" });
     setServerStatus("idle");
     setUsername("");
@@ -235,6 +340,8 @@ export default function LoginPage({ onLogin, isClientMode = false, onDisconnect 
     setEmail("");
     setDisplayName("");
     setError("");
+    setRememberMe(false);
+    setAutoLogin(false);
     onDisconnect?.();
   };
 
@@ -341,7 +448,7 @@ export default function LoginPage({ onLogin, isClientMode = false, onDisconnect 
           </div>
           )}
 
-          <form onSubmit={handleSubmit} className="space-y-4">
+          <form ref={formRef} onSubmit={handleSubmit} className="space-y-4">
             {/* Phase 6: 2FA 面板（取代登录表单） */}
             {twoFactor ? (
               <div className="space-y-4">
@@ -546,6 +653,36 @@ export default function LoginPage({ onLogin, isClientMode = false, onDisconnect 
                 </motion.div>
               )}
             </AnimatePresence>
+
+            {/* 记住密码 / 自动登录（仅登录模式 + 支持落盘加密的平台显示） */}
+            {!isRegister && canSavePassword && (
+              <div className="flex items-center justify-between gap-3 pt-1">
+                <label className="flex items-center gap-2 cursor-pointer select-none text-xs text-zinc-600 dark:text-zinc-400">
+                  <input
+                    type="checkbox"
+                    checked={rememberMe}
+                    onChange={(e) => {
+                      const checked = e.target.checked;
+                      setRememberMe(checked);
+                      // 关掉记住密码时顺带关自动登录
+                      if (!checked) setAutoLogin(false);
+                    }}
+                    className="w-3.5 h-3.5 rounded border-zinc-300 dark:border-zinc-600 text-indigo-600 focus:ring-indigo-500/40"
+                  />
+                  {t("auth.rememberMe")}
+                </label>
+                <label className={`flex items-center gap-2 select-none text-xs ${rememberMe ? "cursor-pointer text-zinc-600 dark:text-zinc-400" : "cursor-not-allowed text-zinc-400 dark:text-zinc-600"}`}>
+                  <input
+                    type="checkbox"
+                    checked={autoLogin}
+                    disabled={!rememberMe}
+                    onChange={(e) => setAutoLogin(e.target.checked)}
+                    className="w-3.5 h-3.5 rounded border-zinc-300 dark:border-zinc-600 text-indigo-600 focus:ring-indigo-500/40 disabled:opacity-50"
+                  />
+                  {t("auth.autoLogin")}
+                </label>
+              </div>
+            )}
             </>)}
 
             {/* 错误提示 */}

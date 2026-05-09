@@ -18,6 +18,8 @@ import { TextSelection } from "@tiptap/pm/state";
 import { markdownToSimpleHtml } from "@/lib/importService";
 import { markdownToHtml as mdToFullHtml, detectFormat as detectContentFormat } from "@/lib/contentFormat";
 import { api } from "@/lib/api";
+import { extractRtfImagesAsync } from "@/lib/rtfImageWorkerClient";
+import { replaceDataUrlImagesWithAttachments } from "@/lib/rtfImageUploader";
 import {
   Bold, Italic, Underline as UnderlineIcon, Strikethrough,
   List, ListOrdered, Heading1, Heading2, Heading3,
@@ -108,8 +110,15 @@ if (!(ProseMirrorNode.prototype as any)[RESOLVE_PATCHED]) {
 //
 // 选择第一个非空的"看起来像真正图片地址"的属性值；若 src 已经是绝对的
 // http(s)/data:/blob: URL 则保留不动（不覆盖用户原本就正常的图）。
+//
+// 返回值：{ total, rescued, failed }
+//   total   - 处理到的 <img> 总数
+//   rescued - 从 data-src / file / srcset 等候选属性救回真实地址的 <img> 数
+//   failed  - 仍然没有可用 src 的 <img>（通常是原网页图片还没加载完就被复制）
 // ---------------------------------------------------------------------------
-function rescuePastedImages(root: Element): void {
+type RescueStats = { total: number; rescued: number; failed: number };
+function rescuePastedImages(root: Element): RescueStats {
+  const stats: RescueStats = { total: 0, rescued: 0, failed: 0 };
   // 1) 先扫一遍找出本片段内"任意一个绝对 URL 的 origin"，作为相对路径的 base。
   //    优先用 <a href>/<link href>/已经是绝对地址的 <img src>，因为 Discuz
   //    复制过来的 HTML 往往带有指向源站的链接（如附件下载链接）。
@@ -157,14 +166,47 @@ function rescuePastedImages(root: Element): void {
     return `${pasteBaseOrigin}/${u.replace(/^\.?\//, "")}`;
   };
 
+  // 从 srcset 字符串中挑一个 URL（优先最高分辨率）。
+  //   "url1 1x, url2 2x"  → url2
+  //   "url1 320w, url2 1280w" → url2
+  //   "url1"              → url1
+  const pickFromSrcset = (raw: string | null): string | null => {
+    if (!raw) return null;
+    const entries = raw
+      .split(",")
+      .map((e) => e.trim())
+      .filter(Boolean)
+      .map((e) => {
+        // 允许 URL 内含空格（罕见）；取最后一段做 descriptor
+        const m = e.match(/^(\S+)(?:\s+(\S+))?$/);
+        if (!m) return null;
+        const url = m[1];
+        const desc = (m[2] || "").toLowerCase();
+        let weight = 0;
+        if (desc.endsWith("w")) weight = parseFloat(desc);
+        else if (desc.endsWith("x")) weight = parseFloat(desc) * 1000; // 粗略统一量纲
+        else weight = 0;
+        return { url, weight };
+      })
+      .filter((x): x is { url: string; weight: number } => !!x);
+    if (entries.length === 0) return null;
+    entries.sort((a, b) => b.weight - a.weight);
+    return entries[0].url;
+  };
+
   // 4) 救援每一个 <img>：按优先级挑一个有效的真实地址覆盖到 src
   root.querySelectorAll("img").forEach((img) => {
+    stats.total += 1;
     const currentSrc = img.getAttribute("src");
     // src 已经是合法且非占位的远端/data URL → 不动
+    //   注意：file:// 不算合法（浏览器出于安全限制不会加载），
+    //   Word 复制过来的 <img src="file:///C:/Users/.../clip_image001.png"> 必须走救援流程。
     if (currentSrc && /^(https?:|data:|blob:)/i.test(currentSrc) && !isPlaceholderSrc(currentSrc)) {
       return;
     }
     // 候选属性顺序：Discuz 的 zoomfile（点击放大原图）> file > 通用 lazyload 属性
+    // 覆盖主流懒加载库与站点：lazysizes、lozad、jQuery.lazyload、微信公众号、
+    // CSDN、简书、掘金、知乎、博客园、Medium 等
     const candidates = [
       "zoomfile",
       "file",
@@ -173,6 +215,14 @@ function rescuePastedImages(root: Element): void {
       "data-lazy-src",
       "data-actualsrc",
       "data-echo",
+      "data-raw-src",
+      "data-original-src",
+      "data-src-large",
+      "data-src-hd",
+      "data-hires",
+      "data-full",
+      "data-url",
+      "data-href",
     ];
     let picked: string | null = null;
     for (const attr of candidates) {
@@ -182,14 +232,48 @@ function rescuePastedImages(root: Element): void {
         break;
       }
     }
+    // 从 data-srcset / srcset 挑最大尺寸
+    if (!picked) {
+      picked = pickFromSrcset(img.getAttribute("data-srcset"))
+        || pickFromSrcset(img.getAttribute("srcset"));
+    }
+    // 从父层 <picture> 的 <source srcset> 挑最大尺寸
+    if (!picked) {
+      const picture = img.closest("picture");
+      if (picture) {
+        const sources = Array.from(picture.querySelectorAll("source"));
+        for (const s of sources) {
+          const url = pickFromSrcset(s.getAttribute("srcset"))
+            || pickFromSrcset(s.getAttribute("data-srcset"));
+          if (url) {
+            picked = url;
+            break;
+          }
+        }
+      }
+    }
     // 候选都没有，但当前 src 是相对路径（非占位）→ 也尝试补全
     if (!picked && currentSrc && !isPlaceholderSrc(currentSrc)) {
       picked = currentSrc;
     }
-    if (!picked) return; // 救不回来，留给 PM 决定（通常会被丢弃）
+    if (!picked) {
+      // 救不回来，记一笔（常见来源：
+      //   a) 懒加载网页图片未加载完；
+      //   b) Word/WPS 复制而来 —— HTML 里 <img src="file:///..."> 浏览器无法加载）
+      // 从片段中移除该 <img>，避免最终笔记里出现破图图标。
+      stats.failed += 1;
+      img.remove();
+      return;
+    }
     const abs = toAbsolute(picked);
     if (abs && /^(https?:|data:|blob:)/i.test(abs)) {
       img.setAttribute("src", abs);
+      // 顺手清掉 file:// 的 data-* 与 srcset，避免干扰下游
+      img.removeAttribute("srcset");
+      stats.rescued += 1;
+    } else {
+      stats.failed += 1;
+      img.remove();
     }
   });
 
@@ -200,19 +284,152 @@ function rescuePastedImages(root: Element): void {
     while (el.firstChild) span.appendChild(el.firstChild);
     el.replaceWith(span);
   });
+
+  return stats;
 }
 
-function normalizePastedHtmlForBlocks(html: string): string {
-  if (!html) return html;
+// ---------------------------------------------------------------------------
+// isWordLikeHtml：判断剪贴板 HTML 是否来自 Microsoft Word / WPS / Outlook
+// ---------------------------------------------------------------------------
+// Office 系产品在写剪贴板 HTML 时有非常稳定的"指纹"：
+//   - <html xmlns:o="urn:schemas-microsoft-com:office:office"> 等 Office 命名空间
+//   - CSS class 带 Mso 前缀（MsoNormal、MsoListParagraph 等）
+//   - 专有标签：<o:p>、<v:shape>、<v:imagedata>
+//   - 注释 "ProgId" 指示 MS Office HTML
+//   - <img src="file:///..."> 指向 Word 临时目录的本地图片（复制到其他程序后不可访问）
+//
+// 识别这些来源是为了在图片丢失时给出**更有针对性**的提示，告诉用户
+// "Word 粘贴带不过来图片，请改用导入 Word 文档"。
+// ---------------------------------------------------------------------------
+function isWordLikeHtml(html: string): boolean {
+  if (!html) return false;
+  const head = html.slice(0, 4096); // 指纹基本都在头部，避免扫全量大块
+  return (
+    /xmlns:o="urn:schemas-microsoft-com:office/i.test(head) ||
+    /xmlns:w="urn:schemas-microsoft-com:office:word/i.test(head) ||
+    /<meta[^>]+content=["']?[^"']*Microsoft[^"']*Word/i.test(head) ||
+    /ProgId["']?\s*=?\s*["']?Word\.Document/i.test(head) ||
+    /class=["'][^"']*Mso[A-Z]/i.test(html) ||
+    /<o:p[\s>/]/i.test(html) ||
+    /<v:imagedata\b/i.test(html) ||
+    /<v:shape\b/i.test(html)
+  );
+}
+
+// ---------------------------------------------------------------------------
+// extractImagesFromRtf：从 Word/WPS 粘贴的 RTF 里提取内联图片。
+//
+// 背景：Word 全选复制时，text/html 里的 <img> src 通常是 "file:///C:/Users/
+// .../clip_image001.png" 等本地路径（浏览器出于安全限制无法加载），而真正
+// 的图像二进制放在同时携带的 text/rtf 中，以 \pngblip 或 \jpegblip 开头、
+// 后跟一大段十六进制字符、以 `}` 结束。腾讯文档 / Google Docs 粘贴能保留
+// 图片就是因为它们解析了 RTF 通道。
+//
+// 返回顺序的 data URL 数组，与 HTML 里 <img> 出现顺序一一对应。
+// ---------------------------------------------------------------------------
+function hexToBase64(hex: string): string {
+  // hex 字符串转 Uint8Array 再转 base64。采用分块 String.fromCharCode
+  // 避免一次性 apply 超大数组栈溢出。
+  const clean = hex.replace(/[^0-9a-fA-F]/g, "");
+  const len = Math.floor(clean.length / 2);
+  const bytes = new Uint8Array(len);
+  for (let i = 0; i < len; i++) {
+    bytes[i] = parseInt(clean.substr(i * 2, 2), 16);
+  }
+  let binary = "";
+  const CHUNK = 0x8000;
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    binary += String.fromCharCode.apply(
+      null,
+      Array.from(bytes.subarray(i, i + CHUNK))
+    );
+  }
+  return btoa(binary);
+}
+
+function extractImagesFromRtf(rtf: string): string[] {
+  const result: string[] = [];
+  if (!rtf || rtf.length === 0) return result;
+  // 以 \pict 块为单位扫描（Word 每张图都包在 {\pict ... } 里）。
+  // 正则说明：
+  //   \{\\\*?\\?pict      匹配 "{\pict" 或 "{\*\pict"（兼容部分写法）
+  //   [\s\S]*?            非贪婪匹配块内内容
+  //   (\\pngblip|\\jpegblip)   图片格式标识
+  //   ([\s\S]*?)          捕获十六进制（含空白和换行）
+  //   \}                  块结束
+  // 用简化版：直接定位 \pngblip / \jpegblip，然后往后读十六进制直到遇到
+  // 非 hex（通常是 `}` 或控制字）。这样对嵌套 {} 容忍度更高。
+  const re = /\\(pngblip|jpegblip)[^}]*?([0-9a-fA-F\s]{32,})/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(rtf)) !== null) {
+    const format = m[1] === "pngblip" ? "png" : "jpeg";
+    const hex = m[2];
+    try {
+      const b64 = hexToBase64(hex);
+      if (b64.length > 0) {
+        result.push(`data:image/${format};base64,${b64}`);
+      }
+    } catch {
+      /* 单张图损坏不影响其他 */
+    }
+  }
+  return result;
+}
+
+// 把 HTML 里的占位 <img>（file:///、v:imagedata、空 src 等）按出现顺序
+// 替换成从 RTF 提取出来的 data URL。返回替换后的 HTML。
+// 若 rtfImages 数量少于 HTML 里的 <img>，多出来的 <img> 保持原样（让后续
+// rescue 流程去清理 / 标记为 failed）。
+function mergeRtfImagesIntoHtml(html: string, rtfImages: string[]): string {
+  if (!rtfImages.length || !html) return html;
+  try {
+    const doc = new DOMParser().parseFromString(
+      `<div id="__root">${html}</div>`,
+      "text/html"
+    );
+    const root = doc.getElementById("__root");
+    if (!root) return html;
+    // Word 有时会用 <v:imagedata src="file://..."/>（VML）承载图片占位，
+    // 这些节点本身不是 <img>；但它们通常被 <img> 包裹或与 <img> 成对出现。
+    // 这里只按顺序替换普通 <img> 的 src，已能覆盖 Word 的主流情况。
+    const imgs = Array.from(root.querySelectorAll("img"));
+    let cursor = 0;
+    for (const img of imgs) {
+      if (cursor >= rtfImages.length) break;
+      const src = img.getAttribute("src") || "";
+      // 只替换"显然无法加载"的占位：file:///、空、vml 协议等。
+      // 若 src 已经是 http/https/data/blob，保留不动。
+      const needReplace =
+        !src ||
+        /^file:\/\//i.test(src) ||
+        /^about:/i.test(src) ||
+        src.trim().length === 0;
+      if (needReplace) {
+        img.setAttribute("src", rtfImages[cursor]);
+        cursor += 1;
+      }
+    }
+    return root.innerHTML;
+  } catch {
+    return html;
+  }
+}
+
+
+
+function normalizePastedHtmlForBlocks(html: string): { html: string; imageStats: RescueStats; isWordSource: boolean } {
+  const empty: RescueStats = { total: 0, rescued: 0, failed: 0 };
+  if (!html) return { html, imageStats: empty, isWordSource: false };
+  const isWordSource = isWordLikeHtml(html);
   try {
     const doc = new DOMParser().parseFromString(`<div id="__root">${html}</div>`, "text/html");
     const root = doc.getElementById("__root");
-    if (!root) return html;
+    if (!root) return { html, imageStats: empty, isWordSource };
 
     // 0) 先抢救图片：把 Discuz / 懒加载站点中藏在 file/zoomfile/data-src
     //    等属性里的"真正图片地址"提升到 src，并补全相对路径，
     //    避免后续 PM DOMParser 把"src 是占位 / 空 / 相对路径"的 <img> 节点丢掉。
-    rescuePastedImages(root);
+    const imageStats = rescuePastedImages(root);
 
     // 1) 顶层 <div> 直接替换为 <p>（保留内部内联内容）
     //    注意只处理"直接子节点层"，不递归改动引用/表格内的 <div>。
@@ -262,11 +479,11 @@ function normalizePastedHtmlForBlocks(html: string): string {
     const topBlocks = Array.from(root.querySelectorAll(":scope > p, :scope > h1, :scope > h2, :scope > h3, :scope > h4, :scope > h5, :scope > h6"));
     topBlocks.forEach(splitByTopLevelBr);
 
-    return root.innerHTML;
+    return { html: root.innerHTML, imageStats, isWordSource };
   } catch (e) {
     // 异常时不阻塞粘贴流程，返回原 HTML
     if (typeof console !== "undefined") console.warn("[normalizePastedHtmlForBlocks] failed:", e);
-    return html;
+    return { html, imageStats: empty, isWordSource };
   }
 }
 
@@ -843,14 +1060,40 @@ export default forwardRef<NoteEditorHandle, TiptapEditorProps>(function TiptapEd
       handlePaste: (view, event) => {
         // 始终阻止浏览器默认粘贴行为，防止页面跳转到空白页
         event.preventDefault();
+        // --- [DIAG] 入口全局探针：确认路径和各通道数据 ---
+        try {
+          const cd = event.clipboardData;
+          const probeHtml = cd?.getData("text/html") || "";
+          const probeText = cd?.getData("text/plain") || "";
+          const probeRtf = cd?.getData("text/rtf") || "";
+          const itemList = cd ? Array.from(cd.items).map((it) => it.kind + "/" + it.type) : [];
+          const fileList = cd ? Array.from(cd.files).map((f) => f.name + "/" + f.type + "/" + f.size) : [];
+          console.log("[paste-diag] ENTRY",
+            " text.len=", probeText.length,
+            " html.len=", probeHtml.length,
+            " rtf.len=", probeRtf.length,
+            " pngblip=", (probeRtf.match(/\\pngblip/g) || []).length,
+            " items=", itemList,
+            " files=", fileList);
+        } catch {}
         try {
           // 1) 处理剪贴板中的图片文件（如截图粘贴）
           //    走 /api/attachments 上传接口：写磁盘 + 落 attachments 行，
           //    编辑器插入的 <img> 引用服务端 URL，避免内联 base64 把文档体积撑大。
+          //
+          //    ⚠️ 关键：Word / 腾讯文档 等富文本源全选复制时，clipboardData 里
+          //    同时存在 text/html（内联 base64 的多张 <img>）和 image/png（通常
+          //    只是首张图或缩略合成图）。若直接遍历 items 看到 image/* 就 return，
+          //    会"只上传一张图 + 丢掉 HTML 里其余所有图 + 丢掉正文文字"。
+          //    因此：当剪贴板同时带有含 <img> 的 HTML 时，让 HTML 分支接管；
+          //    只有纯截图场景（HTML 为空 / HTML 不含图）才走上传。
           const items = event.clipboardData?.items;
-          if (items) {
+          const htmlForProbe = event.clipboardData?.getData("text/html") || "";
+          const htmlHasImg = htmlForProbe.length > 0 && /<img\b/i.test(htmlForProbe);
+          if (items && !htmlHasImg) {
             for (let i = 0; i < items.length; i++) {
               if (items[i].type.startsWith("image/")) {
+                console.log("[paste-diag] PATH=items image/* (will upload as screenshot)");
                 const file = items[i].getAsFile();
                 if (file) {
                   const currentNote = noteRef.current;
@@ -900,6 +1143,7 @@ export default forwardRef<NoteEditorHandle, TiptapEditorProps>(function TiptapEd
           //     用 clipboardData.files 比 items 更直观；它已剔除 string 类型项。
           const pastedFiles = Array.from(event.clipboardData?.files || []);
           if (pastedFiles.length > 0) {
+            console.log("[paste-diag] PATH=files (attachments upload)");
             const currentNote = noteRef.current;
             if (currentNote?.id) {
               showPasteToast("converting", t("tiptap.attachmentUploading"));
@@ -952,10 +1196,188 @@ export default forwardRef<NoteEditorHandle, TiptapEditorProps>(function TiptapEd
             }
           }
           if (inCodeBlock) {
+            console.log("[paste-diag] PATH=inCodeBlock (insertText)");
             if (!text) return true;
             const tr = stCode.tr.insertText(text);
             view.dispatch(tr);
             return true;
+          }
+
+          // 2.5) RTF 图片恢复分支（Word / WPS 全选粘贴核心路径）——必须早于
+          //      looksLikeCode / looksLikeMarkdown 判断，否则 Word 的纯文本
+          //      会被它们误判为代码/Markdown 从而 return true 抢走事件，
+          //      RTF 通道里的 42 张 \pngblip 图就再也恢复不出来。
+          //
+          // Word/WPS 复制时的典型剪贴板形态：
+          //   - text/plain ：可见文字（数 KB）
+          //   - text/html  ：富文本标记；<img src> 多为 "file:///C:/..." 本地路径，
+          //                  浏览器无法加载。Chromium 在超大剪贴板（RTF 百 MB 级）
+          //                  下首次 getData("text/html") 偶尔返回空字符串，需第二
+          //                  次才能读到，用户体感就是"第一次粘贴没反应"。
+          //   - text/rtf   ：含所有图片字节，格式为 \pngblip / \jpegblip + 十六进制。
+          //
+          // 因此只要 RTF 里检测到 \pngblip/\jpegblip，就一律在这里兜底：
+          //   a) 若 html 非空：把 RTF 里的图按顺序回填到 <img src=file://> 占位
+          //   b) 若 html 为空：用 text/plain 按行拼成简化 HTML，再把 RTF 图片全部
+          //                    追加到正文末尾；至少保证"文字 + 图片都不丢"。
+          {
+            const rtfForImg = event.clipboardData?.getData("text/rtf") || "";
+            // 先做廉价探测：只数 \pngblip / \jpegblip 的出现次数，不做解码。
+            // 这样能在阻塞主线程做重活之前，立刻决定是否需要弹 loading。
+            const blipMatches = rtfForImg.length > 0
+              ? rtfForImg.match(/\\(pngblip|jpegblip)/g)
+              : null;
+            const blipCount = blipMatches ? blipMatches.length : 0;
+            if (blipCount > 0) {
+              console.log("[paste-diag] PATH=rtf-image-rescue (html.len=", html.length,
+                " blipCount=", blipCount, ")");
+
+              // 1) 立刻弹 loading toast。真正的重活（hex→base64）已经挪到
+              //    Web Worker 里，主线程完全不会阻塞，toast 和 UI 动画都能
+              //    正常刷新。
+              showPasteToast(
+                "converting",
+                t("tiptap.rtfRescueProcessing", { count: blipCount })
+              );
+
+              // 2) 保存入口时可见的值到闭包局部，异步流程继续使用。
+              const htmlSnapshot = html;
+              const textSnapshot = text;
+              const noteAtPaste = noteRef.current;
+
+              // 3) 丢给 worker。Worker 通信失败/不可用时 client 内部会自动
+              //    降级为主线程同步实现（只会卡，不会错）。
+              extractRtfImagesAsync(rtfForImg)
+                .then((rtfImages) => {
+                  if (view.isDestroyed) return;
+                  console.log("[paste-diag] RTF images extracted (worker)=", rtfImages.length);
+                  if (rtfImages.length === 0) {
+                    dismissPasteToast();
+                    return;
+                  }
+
+                  let htmlForParse: string;
+                  if (htmlSnapshot && htmlSnapshot.trim().length > 0) {
+                    // 情况 a：HTML 已就绪，按位置回填
+                    htmlForParse = mergeRtfImagesIntoHtml(htmlSnapshot, rtfImages);
+                  } else {
+                    // 情况 b：HTML 为空（Chromium 大剪贴板首次读），用 text 构造最简 HTML
+                    const lines = (textSnapshot || "").split(/\r?\n/);
+                    const textHtml = lines
+                      .map((l) => {
+                        const trimmed = l.trim();
+                        if (!trimmed) return "";
+                        const safe = trimmed
+                          .replace(/&/g, "&amp;")
+                          .replace(/</g, "&lt;")
+                          .replace(/>/g, "&gt;");
+                        return `<p>${safe}</p>`;
+                      })
+                      .filter(Boolean)
+                      .join("");
+                    const imgHtml = rtfImages
+                      .map((src) => `<p><img src="${src}"/></p>`)
+                      .join("");
+                    htmlForParse = textHtml + imgHtml;
+                  }
+
+                  const { state, dispatch } = view;
+                  const parser = ProseMirrorDOMParser.fromSchema(state.schema);
+                  const tempDiv = document.createElement("div");
+                  const normalized = normalizePastedHtmlForBlocks(htmlForParse);
+                  tempDiv.innerHTML = normalized.html;
+                  try {
+                    const finalImgs = tempDiv.querySelectorAll("img").length;
+                    console.log("[paste-diag] rtf-rescue normalized <img>=", finalImgs,
+                      " stats=", normalized.imageStats);
+                  } catch {}
+                  const slice = parser.parseSlice(tempDiv);
+                  try {
+                    let cnt = 0;
+                    slice.content.descendants((n) => {
+                      if (n.type.name === "image") cnt += 1;
+                    });
+                    console.log("[paste-diag] rtf-rescue PM slice image nodes=", cnt);
+                  } catch {}
+                  dispatch(state.tr.replaceSelection(slice));
+
+                  // 4) 插入已完成 —— 此刻先告诉用户"图片已粘贴"，随后
+                  //    进入后台上传阶段。分两条 toast 比挤在一条里流畅。
+                  showPasteToast(
+                    "success",
+                    t("tiptap.rtfRescueDone", { count: rtfImages.length }),
+                    1500
+                  );
+
+                  // 5) 后台异步：把文档里所有 data:image/* 替换成
+                  //    /api/attachments/<id>。避免笔记 JSON 膨胀到几十 MB、
+                  //    滚动/搜索/同步全部被拖慢，服务端也更好做去重/清理。
+                  //
+                  //    没有 noteId 时不做（比如未登录或临时编辑器实例）；
+                  //    用户失焦保存时本来也走不了 /api/attachments，只能
+                  //    保持 base64——功能不会坏，只是体积大。
+                  if (editor && noteAtPaste?.id) {
+                    const noteId = noteAtPaste.id;
+                    // 稍作延迟让渲染先落地，避免上传 HTTP 请求和大图解码抢资源
+                    setTimeout(() => {
+                      if (editor.isDestroyed) return;
+                      showPasteToast(
+                        "converting",
+                        t("tiptap.rtfRescueUploading", {
+                          done: 0,
+                          total: rtfImages.length,
+                        })
+                      );
+                      replaceDataUrlImagesWithAttachments(editor, noteId, {
+                        onProgress: (done, total) => {
+                          showPasteToast(
+                            "converting",
+                            t("tiptap.rtfRescueUploading", { done, total })
+                          );
+                        },
+                      })
+                        .then(({ total, uploaded, failed }) => {
+                          if (editor.isDestroyed) return;
+                          if (total === 0) return;
+                          if (failed === 0) {
+                            showPasteToast(
+                              "success",
+                              t("tiptap.rtfRescueUploadDone", {
+                                uploaded,
+                                total,
+                              })
+                            );
+                          } else {
+                            showPasteToast(
+                              "error",
+                              t("tiptap.rtfRescueUploadPartial", {
+                                uploaded,
+                                total,
+                                failed,
+                              }),
+                              4000
+                            );
+                          }
+                        })
+                        .catch((err) => {
+                          console.error(
+                            "[paste-diag] background upload failed:",
+                            err
+                          );
+                          // 静默失败：base64 兜底图仍然在编辑器里，用户看得见。
+                        });
+                    }, 200);
+                  }
+                })
+                .catch((err) => {
+                  console.error("[paste-diag] rtf-rescue failed:", err);
+                  showPasteToast("error", t("tiptap.imageUploadFailed"));
+                });
+
+              // 6) 同步返回 true：event.preventDefault 已调，PM 不会再插入
+              //    原始剪贴板内容；真正的插入由上面的异步任务完成。
+              return true;
+            }
           }
 
           // 3) 多行纯文本（非 Markdown）且看起来像代码：整段包进单一 codeBlock。
@@ -964,6 +1386,7 @@ export default forwardRef<NoteEditorHandle, TiptapEditorProps>(function TiptapEd
           //    若走 HTML 解析会被拆成多块，导致"每行一个代码块"。
           //    增加 looksLikeCode 判断：含大量中文自然语言的多行文本不应被包成 codeBlock。
           if (text && text.includes("\n") && !looksLikeMarkdown(text) && looksLikeCode(text)) {
+            console.log("[paste-diag] PATH=codeBlock (looksLikeCode)");
             // 把纯文本包在 <pre><code> 中，通过 PM 的 DOMParser.parseSlice → replaceSelection
             // 让 PM 自己处理块级节点（codeBlock）的嵌套与光标定位。
             // 之前的做法是手动 codeBlockType.create() + replaceSelectionWith()，
@@ -987,6 +1410,7 @@ export default forwardRef<NoteEditorHandle, TiptapEditorProps>(function TiptapEd
           // 4) Markdown 纯文本：不自动转换，先原样插入纯文本并弹 confirm toast，
           //    用户点击"立即转换样式"时再用原始文本替换刚插入的那段范围。
           if (text && looksLikeMarkdown(text)) {
+            console.log("[paste-diag] PATH=markdown (insertText + confirm toast)");
             const { state, dispatch } = view;
             // 记录插入起点，用于后续按 from..to 范围替换
             const insertFrom = state.selection.from;
@@ -1032,13 +1456,67 @@ export default forwardRef<NoteEditorHandle, TiptapEditorProps>(function TiptapEd
           //    先归一化：把 <div>/<br> 伪多行段落拆成真正的多个 <p>，
           //    避免后续块级操作（toggleHeading 等）误把整段转换。
           if (html && html.trim().length > 0) {
+            console.log("[paste-diag] PATH=html (normalize + parseSlice)");
             const { state, dispatch } = view;
             const parser = ProseMirrorDOMParser.fromSchema(state.schema);
             const tempDiv = document.createElement("div");
-            tempDiv.innerHTML = normalizePastedHtmlForBlocks(html);
+            // 5a) Word / WPS 粘贴：HTML 里的 <img src> 是 "file:///..." 本地路径，
+            //     浏览器无法加载；但 text/rtf 里以 \pngblip / \jpegblip 内联了
+            //     真正的图像字节。在归一化之前，先从 RTF 提取 data URL，按顺序
+            //     回填到 HTML 的 <img> 占位上，这样后续 rescue / PM DOMParser
+            //     能正常当作合法 data:image 插入（已超 200B，不会被判为占位）。
+            let htmlForParse = html;
+            try {
+              const rtf = event.clipboardData?.getData("text/rtf") || "";
+              if (rtf.length > 0 && /\\(pngblip|jpegblip)/.test(rtf)) {
+                const rtfImages = extractImagesFromRtf(rtf);
+                if (rtfImages.length > 0) {
+                  htmlForParse = mergeRtfImagesIntoHtml(html, rtfImages);
+                  console.log(
+                    "[paste-diag] RTF images extracted=",
+                    rtfImages.length
+                  );
+                }
+              }
+            } catch (err) {
+              console.warn("[paste-diag] RTF image extraction failed:", err);
+            }
+            const normalized = normalizePastedHtmlForBlocks(htmlForParse);
+            tempDiv.innerHTML = normalized.html;
+            // --- [DIAG] Word 粘贴图片丢失排查 ---
+            try {
+              const rawImgs = (html.match(/<img[^>]*>/gi) || []).length;
+              const normalizedImgs = tempDiv.querySelectorAll("img").length;
+              const firstSrc = tempDiv.querySelector("img")?.getAttribute("src") || "";
+              console.log("[paste-diag] raw html <img>=", rawImgs,
+                " normalized <img>=", normalizedImgs,
+                " isWord=", normalized.isWordSource,
+                " stats=", normalized.imageStats,
+                " firstSrcHead=", firstSrc.slice(0, 80));
+            } catch {}
             const slice = parser.parseSlice(tempDiv);
+            try {
+              let imgCountInSlice = 0;
+              slice.content.descendants((n) => {
+                if (n.type.name === "image") imgCountInSlice += 1;
+              });
+              console.log("[paste-diag] PM slice image nodes=", imgCountInSlice);
+            } catch {}
             const tr = state.tr.replaceSelection(slice);
             dispatch(tr);
+            // 若存在图片还没加载完（没有任何可用 src 的 <img>），提示用户
+            //   a) Word 粘贴：<img src="file:///..."> 浏览器不可加载 → 引导用户改用"导入 Word 文档"
+            //   b) 懒加载网页：<img> 真实地址没填入 → 提示回原网页滚动加载后再复制
+            if (normalized.imageStats.failed > 0) {
+              const msgKey = normalized.isWordSource
+                ? "tiptap.wordImagesNotPastable"
+                : "tiptap.imagesNotLoaded";
+              showPasteToast(
+                "error",
+                t(msgKey, { count: normalized.imageStats.failed }),
+                6000
+              );
+            }
             return true;
           }
 

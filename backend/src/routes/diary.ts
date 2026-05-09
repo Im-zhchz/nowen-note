@@ -31,8 +31,41 @@ import {
   getAttachmentsDir,
   MIME_TO_EXT,
 } from "./attachments";
+import {
+  getUserWorkspaceRole,
+  canManageResource,
+  requireWorkspaceFeature,
+} from "../middleware/acl";
 
 const diary = new Hono();
+
+// ---------------------------------------------------------------------------
+// Phase 2/Y2: 工作区 scope 解析
+// ---------------------------------------------------------------------------
+// 说说路由兼容两种作用域：
+//   - 个人空间：`?workspaceId=` 未传 / 传 'personal' → diaries.workspaceId IS NULL
+//   - 工作区：   `?workspaceId=<uuid>`                → diaries.workspaceId = <uuid>
+//                                                    （需要当前用户是该工作区成员，
+//                                                     且 workspace.enabledFeatures.diaries !== false）
+//
+// 返回 { scope, workspaceId, error? }：
+//   - error 非空时路由应立即返回 403
+//   - scope === 'personal' 时 workspaceId 为 null（用于 SQL "IS NULL" 比较）
+//   - scope === 'workspace' 时 workspaceId 为具体 uuid 字符串
+function resolveDiaryScope(
+  c: Context,
+  userId: string,
+): { scope: "personal" | "workspace"; workspaceId: string | null; error?: string } {
+  const raw = c.req.query("workspaceId");
+  if (!raw || raw === "personal") {
+    return { scope: "personal", workspaceId: null };
+  }
+  const role = getUserWorkspaceRole(raw, userId);
+  if (!role) {
+    return { scope: "workspace", workspaceId: raw, error: "无权访问该工作区" };
+  }
+  return { scope: "workspace", workspaceId: raw };
+}
 
 // 单条说说最多 9 张图（朋友圈风格；前端也应该卡同样的上限做"快速失败"）
 const MAX_IMAGES_PER_DIARY = 9;
@@ -58,10 +91,17 @@ const ORPHAN_TTL_MS = 24 * 60 * 60 * 1000; // 24h
 interface DiaryRow {
   id: string;
   userId: string;
+  workspaceId: string | null;
   contentText: string;
   mood: string;
   images: string;
   createdAt: string;
+  /**
+   * creatorName：工作区下展示"谁发的说说"。LEFT JOIN 取自 users.username，
+   * 用户被删除时为 null（前端按"未知用户"渲染）。
+   * 仅在 list 接口（/timeline）填充，单条创建/单条返回也会顺手填上保持契约一致。
+   */
+  creatorName?: string | null;
 }
 
 function rowToDiary(row: DiaryRow) {
@@ -77,10 +117,12 @@ function rowToDiary(row: DiaryRow) {
   return {
     id: row.id,
     userId: row.userId,
+    workspaceId: row.workspaceId,
     contentText: row.contentText,
     mood: row.mood,
     images,
     createdAt: row.createdAt,
+    creatorName: row.creatorName ?? null,
   };
 }
 
@@ -125,13 +167,21 @@ function deleteDiaryImageFilesByIds(ids: string[]): number {
 /**
  * 发布一条说说
  *   body: { contentText: string, mood?: string, images?: string[] }
+ *   query: workspaceId?  (personal / <uuid>，省略即个人空间)
  *   - images 是先通过 POST /api/diary/attachments 上传得到的 uuid 数组；
- *     这里把它们的 diaryId 字段 UPDATE 为新 diary.id，完成"绑定"。
+ *     这里把它们的 diaryId 字段 UPDATE 为新 diary.id，完成"绑定"；同时
+ *     把 diary_attachments.workspaceId 对齐到目标工作区（Y2：便于按工作区
+ *     维度做存储配额 / 清理统计）。
  *   - 只更新真正属于当前 userId 且当前 diaryId 仍为 NULL 的行（防止有人偷接别人的图）。
+ *   - 工作区 scope：必须是该工作区成员 + diaries 功能开关未被关闭（由
+ *     requireWorkspaceFeature 中间件校验）。
  */
-diary.post("/", async (c) => {
+diary.post("/", requireWorkspaceFeature("diaries"), async (c) => {
   const db = getDb();
   const userId = c.req.header("X-User-Id")!;
+
+  const scope = resolveDiaryScope(c, userId);
+  if (scope.error) return c.json({ error: scope.error, code: "FORBIDDEN" }, 403);
 
   let body: any;
   try {
@@ -156,10 +206,11 @@ diary.post("/", async (c) => {
   // 把整批写入放进事务：要么 diary 行 + 图片 attach 一起成功，要么全部回滚
   const tx = db.transaction(() => {
     db.prepare(
-      "INSERT INTO diaries (id, userId, contentText, mood, images) VALUES (?, ?, ?, ?, ?)",
+      "INSERT INTO diaries (id, userId, workspaceId, contentText, mood, images) VALUES (?, ?, ?, ?, ?, ?)",
     ).run(
       id,
       userId,
+      scope.workspaceId,
       hasText ? contentText.trim() : "",
       typeof mood === "string" ? mood : "",
       JSON.stringify(images),
@@ -169,15 +220,17 @@ diary.post("/", async (c) => {
       // 只 attach 真正"属于本人 + 仍悬空"的图片，杜绝越权 / 重复绑定。
       // 然后再读回真实更新成功的 id 列表覆写 images 字段，防止前端塞进无效 uuid
       // 后展示时拉到 404。
+      // Y2: 同时把 diary_attachments.workspaceId 对齐到目标 scope，保持附件
+      //     与说说的工作区归属一致（便于按工作区统计磁盘占用、清理）。
       const placeholders = images.map(() => "?").join(",");
       const upd = db.prepare(
         `UPDATE diary_attachments
-            SET diaryId = ?
+            SET diaryId = ?, workspaceId = ?
           WHERE id IN (${placeholders})
             AND userId = ?
             AND diaryId IS NULL`,
       );
-      upd.run(id, ...images, userId);
+      upd.run(id, scope.workspaceId, ...images, userId);
 
       const validRows = db
         .prepare(
@@ -229,27 +282,45 @@ function normalizeDateBound(raw: string | undefined, kind: "from" | "to"): strin
   return null; // 形态不认识就当没传
 }
 
-// 公用：把 userId + 可选 from/to 拼成 WHERE 子句 + 参数数组（cursor 由调用方追加）
+// 公用：把 scope + 可选 from/to 拼成 WHERE 子句 + 参数数组（cursor 由调用方追加）
+// Y2:
+//   - scope.personal → `userId = ? AND workspaceId IS NULL`
+//   - scope.workspace → `workspaceId = ?`（全员可见，不再按 userId 过滤）
+//
+// 字段前缀说明：
+//   timeline 列表为了拉 creatorName 与 users 表 LEFT JOIN，
+//   而 users 表也存在 `createdAt`、`id` 同名列；为防止 SQLite 解析成歧义，
+//   涉及双表都有的列（这里只有 createdAt）一律带 `diaries.` 表前缀。
+//   `userId` 仅 diaries 有（users 叫 `id`），不需要前缀；
+//   `workspaceId` 仅 diaries 有，同上。
 function buildTimeRangeWhere(
+  scope: { scope: "personal" | "workspace"; workspaceId: string | null },
   userId: string,
   from: string | null,
   to: string | null,
 ): { sql: string; args: unknown[] } {
-  let sql = "userId = ?";
-  const args: unknown[] = [userId];
+  let sql: string;
+  const args: unknown[] = [];
+  if (scope.scope === "workspace") {
+    sql = "diaries.workspaceId = ?";
+    args.push(scope.workspaceId);
+  } else {
+    sql = "diaries.userId = ? AND diaries.workspaceId IS NULL";
+    args.push(userId);
+  }
   if (from) {
-    sql += " AND createdAt >= ?";
+    sql += " AND diaries.createdAt >= ?";
     args.push(from);
   }
   if (to) {
-    sql += " AND createdAt <= ?";
+    sql += " AND diaries.createdAt <= ?";
     args.push(to);
   }
   return { sql, args };
 }
 
 // 获取时间线（分页，按时间倒序，可按 from/to 过滤）
-diary.get("/timeline", (c) => {
+diary.get("/timeline", requireWorkspaceFeature("diaries"), (c) => {
   const db = getDb();
   const userId = c.req.header("X-User-Id")!;
   const cursor = c.req.query("cursor"); // 上次最后一条的 createdAt
@@ -257,19 +328,27 @@ diary.get("/timeline", (c) => {
   const from = normalizeDateBound(c.req.query("from"), "from");
   const to = normalizeDateBound(c.req.query("to"), "to");
 
-  const { sql: whereSql, args } = buildTimeRangeWhere(userId, from, to);
+  const scope = resolveDiaryScope(c, userId);
+  if (scope.error) return c.json({ error: scope.error, code: "FORBIDDEN" }, 403);
+
+  const { sql: whereSql, args } = buildTimeRangeWhere(scope, userId, from, to);
   let finalWhere = whereSql;
   const finalArgs = [...args];
   if (cursor) {
-    finalWhere += " AND createdAt < ?";
+    // 带 diaries. 前缀：因为本 SELECT 与 users 表 LEFT JOIN，避免 createdAt 歧义。
+    finalWhere += " AND diaries.createdAt < ?";
     finalArgs.push(cursor);
   }
 
   const rows = db
     .prepare(
-      `SELECT * FROM diaries
+      // creatorName: LEFT JOIN users 取创建者用户名（工作区下展示"谁发的"）。
+      // diaries.* 保留原契约；新增 creatorName 字段由 rowToDiary 透传给前端。
+      // ORDER BY 显式带 diaries.createdAt 前缀，避免和 users 表潜在的同名列歧义。
+      `SELECT diaries.*, users.username AS creatorName
+       FROM diaries LEFT JOIN users ON users.id = diaries.userId
        WHERE ${finalWhere}
-       ORDER BY createdAt DESC
+       ORDER BY diaries.createdAt DESC
        LIMIT ?`,
     )
     .all(...finalArgs, limit) as DiaryRow[];
@@ -285,15 +364,21 @@ diary.get("/timeline", (c) => {
 });
 
 // 删除一条说说（同时清理它名下所有图片：磁盘 + DB 行）
+// Y2: 工作区说说走 canManageResource —— 创建者本人 + admin/owner 可删；
+//      个人说说仍只有创建者本人可删。
 diary.delete("/:id", (c) => {
   const db = getDb();
   const userId = c.req.header("X-User-Id")!;
   const id = c.req.param("id");
 
   const row = db
-    .prepare("SELECT id FROM diaries WHERE id = ? AND userId = ?")
-    .get(id, userId);
+    .prepare("SELECT id, userId, workspaceId FROM diaries WHERE id = ?")
+    .get(id) as { id: string; userId: string; workspaceId: string | null } | undefined;
   if (!row) return c.json({ error: "Not found" }, 404);
+
+  if (!canManageResource(row.userId, row.workspaceId, userId)) {
+    return c.json({ error: "无权删除该说说", code: "FORBIDDEN" }, 403);
+  }
 
   // 先查出图片 id（DELETE CASCADE 之后行就没了，查不到 path）
   const imgRows = db
@@ -312,26 +397,44 @@ diary.delete("/:id", (c) => {
 // 统计
 //   - 不带 from/to：返回"全部 + 今日"两个数（保留旧行为，兼容已有调用）
 //   - 带 from/to：返回当前筛选范围内的总数（todayCount 仍按"今日"统计，不受筛选影响）
-diary.get("/stats", (c) => {
+// Y2: 按 scope（personal / workspace）统计；工作区模式下 todayCount 也按 workspace
+//      统计（不再限定 userId），与 timeline 的可见范围保持一致。
+diary.get("/stats", requireWorkspaceFeature("diaries"), (c) => {
   const db = getDb();
   const userId = c.req.header("X-User-Id")!;
   const from = normalizeDateBound(c.req.query("from"), "from");
   const to = normalizeDateBound(c.req.query("to"), "to");
 
-  const { sql: whereSql, args } = buildTimeRangeWhere(userId, from, to);
+  const scope = resolveDiaryScope(c, userId);
+  if (scope.error) return c.json({ error: scope.error, code: "FORBIDDEN" }, 403);
+
+  const { sql: whereSql, args } = buildTimeRangeWhere(scope, userId, from, to);
   const total = (
     db
       .prepare(`SELECT COUNT(*) as count FROM diaries WHERE ${whereSql}`)
       .get(...args) as any
   ).count;
 
-  // 今日发布数：始终按"今天"统计，独立于筛选范围（前端用作活跃度参考）
+  // 今日发布数：始终按"今天"统计，独立于筛选范围（前端用作活跃度参考）。
   const today = new Date().toISOString().split("T")[0];
-  const todayCount = (
-    db
-      .prepare("SELECT COUNT(*) as count FROM diaries WHERE userId = ? AND createdAt >= ?")
-      .get(userId, today) as any
-  ).count;
+  const todayCount = (() => {
+    if (scope.scope === "workspace") {
+      return (
+        db
+          .prepare(
+            "SELECT COUNT(*) as count FROM diaries WHERE workspaceId = ? AND createdAt >= ?",
+          )
+          .get(scope.workspaceId, today) as any
+      ).count;
+    }
+    return (
+      db
+        .prepare(
+          "SELECT COUNT(*) as count FROM diaries WHERE userId = ? AND workspaceId IS NULL AND createdAt >= ?",
+        )
+        .get(userId, today) as any
+    ).count;
+  })();
 
   return c.json({ total, todayCount });
 });
@@ -344,14 +447,23 @@ diary.get("/stats", (c) => {
 /**
  * 上传一张说说图片。
  *   POST /api/diary/attachments
+ *   query: workspaceId?  (personal / <uuid>)
  *   multipart: file
  *
  * 此时返回的附件 diaryId 是 NULL，等用户实际点"发布"时 POST /api/diary
  * 再带上 images: [id...] 完成绑定（见上面 diary.post 注释）。
+ *
+ * Y2:
+ *   - 上传时即记录目标 workspaceId（若指定工作区且为成员）；diary 发布时若
+ *     scope 不一致会被 UPDATE 一次对齐（见 diary.post）；
+ *   - orphan 上限"50 张"按 scope 分别计数（避免在工作区上传把个人空间额度也吃光）。
  */
-diary.post("/attachments", async (c) => {
+diary.post("/attachments", requireWorkspaceFeature("diaries"), async (c) => {
   const userId = c.req.header("X-User-Id") || "";
   const db = getDb();
+
+  const scope = resolveDiaryScope(c, userId);
+  if (scope.error) return c.json({ error: scope.error, code: "FORBIDDEN" }, 403);
 
   let body: Record<string, any>;
   try {
@@ -378,12 +490,18 @@ diary.post("/attachments", async (c) => {
 
   // 单用户当前悬空附件数限制：防止恶意客户端只上传不发布把磁盘怼爆。
   // 这里用一个简单上限 50 张：正常用户撑死也就一次发 9 张；触发就回 429。
-  const orphanCount = (
-    db
-      .prepare(
-        "SELECT COUNT(*) as count FROM diary_attachments WHERE userId = ? AND diaryId IS NULL",
+  // Y2: 按 scope 分别计数。
+  const orphanCountQuery = scope.scope === "workspace"
+    ? db.prepare(
+        "SELECT COUNT(*) as count FROM diary_attachments WHERE userId = ? AND diaryId IS NULL AND workspaceId = ?",
       )
-      .get(userId) as any
+    : db.prepare(
+        "SELECT COUNT(*) as count FROM diary_attachments WHERE userId = ? AND diaryId IS NULL AND workspaceId IS NULL",
+      );
+  const orphanCount = (
+    scope.scope === "workspace"
+      ? (orphanCountQuery.get(userId, scope.workspaceId) as any)
+      : (orphanCountQuery.get(userId) as any)
   ).count;
   if (orphanCount >= 50) {
     return c.json(
@@ -407,9 +525,9 @@ diary.post("/attachments", async (c) => {
 
   try {
     db.prepare(
-      `INSERT INTO diary_attachments (id, diaryId, userId, mimeType, size, path)
-       VALUES (?, NULL, ?, ?, ?, ?)`,
-    ).run(id, userId, mime, file.size, filename);
+      `INSERT INTO diary_attachments (id, diaryId, userId, workspaceId, mimeType, size, path)
+       VALUES (?, NULL, ?, ?, ?, ?, ?)`,
+    ).run(id, userId, scope.workspaceId, mime, file.size, filename);
   } catch (err: any) {
     try {
       fs.unlinkSync(savePath);

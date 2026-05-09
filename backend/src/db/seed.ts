@@ -35,10 +35,19 @@ export function seedDatabase() {
   ];
 
   for (const note of notes) {
+    const noteId = uuid();
     db.prepare(`
       INSERT INTO notes (id, userId, notebookId, title, content, contentText, isPinned, isFavorite)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(uuid(), userId, note.notebookId, note.title, note.content, note.contentText, note.isPinned || 0, note.isFavorite || 0);
+      VALUES (?, ?, ?, ?, ?, ?, ?, 0)
+    `).run(noteId, userId, note.notebookId, note.title, note.content, note.contentText, note.isPinned || 0);
+    // Y1: 收藏语义已迁移到 favorites 表（per-user）。seed 里的 isFavorite:1 翻译为
+    // "种子用户自己收藏了这条笔记"。物理列 notes.isFavorite 始终写 0（过渡期保留）。
+    if (note.isFavorite) {
+      db.prepare(`
+        INSERT OR IGNORE INTO favorites (userId, noteId, workspaceId, createdAt)
+        VALUES (?, ?, NULL, datetime('now'))
+      `).run(userId, noteId);
+    }
   }
 
   const tag1Id = uuid();

@@ -1,13 +1,21 @@
 /**
  * MembersPanel - 工作区成员与邀请管理面板（Phase 1）
  */
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { motion, AnimatePresence } from "framer-motion";
 import { Copy, Trash2, Plus, UserPlus, Shield, ChevronDown } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { api } from "@/lib/api";
-import { Workspace, WorkspaceMember, WorkspaceInvite, WorkspaceRole } from "@/types";
+import {
+  Workspace,
+  WorkspaceMember,
+  WorkspaceInvite,
+  WorkspaceRole,
+  WorkspaceFeatures,
+  WORKSPACE_FEATURE_META,
+} from "@/types";
 import { Modal } from "@/components/WorkspaceSwitcher";
 import { toast } from "@/lib/toast";
 import { cn } from "@/lib/utils";
@@ -38,11 +46,14 @@ export default function MembersPanel({ workspaceId, onClose }: Props) {
   const [workspace, setWorkspace] = useState<Workspace | null>(null);
   const [members, setMembers] = useState<WorkspaceMember[]>([]);
   const [invites, setInvites] = useState<WorkspaceInvite[]>([]);
-  const [tab, setTab] = useState<"members" | "invites">("members");
+  const [features, setFeatures] = useState<WorkspaceFeatures | null>(null);
+  const [tab, setTab] = useState<"members" | "invites" | "features">("members");
   const [loading, setLoading] = useState(true);
   const [showCreateInvite, setShowCreateInvite] = useState(false);
 
   const isManager = workspace?.role === "owner" || workspace?.role === "admin";
+  // 功能开关：按后端约束，仅 owner 可改；admin 可见但只读（保持信息透明）。
+  const isOwner = workspace?.role === "owner";
 
   const loadAll = async () => {
     setLoading(true);
@@ -60,6 +71,13 @@ export default function MembersPanel({ workspaceId, onClose }: Props) {
           setInvites(inv);
         } catch {
           // 忽略
+        }
+        // 功能开关：任何成员都能读（后端允许），但我们这里只在管理员视图里用。
+        try {
+          const feat = await api.getWorkspaceFeatures(workspaceId);
+          setFeatures(feat);
+        } catch {
+          // 后端暂不可用时，降级为 null，Tab 显示 "加载失败" 即可，不阻断成员管理。
         }
       }
     } catch (e: any) {
@@ -115,18 +133,45 @@ export default function MembersPanel({ workspaceId, onClose }: Props) {
     }
   };
 
+  // 功能开关：乐观更新 + 失败回滚。
+  //   - owner 勾选时立即本地生效（侧边栏通过事件广播同步）
+  //   - 后端失败则回滚 UI 并 toast
+  //   - 广播自定义事件 'nowen:workspace-features-changed'，由侧边栏/路由守卫订阅
+  const handleToggleFeature = async (key: keyof WorkspaceFeatures, value: boolean) => {
+    if (!features || !isOwner) return;
+    const prev = features;
+    const next: WorkspaceFeatures = { ...features, [key]: value };
+    setFeatures(next);
+    try {
+      const saved = await api.updateWorkspaceFeatures(workspaceId, { [key]: value });
+      // 后端归一化结果为准，避免本地与服务端漂移
+      setFeatures(saved);
+      window.dispatchEvent(
+        new CustomEvent("nowen:workspace-features-changed", {
+          detail: { workspaceId, features: saved },
+        }),
+      );
+    } catch (e: any) {
+      setFeatures(prev);
+      toast.error(e?.message || "保存失败");
+    }
+  };
+
   return (
     <Modal
       title={workspace ? `${workspace.icon} ${workspace.name}` : "工作区"}
       onClose={onClose}
       widthClass="max-w-2xl"
+      heightClass="h-[80vh]"
     >
       {loading ? (
         <div className="py-8 text-center text-muted-foreground">加载中...</div>
       ) : (
-        <>
+        // 纵向填满 Modal body：tab 条固定在顶，面板区 flex-1 内部滚动，
+        // 让弹窗整体高度稳定在 80vh，不再随 tab 内容伸缩。
+        <div className="flex flex-col h-full min-h-0">
           {/* Tab */}
-          <div className="flex gap-1 mb-4 border-b border-border">
+          <div className="flex gap-1 mb-4 border-b border-border shrink-0">
             <TabBtn active={tab === "members"} onClick={() => setTab("members")}>
               成员 ({members.length})
             </TabBtn>
@@ -135,10 +180,15 @@ export default function MembersPanel({ workspaceId, onClose }: Props) {
                 邀请码 ({invites.length})
               </TabBtn>
             )}
+            {isManager && (
+              <TabBtn active={tab === "features"} onClick={() => setTab("features")}>
+                功能模块
+              </TabBtn>
+            )}
           </div>
 
           {tab === "members" && (
-            <div className="space-y-1 max-h-[60vh] overflow-auto">
+            <div className="space-y-1 flex-1 min-h-0 overflow-auto">
               {members.map((m) => (
                 <div
                   key={m.userId}
@@ -183,14 +233,14 @@ export default function MembersPanel({ workspaceId, onClose }: Props) {
           )}
 
           {tab === "invites" && isManager && (
-            <div className="space-y-3">
-              <div className="flex justify-end">
+            <div className="flex flex-col flex-1 min-h-0 space-y-3">
+              <div className="flex justify-end shrink-0">
                 <Button size="sm" onClick={() => setShowCreateInvite(true)}>
                   <Plus className="w-4 h-4 mr-1" />
                   创建邀请码
                 </Button>
               </div>
-              <div className="space-y-2 max-h-[50vh] overflow-auto">
+              <div className="space-y-2 flex-1 min-h-0 overflow-auto">
                 {invites.length === 0 && (
                   <div className="text-center text-sm text-muted-foreground py-8">
                     暂无邀请码
@@ -206,7 +256,40 @@ export default function MembersPanel({ workspaceId, onClose }: Props) {
               </div>
             </div>
           )}
-        </>
+
+          {tab === "features" && isManager && (
+            <div className="space-y-3 flex-1 min-h-0 overflow-auto">
+              {!features ? (
+                <div className="text-center text-sm text-muted-foreground py-8">
+                  功能开关暂不可用
+                </div>
+              ) : (
+                <>
+                  <p className="text-xs text-muted-foreground">
+                    关闭的模块对所有成员隐藏入口，且无法读取/写入对应数据。
+                    {!isOwner && (
+                      <span className="ml-1 text-amber-600 dark:text-amber-400">
+                        仅所有者可修改。
+                      </span>
+                    )}
+                  </p>
+                  <div className="space-y-1">
+                    {WORKSPACE_FEATURE_META.map((meta) => (
+                      <FeatureRow
+                        key={meta.key}
+                        label={meta.label}
+                        description={meta.description}
+                        enabled={features[meta.key]}
+                        disabled={!isOwner}
+                        onToggle={(v) => handleToggleFeature(meta.key, v)}
+                      />
+                    ))}
+                  </div>
+                </>
+              )}
+            </div>
+          )}
+        </div>
       )}
 
       {showCreateInvite && (
@@ -255,11 +338,69 @@ function RoleSelect({
   onChange: (v: WorkspaceRole) => void;
 }) {
   const [open, setOpen] = useState(false);
+  const [pos, setPos] = useState<
+    { top: number; left: number; placement: "bottom" | "top" } | null
+  >(null);
+  const btnRef = useRef<HTMLButtonElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
   const options: WorkspaceRole[] = ["admin", "editor", "commenter", "viewer"];
 
+  // 菜单尺寸（与下面 className 保持一致）：min-w 100、估高 ~ 4*28 + 8 padding ≈ 120
+  const MENU_MIN_WIDTH = 100;
+  const MENU_EST_HEIGHT = 120;
+
+  const computePos = () => {
+    const btn = btnRef.current;
+    if (!btn) return;
+    const rect = btn.getBoundingClientRect();
+    const vh = window.innerHeight;
+    const vw = window.innerWidth;
+    const spaceBelow = vh - rect.bottom;
+    const spaceAbove = rect.top;
+    const placement: "bottom" | "top" =
+      spaceBelow < MENU_EST_HEIGHT + 12 && spaceAbove > spaceBelow ? "top" : "bottom";
+    // 菜单右对齐按钮（与原 `right-0` 的视觉一致）
+    const width = Math.max(MENU_MIN_WIDTH, rect.width);
+    let left = rect.right - width;
+    if (left < 8) left = 8;
+    if (left + width > vw - 8) left = vw - width - 8;
+    const top = placement === "bottom" ? rect.bottom + 4 : rect.top - 4 - MENU_EST_HEIGHT;
+    setPos({ top, left, placement });
+  };
+
+  // 打开时定位；外点 / ESC / scroll / resize 自动关闭。
+  // scroll 用 capture=true 能捕获任意祖先滚动容器（Modal body 滚动时直接关比跟随更稳）。
+  useEffect(() => {
+    if (!open) return;
+    computePos();
+    const handleDown = (e: MouseEvent | TouchEvent) => {
+      const t = e.target as Node;
+      if (menuRef.current?.contains(t)) return;
+      if (btnRef.current?.contains(t)) return;
+      setOpen(false);
+    };
+    const handleKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setOpen(false);
+    };
+    const handleClose = () => setOpen(false);
+    document.addEventListener("mousedown", handleDown);
+    document.addEventListener("touchstart", handleDown, { passive: true });
+    document.addEventListener("keydown", handleKey);
+    window.addEventListener("scroll", handleClose, true);
+    window.addEventListener("resize", handleClose);
+    return () => {
+      document.removeEventListener("mousedown", handleDown);
+      document.removeEventListener("touchstart", handleDown);
+      document.removeEventListener("keydown", handleKey);
+      window.removeEventListener("scroll", handleClose, true);
+      window.removeEventListener("resize", handleClose);
+    };
+  }, [open]);
+
   return (
-    <div className="relative">
+    <>
       <button
+        ref={btnRef}
         onClick={() => setOpen((v) => !v)}
         className={cn(
           "px-2 py-0.5 rounded text-xs font-medium flex items-center gap-1",
@@ -269,18 +410,22 @@ function RoleSelect({
         {ROLE_LABEL[value]}
         <ChevronDown className="w-3 h-3" />
       </button>
-      <AnimatePresence>
-        {open && (
-          <>
-            <div
-              className="fixed inset-0 z-40"
-              onClick={() => setOpen(false)}
-            />
+      {/*
+        菜单 portal 到 body，position:fixed + 按钮位置实时计算坐标。
+        这样可以绕开 Modal 内容器的 overflow 裁切与 stacking context 限制，
+        贴近视口底部时自动上翻，避免出现被"切半截"的现象。
+      */}
+      {open && pos &&
+        createPortal(
+          <AnimatePresence>
             <motion.div
-              initial={{ opacity: 0, y: -4 }}
+              ref={menuRef}
+              initial={{ opacity: 0, y: pos.placement === "bottom" ? -4 : 4 }}
               animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: -4 }}
-              className="absolute right-0 top-full mt-1 bg-popover border border-border rounded shadow-lg z-50 py-1 min-w-[100px]"
+              exit={{ opacity: 0, y: pos.placement === "bottom" ? -4 : 4 }}
+              style={{ top: pos.top, left: pos.left, minWidth: MENU_MIN_WIDTH }}
+              className="fixed z-[200] bg-popover border border-border rounded shadow-lg py-1"
+              onMouseDown={(e) => e.stopPropagation()}
             >
               {options.map((r) => (
                 <button
@@ -295,10 +440,10 @@ function RoleSelect({
                 </button>
               ))}
             </motion.div>
-          </>
+          </AnimatePresence>,
+          document.body,
         )}
-      </AnimatePresence>
-    </div>
+    </>
   );
 }
 
@@ -362,6 +507,56 @@ function InviteItem({
         title="撤销"
       >
         <Trash2 className="w-4 h-4" />
+      </button>
+    </div>
+  );
+}
+
+/* ========== 功能开关行（Phase 1）========== */
+function FeatureRow({
+  label,
+  description,
+  enabled,
+  disabled,
+  onToggle,
+}: {
+  label: string;
+  description: string;
+  enabled: boolean;
+  disabled: boolean;
+  onToggle: (v: boolean) => void;
+}) {
+  return (
+    <div
+      className={cn(
+        "flex items-center gap-3 p-3 rounded border border-border",
+        disabled && "opacity-80",
+      )}
+    >
+      <div className="flex-1 min-w-0">
+        <div className="text-sm font-medium">{label}</div>
+        <div className="text-xs text-muted-foreground">{description}</div>
+      </div>
+      {/* 纯 CSS toggle，不引额外组件库。disabled 下 onClick 不响应，且鼠标样式提示。 */}
+      <button
+        type="button"
+        role="switch"
+        aria-checked={enabled}
+        disabled={disabled}
+        onClick={() => !disabled && onToggle(!enabled)}
+        className={cn(
+          "relative h-5 w-9 shrink-0 rounded-full transition-colors",
+          enabled ? "bg-primary" : "bg-muted",
+          disabled ? "cursor-not-allowed" : "cursor-pointer",
+        )}
+        title={disabled ? "仅所有者可修改" : undefined}
+      >
+        <span
+          className={cn(
+            "absolute top-0.5 left-0.5 h-4 w-4 rounded-full bg-background shadow transition-transform",
+            enabled && "translate-x-4",
+          )}
+        />
       </button>
     </div>
   );

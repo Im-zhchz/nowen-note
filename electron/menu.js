@@ -24,6 +24,7 @@ function buildMenu({
   onCheckForUpdates,
   openAboutWindow,
   mode = "full",
+  liteOnly = false,
   onSwitchToLite,
   onSwitchToFull,
   onChangeServer,
@@ -33,6 +34,7 @@ function buildMenu({
   // "模式"子菜单：根据当前模式动态显示可用项
   //   full：仅显示"切换到轻量模式…"
   //   lite：显示"更换服务器…" + "切换到本地模式"
+  //   liteOnly 发行版：只显示"更换服务器…"（因为没有 backend 可回）
   // 这样 UI 不会出现"我已经在 Lite 还显示一个 Lite 选项"这种鸡肋项。
   const modeSubmenu = isLite
     ? [
@@ -40,10 +42,14 @@ function buildMenu({
           label: "更换服务器…",
           click: () => onChangeServer?.(),
         },
-        {
-          label: "切换到本地模式",
-          click: () => onSwitchToFull?.(),
-        },
+        ...(liteOnly
+          ? []
+          : [
+              {
+                label: "切换到本地模式",
+                click: () => onSwitchToFull?.(),
+              },
+            ]),
       ]
     : [
         {
@@ -51,6 +57,9 @@ function buildMenu({
           click: () => onSwitchToLite?.(),
         },
       ];
+  const modeLabel = isLite
+    ? (liteOnly ? "模式：轻量发行版" : "模式：轻量（远端）")
+    : "模式：本地";
   /** @type {Electron.MenuItemConstructorOptions[]} */
   const template = [
     // ========== App 菜单（仅 macOS） ==========
@@ -73,7 +82,7 @@ function buildMenu({
                 click: () => send("menu:open-settings"),
               },
               {
-                label: `模式：${isLite ? "轻量（远端）" : "本地"}`,
+                label: modeLabel,
                 submenu: modeSubmenu,
               },
               { type: "separator" },
@@ -120,7 +129,7 @@ function buildMenu({
                 click: () => send("menu:open-settings"),
               },
               {
-                label: `模式：${isLite ? "轻量（远端）" : "本地"}`,
+                label: modeLabel,
                 submenu: modeSubmenu,
               },
               { type: "separator" },

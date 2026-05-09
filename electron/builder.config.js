@@ -66,6 +66,68 @@ const LINUX_VENDOR = process.env.NOWEN_LINUX_VENDOR || "Nowen";
 const LINUX_HOMEPAGE =
   process.env.NOWEN_LINUX_HOMEPAGE || "https://github.com/cropflre/nowen-note";
 
+// ===== 体积优化：精简后端 node_modules =====
+// 后端通过 esbuild bundle 成单文件（backend/dist/index.js），
+// 但仍有少量"必须保留为 external"的包：
+//   - better-sqlite3            原生 .node 模块
+//   - sqlite-vec / sqlite-vec-{platform}-{arch}  平台二进制 .so/.dll/.dylib
+//   - bonjour-service           涉及 multicast-dns 的动态行为，传递依赖较深
+// 其他业务依赖已全部 inline 进 bundle，运行时不再需要。
+//
+// 我们用"白名单顶层目录"的方式精准保留这些包及其运行时传递依赖。
+// 注意：prebuild-install 链（detect-libc / napi-build-utils / tar-fs 等）只在
+// npm install 阶段使用，运行时不会被 require，因此全部排除。
+const BACKEND_KEEP_PACKAGES = [
+  // better-sqlite3 + 运行时传递依赖
+  "better-sqlite3",
+  "bindings",
+  "file-uri-to-path",
+  // sqlite-vec + 全平台二进制（让同一份 backend/node_modules 可跨平台打包）
+  "sqlite-vec",
+  "sqlite-vec-windows-x64",
+  "sqlite-vec-darwin-x64",
+  "sqlite-vec-darwin-arm64",
+  "sqlite-vec-linux-x64",
+  "sqlite-vec-linux-arm64",
+  // bonjour-service + 运行时传递依赖
+  "bonjour-service",
+  "multicast-dns",
+  "dns-packet",
+  "@leichtgewicht",        // 整个 scope (含 ip-codec)
+  "thunky",
+];
+
+// 生成 electron-builder filter 规则（路径相对 from 目录，即 backend/node_modules 根）
+//
+// 策略：
+//   1. 先用 "!**" 排除一切
+//   2. 对白名单包的整棵子树重新加回
+//   3. 再去掉每个包里的 docs / tests / *.md / *.ts 等非运行时文件
+function buildBackendNodeModulesFilter() {
+  const rules = [];
+  // 第一步：排除一切
+  rules.push("!**/*");
+  // 第二步：白名单包的顶层目录整个加回
+  for (const pkg of BACKEND_KEEP_PACKAGES) {
+    // 对 @scope/xxx 这种路径，electron-builder 的 glob 能正确处理 "@xxx/**"
+    rules.push(`${pkg}/**/*`);
+  }
+  // 第三步：在保留的包里，剔除显然不需要的文件/目录
+  rules.push("!**/{test,tests,docs,doc,examples,example,benchmark,benchmarks}/**");
+  rules.push("!**/*.{md,markdown,ts,map}");
+  // 注意：不能排除 *.d.ts ？其实 d.ts 和 .ts 已被上一条覆盖
+  rules.push("!**/CHANGELOG*");
+  rules.push("!**/LICENSE*");
+  rules.push("!**/{AUTHORS,CONTRIBUTORS,HISTORY}*");
+  // better-sqlite3 自带源码（src/ 是 C++ 源码，deps/ 是 sqlite amalgamation；
+  // 只要 build/Release/*.node 就够 runtime 跑，src/deps 可以剥掉）
+  rules.push("!better-sqlite3/src/**");
+  rules.push("!better-sqlite3/deps/**");
+  rules.push("!better-sqlite3/docs/**");
+  rules.push("!better-sqlite3/benchmark/**");
+  return rules;
+}
+
 module.exports = {
   appId: "com.nowen.note",
   productName: "Nowen Note",
@@ -79,6 +141,8 @@ module.exports = {
     // 图标、entitlements 等打包资源统一放 build/ 下
     buildResources: "build",
   },
+  // 仅打包中英两种语言；默认会有 100+ 种 locale，约占 36MB
+  electronLanguages: ["en-US", "zh-CN"],
   // GitHub Releases 作为自动更新 feed
   // 发布时需设置 GH_TOKEN 环境变量；私有仓库需 private: true
   publish: [
@@ -132,7 +196,7 @@ module.exports = {
     {
       from: "backend/node_modules",
       to: "backend/node_modules",
-      filter: ["**/*"],
+      filter: buildBackendNodeModulesFilter(),
     },
     {
       from: "backend/package.json",

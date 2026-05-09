@@ -68,6 +68,294 @@ export const MIGRATIONS: Migration[] = [
       // no-op：仅用于把 user_version 从 0 抬到 1，让以后的迁移有起点。
     },
   },
+
+  // ==========================================================================
+  // v2：工作区数据隔离 Phase 1 — 基础设施
+  // --------------------------------------------------------------------------
+  // 为 diaries / tasks / mindmaps / attachments 加 workspaceId（nullable，NULL=个人空间），
+  // 新增 favorites 表替代 notes.isFavorite 的单用户语义（老字段保留、不删，
+  // Phase 2 再把读路径切到 favorites 后再考虑废弃）；workspaces 增加
+  // enabledFeatures 存"该工作区启用了哪些功能模块"（空字符串 = 默认全开）。
+  //
+  // 安全保证：
+  //   - 所有变更都是 ALTER TABLE ADD COLUMN / CREATE TABLE IF NOT EXISTS，
+  //     **零数据修改**，存量数据 workspaceId 自动为 NULL → 挂在个人空间，
+  //     符合"存量全部归个人、工作区是新增维度"的零风险策略。
+  //   - SQLite 对 ALTER TABLE ADD COLUMN 不支持带 FOREIGN KEY 的列；
+  //     workspaceId 的引用完整性由业务层在删除工作区时维护（workspaces 路由
+  //     已有 UPDATE notebooks/notes SET workspaceId=NULL 的 tx，后续 Phase 2
+  //     扩展到 diaries/tasks/mindmaps/attachments 即可）。
+  //   - mindmaps 表在当前基线里可能还不存在（老库没有这个模块），用
+  //     "SELECT 探测 + catch 兜底 ALTER" 的幂等模式处理，不存在则跳过 ALTER——
+  //     Phase 2 真正引入 mindmaps 模块时再在那条迁移里自己加带 workspaceId
+  //     的 CREATE TABLE。
+  {
+    version: 2,
+    name: "workspace-data-isolation-phase1",
+    up: (db) => {
+      // ---- 工具：幂等加列（列已存在时静默跳过） ----
+      const addColumnIfMissing = (
+        table: string,
+        column: string,
+        definition: string,
+      ) => {
+        // 用 PRAGMA table_info 精确探测，不依赖 SELECT 抛错，避免其它错误误吞。
+        const cols = db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
+        if (cols.length === 0) {
+          // 表本身不存在：跳过（mindmaps 等后续模块的表由各自首次建立时保证带 workspaceId）
+          return;
+        }
+        if (cols.some((c) => c.name === column)) return;
+        db.prepare(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`).run();
+      };
+
+      // ---- 1. 说说：加 workspaceId ----
+      addColumnIfMissing("diaries", "workspaceId", "TEXT");
+      db.exec("CREATE INDEX IF NOT EXISTS idx_diaries_workspace ON diaries(workspaceId);");
+
+      // ---- 2. 待办：加 workspaceId ----
+      addColumnIfMissing("tasks", "workspaceId", "TEXT");
+      db.exec("CREATE INDEX IF NOT EXISTS idx_tasks_workspace ON tasks(workspaceId);");
+
+      // ---- 3. 思维导图：加 workspaceId（若表存在）----
+      addColumnIfMissing("mindmaps", "workspaceId", "TEXT");
+      // 索引只在表存在时建；CREATE INDEX 对不存在的表会抛错，所以用 try/catch 兜底。
+      try {
+        db.exec("CREATE INDEX IF NOT EXISTS idx_mindmaps_workspace ON mindmaps(workspaceId);");
+      } catch {
+        // 表还不存在，跳过索引。下次 mindmaps 表建立时可再补建索引。
+      }
+
+      // ---- 4. 附件：加 workspaceId（跟随所属笔记/说说/任务）----
+      //   attachments 语义是"笔记的附件"，workspaceId 冗余一份便于"工作区空间占用统计"
+      //   和"按工作区清理"不必跨表 join。注意此列**仅 Phase 2 之后写入**，Phase 1
+      //   只是加列，存量保持 NULL（= 个人空间 / 未归属，行为与之前一致）。
+      addColumnIfMissing("attachments", "workspaceId", "TEXT");
+      db.exec(
+        "CREATE INDEX IF NOT EXISTS idx_attachments_workspace ON attachments(workspaceId);",
+      );
+
+      // ---- 5. 收藏：独立表替代 notes.isFavorite 的"单用户"语义 ----
+      //   为什么不直接改 isFavorite？
+      //     工作区协作下，"这条笔记我收藏了"必须是 **per-user** 的：
+      //     A 收藏了不代表 B 也收藏。保留老字段兼容 Phase 1 旧代码继续工作，
+      //     Phase 2 把读路径切到 favorites 后再逐步废弃 isFavorite 字段。
+      //
+      //   workspaceId 冗余：收藏的笔记可能跨空间（个人空间+工作区），这里存一份
+      //   "这次收藏时笔记所在的 workspaceId"便于按空间筛选收藏列表；NULL 表示
+      //   收藏的是个人空间的笔记。
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS favorites (
+          userId TEXT NOT NULL,
+          noteId TEXT NOT NULL,
+          workspaceId TEXT,
+          createdAt TEXT NOT NULL DEFAULT (datetime('now')),
+          PRIMARY KEY (userId, noteId),
+          FOREIGN KEY (userId) REFERENCES users(id) ON DELETE CASCADE,
+          FOREIGN KEY (noteId) REFERENCES notes(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_favorites_user ON favorites(userId, createdAt DESC);
+        CREATE INDEX IF NOT EXISTS idx_favorites_note ON favorites(noteId);
+        CREATE INDEX IF NOT EXISTS idx_favorites_workspace ON favorites(workspaceId);
+      `);
+
+      // ---- 6. 工作区功能开关 ----
+      //   enabledFeatures 存 JSON 字符串，格式：
+      //     {"notes":true,"diaries":true,"tasks":true,"mindmaps":true,"files":true,"favorites":true}
+      //   约定：
+      //     - 空字符串 ''（默认）视为"未配置"，在应用层解释为"全部启用"，
+      //       这样**老工作区无需迁移数据**——未来新建工作区的默认值也是 ''
+      //       （全开），owner 按需关闭再写入 JSON。
+      //     - 个人空间不走这个字段（个人空间本来就是 workspaceId=NULL，
+      //       前端可以读取当前用户的全局偏好，后端不强制）。
+      addColumnIfMissing("workspaces", "enabledFeatures", "TEXT NOT NULL DEFAULT ''");
+    },
+  },
+
+  // ==========================================================================
+  // v3：工作区数据隔离 Phase 2 — Y1（favorites 切换 + 附件 workspaceId 冗余）
+  // --------------------------------------------------------------------------
+  // 本次做两件事：
+  //
+  //   1) 为 diary_attachments / task_attachments 加 workspaceId（nullable）+ 索引，
+  //      与父资源（diary / task）对齐。Phase 2 的附件归属方案是：
+  //        - 上传时由前端带上当前工作区 workspaceId（说说/任务都是"先传附件拿 id
+  //          再提交父记录"的链路，前端自己知道在哪个工作区里发）；
+  //        - 服务端落表时写入该列，**与父资源的 workspaceId 必须一致**（父资源创建
+  //          时会做一次校验：如果传入的附件 id 的 workspaceId 与父不一致，直接拒绝
+  //          绑定）。
+  //      零数据变更：存量附件 workspaceId = NULL，语义是"个人空间 / 未归档"，
+  //      与现有行为完全一致。
+  //
+  //   2) **favorites 数据回填**：把老 `notes.isFavorite = 1` 的行一次性同步到
+  //      favorites 表，userId 取笔记主人、workspaceId 跟笔记走。
+  //      之所以放到迁移而不是业务层：
+  //        - 一次性、幂等、在事务里做，不存在"写了一半挂了"的风险；
+  //        - 业务层不用再去兼容"favorites 表是空的但笔记有 isFavorite=1"的过渡态，
+  //          Y1 同步提交后即可以"favorites 是唯一真相源"的假设写代码。
+  //      语义变化说明：
+  //        - 老语义："isFavorite 是笔记的一个属性，任何能看到笔记的人看到的收藏状态
+  //          都一样"——这在个人空间没问题，但到工作区就错了。
+  //        - 新语义："favorites 是 per-user 的关系表，A 收藏不等于 B 收藏"。
+  //      回填策略：只给笔记主人插一条 favorites 行（因为老 isFavorite=1 表达的就是
+  //      "笔记主人收藏了它"），其他成员回填前没收藏、回填后依然没收藏，逻辑自然。
+  //      **不删 notes.isFavorite 列**：保留一个版本作为兼容（Y1 后没人再读它；
+  //      再过一版彻底删列）。Y1 同步停止写 isFavorite，避免新/旧字段不同步。
+  //
+  // 回滚注意：如果要从 v3 回滚到 v2，favorites 表里由本次回填产生的行不会自动
+  // 撤销——但因为我们保留了 notes.isFavorite 列，旧代码读老字段依然有效，所以
+  // 即使"新表多了几行"也不影响旧版行为。
+  {
+    version: 3,
+    name: "workspace-data-isolation-phase2-y1-favorites",
+    up: (db) => {
+      // 同 v2 里的工具（每条迁移独立闭包，不共享函数）
+      const addColumnIfMissing = (
+        table: string,
+        column: string,
+        definition: string,
+      ) => {
+        const cols = db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
+        if (cols.length === 0) return;
+        if (cols.some((c) => c.name === column)) return;
+        db.prepare(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`).run();
+      };
+
+      // ---- 1. diary_attachments.workspaceId ----
+      addColumnIfMissing("diary_attachments", "workspaceId", "TEXT");
+      db.exec(
+        "CREATE INDEX IF NOT EXISTS idx_diary_attachments_workspace ON diary_attachments(workspaceId);",
+      );
+
+      // ---- 2. task_attachments.workspaceId ----
+      addColumnIfMissing("task_attachments", "workspaceId", "TEXT");
+      db.exec(
+        "CREATE INDEX IF NOT EXISTS idx_task_attachments_workspace ON task_attachments(workspaceId);",
+      );
+
+      // ---- 3. favorites 数据回填 ----
+      // 使用 INSERT OR IGNORE：favorites 表主键是 (userId, noteId)，已存在的行不会被
+      // 重复插入；这也让本条迁移可以"幂等重放"——即便未来因故把 v3 记录抹了重跑，
+      // 也不会产生脏数据或抛约束错误。
+      //
+      // SELECT 条件：
+      //   - isFavorite = 1（老数据里真正被收藏的笔记）
+      //   - isTrashed = 0（放在回收站的就不要回填了，视作"等价于取消收藏"）
+      //   - 不 JOIN users/workspaces 校验引用完整性：notes.userId 走 FK CASCADE，
+      //     workspaceId 可空，favorites 的 FK 仅指向 users(id) 和 notes(id)，
+      //     这两张表的行只要此刻存在，插入就稳定。
+      //
+      // createdAt 留给默认值 datetime('now')——老字段没有"什么时候收藏"的时间，
+      // 用迁移时刻作近似，用户看到的"收藏时间"就是首次升级到 v3 的时间，符合预期。
+      db.prepare(`
+        INSERT OR IGNORE INTO favorites (userId, noteId, workspaceId, createdAt)
+        SELECT userId, id, workspaceId, datetime('now')
+        FROM notes
+        WHERE isFavorite = 1 AND isTrashed = 0
+      `).run();
+    },
+  },
+
+  // ==========================================================================
+  // v4：工作区数据隔离 Phase 2 — Y4（mindmaps 补 workspaceId + 索引）
+  // --------------------------------------------------------------------------
+  // 背景：v2 里对 mindmaps 的 workspaceId 迁移是"表存在才 ALTER、不存在就跳过"。
+  // 老库的 mindmaps 表由路由模块 ensureTable() 在首次 import 时建立，v2 跑的
+  // 时点 mindmaps 表很可能已经存在 → v2 能正确补列；但也存在一种情况：
+  //   - 用户的老库 v2 升级时 mindmaps 还没被路由初始化过（比如从未访问过导图
+  //     模块，或后端启动顺序发生变化），v2 就跳过了加列；
+  //   - 然后用户升到 v3+ 开始访问导图路由 → ensureTable() 用**当前代码**的
+  //     CREATE TABLE IF NOT EXISTS 建表，此时 Y4 的新建表语句已经带了
+  //     workspaceId 列，问题自然消失；
+  //   - 但也可能反过来：升级到 v4 之前路由已经 ensureTable() 建出不带
+  //     workspaceId 的旧表，此时 CREATE TABLE IF NOT EXISTS 不会"补列"，
+  //     就会出现 "mindmaps 表存在但缺 workspaceId 列" 的中间态。
+  //
+  // 本迁移一次性兜底：
+  //   - 如果 mindmaps 表存在且缺 workspaceId 列 → 补列 + 建索引；
+  //   - 如果表不存在 → 什么都不做（后续 ensureTable() 会用新 DDL 建出带列的表）；
+  //   - 如果列已经有了 → 只补索引（CREATE INDEX IF NOT EXISTS 幂等）。
+  //
+  // 与 v2 的关系：v2 是"Phase 1 基础设施"的尝试，v4 是最终兜底；两者对同一张
+  // 表做相同动作是安全的（都用 IF NOT EXISTS / PRAGMA 探测），不会双写。
+  {
+    version: 4,
+    name: "workspace-data-isolation-phase2-y4-mindmaps",
+    up: (db) => {
+      const addColumnIfMissing = (
+        table: string,
+        column: string,
+        definition: string,
+      ) => {
+        const cols = db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
+        if (cols.length === 0) return;
+        if (cols.some((c) => c.name === column)) return;
+        db.prepare(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`).run();
+      };
+
+      addColumnIfMissing("mindmaps", "workspaceId", "TEXT");
+      // 仅当表存在时建索引；如果 mindmaps 表此时尚未建立，后续
+      // mindmaps.ts 的 ensureTable() 会用已经带索引的 DDL 补齐。
+      const hasTable = db
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='mindmaps'")
+        .get();
+      if (hasTable) {
+        db.exec(
+          "CREATE INDEX IF NOT EXISTS idx_mindmaps_workspace ON mindmaps(workspaceId);",
+        );
+      }
+    },
+  },
+
+  // ==========================================================================
+  // v5：修正「附件上传时未继承笔记 workspaceId」的存量数据
+  // --------------------------------------------------------------------------
+  // 背景（bug）：
+  //   /api/attachments（POST）在 v2 加列之后一直漏写 workspaceId 字段，直接
+  //   `INSERT INTO attachments (id, noteId, userId, filename, mimeType, size, path)`，
+  //   导致所有通过编辑器粘贴 / 拖拽 / "插入图片" 上传的附件在 DB 中
+  //   workspaceId 都是 NULL。
+  //
+  // 症状：
+  //   - 在工作区笔记里上传图片，DataManager / FileManager 切到该工作区看不到；
+  //   - 切到个人空间反而能看到（因为个人空间的过滤条件正是
+  //     `a.userId = ? AND a.workspaceId IS NULL`）。
+  //
+  // 本迁移的修复动作：
+  //   对每条 attachments.workspaceId IS NULL 的行，若它挂在一条 workspaceId
+  //   非空的笔记上，就把笔记的 workspaceId 复制到附件行。
+  //
+  //   显式排除两种边界：
+  //     1) 孤儿附件（noteId 指向已删除的笔记）—— JOIN 失败，保持 NULL，由
+  //        /api/data-file/cleanup-orphans 统一清理；
+  //     2) 存量就是"个人空间上传"的附件（notes.workspaceId IS NULL）—— 本来就
+  //        对，不要动。
+  //
+  // 幂等：UPDATE 只命中 workspaceId IS NULL 的行；二次运行是 no-op。若未来又
+  // 有同类 bug 引入新 NULL，本迁移已记录到 schema_migrations，不会重跑——
+  // 但之后再出现的 NULL 不是本次迁移的职责，由新的 vN+1 迁移收拾。
+  //
+  // 回滚不可逆：回到 v4 时，被本迁移改成非 NULL 的附件不会自动回归 NULL；
+  // 但 v4 代码的 list / stats / 下载链路对附件 workspaceId 的读取是幂等的
+  // （非空就按工作区过滤），不会出错，最多是"老代码看不到被回填过的附件"。
+  {
+    version: 5,
+    name: "attachments-backfill-workspace-id-from-notes",
+    up: (db) => {
+      db.prepare(`
+        UPDATE attachments
+           SET workspaceId = (
+             SELECT n.workspaceId FROM notes n WHERE n.id = attachments.noteId
+           )
+         WHERE workspaceId IS NULL
+           AND EXISTS (
+             SELECT 1 FROM notes n
+              WHERE n.id = attachments.noteId
+                AND n.workspaceId IS NOT NULL
+           )
+      `).run();
+    },
+  },
 ];
 
 /** 当前代码已知的最高 schema 版本（== MIGRATIONS 里 max(version)）。 */

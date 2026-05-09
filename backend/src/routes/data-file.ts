@@ -85,7 +85,8 @@ function requireAdminOrDeny(c: any): Response | null {
 // ----------------------------------------------------------------------------
 // 所有登录用户可见。字段：
 //   dbFile:       当前 SQLite 文件（含 -wal / -shm）字节数
-//   dataDir:      data 目录总占用（含 attachments 等），仅管理员返回（避免普通用户看到 server 路径结构）
+//   dataDirBytes: data 目录总占用（含 attachments 等）——所有用户可见（仅聚合字节数）
+//   dataDirPath:  data 目录绝对路径——仅管理员返回（避免泄漏服务器路径结构）
 //   counts:       系统范围 notes/users/notebooks 数量；普通用户只拿到自己维度
 //   userUsage:    当前用户数据估算占用（基于文本字段 LENGTH() + attachments.size）
 // ============================================================================
@@ -127,13 +128,12 @@ app.get("/info", (c) => {
   const sysUserCount = safeGet<{ c: number }>("SELECT COUNT(*) as c FROM users")?.c || 0;
   const sysNotebookCount = safeGet<{ c: number }>("SELECT COUNT(*) as c FROM notebooks")?.c || 0;
 
-  // 4) data 目录（管理员才看到，避免泄漏服务器路径）
-  let dataDirTotal = 0;
-  let dataDir: string | null = null;
-  if (isAdmin) {
-    dataDir = path.dirname(dbPath);
-    dataDirTotal = computeDirSize(dataDir);
-  }
+  // 4) data 目录占用：
+  //    - 字节数（dataDirBytes）是**非敏感聚合**——普通用户看到"整个系统总占用"不会
+  //      反推出服务器布局，也符合"存储与空间"面板对所有用户显示系统总量的产品语义。
+  //    - 绝对路径（dataDirPath）仍仅管理员返回，避免泄漏服务端文件系统结构。
+  const dataDir = path.dirname(dbPath);
+  const dataDirTotal = computeDirSize(dataDir);
 
   return c.json({
     dbFile: {
@@ -153,7 +153,7 @@ app.get("/info", (c) => {
       noteCount: sysNoteCount,
       userCount: sysUserCount,
       notebookCount: sysNotebookCount,
-      dataDirBytes: isAdmin ? dataDirTotal : undefined,
+      dataDirBytes: dataDirTotal,
       dataDirPath: isAdmin ? dataDir : undefined,
     },
   });
@@ -310,11 +310,22 @@ app.post("/import", async (c) => {
 // ----------------------------------------------------------------------------
 // 所有登录用户可用，但只清理"当前用户名下"的孤儿附件。
 //
-// 孤儿两类：
+// 孤儿三类：
 //   1) DB 孤儿：attachments 行的 noteId 已经不存在（笔记早被永久删除，但历史
 //      版本遗留了行），CASCADE 场景下正常不会出现；为兼容老数据仍然扫一次。
-//   2) 磁盘孤儿：文件系统里存在、但 attachments 表里已经没有对应行的物理文件
+//   2) 内容孤儿：attachments 行在 DB 里、noteId 对应的 note 还活着，但**该附件
+//      的 URL（/api/attachments/<id>）不再出现在任何 notes.content 里**。这类
+//      在"文件管理→上传"场景尤其常见：上传时会落到一个 isArchived=1 的 holder
+//      笔记兜底外键，之后用户把编辑器里的图删了，笔记不会消失，于是旧逻辑永远
+//      识别不出来。
+//      为避免误杀"刚上传还没保存引用"的新附件，使用 24h 宽限期——createdAt 距
+//      今不足该窗口的附件不参与。
+//   3) 磁盘孤儿：文件系统里存在、但 attachments 表里已经没有对应行的物理文件
 //      （来自之前"清空回收站"未清理物理文件的历史残留）。
+//
+// 查询参数：
+//   ?dryRun=1  — 只返回"将要清理"的统计，不真动磁盘和 DB（前端可用来显示
+//                "可回收 X MB / 共 N 项"徽标）。
 //
 // 为了安全，磁盘扫描只删除**存在于 attachments.path 命名约定**（uuid.扩展名）
 // 的文件，并用"不在 DB 已登记 path 集合内"作为判定标准，不会误删其它用户数据。
@@ -326,34 +337,47 @@ app.post("/cleanup-orphans", (c) => {
   const me = db.prepare("SELECT id, role FROM users WHERE id = ?").get(userId) as { id: string; role: string } | undefined;
   if (!me) return c.json({ error: "未授权" }, 401);
   const isAdmin = me.role === "admin";
+  const dryRun = c.req.query("dryRun") === "1";
+
+  // 宽限期：避免误杀"刚上传还没保存到 content"的新附件
+  const GRACE_HOURS = Number(c.req.query("graceHours") || 24);
+  const cutoffMs = Date.now() - (Number.isFinite(GRACE_HOURS) && GRACE_HOURS >= 0 ? GRACE_HOURS : 24) * 3600 * 1000;
+
+  const attachmentsDir = getAttachmentsDir();
 
   // 1) DB 孤儿：attachments 行 noteId 对应的 notes 已不存在
   //    普通用户仅清自己；管理员清全表
   const dbOrphanRows = (isAdmin
     ? db.prepare(
-        `SELECT a.id, a.path FROM attachments a
+        `SELECT a.id, a.path, COALESCE(a.size, 0) AS size FROM attachments a
          LEFT JOIN notes n ON n.id = a.noteId
          WHERE n.id IS NULL`,
       ).all()
     : db.prepare(
-        `SELECT a.id, a.path FROM attachments a
+        `SELECT a.id, a.path, COALESCE(a.size, 0) AS size FROM attachments a
          LEFT JOIN notes n ON n.id = a.noteId
          WHERE n.id IS NULL AND a.userId = ?`,
-      ).all(userId)) as { id: string; path: string }[];
+      ).all(userId)) as { id: string; path: string; size: number }[];
 
-  const attachmentsDir = getAttachmentsDir();
   let dbOrphansRemoved = 0;
   let dbOrphanFilesRemoved = 0;
-  if (dbOrphanRows.length > 0) {
+  let dbOrphanBytes = 0;
+
+  if (dryRun) {
+    // 只统计将要回收的字节数（不区分 DB 行是否真的有物理文件——多数情况是有的）
+    for (const r of dbOrphanRows) dbOrphanBytes += r.size || 0;
+  } else if (dbOrphanRows.length > 0) {
     const delStmt = db.prepare("DELETE FROM attachments WHERE id = ?");
-    const tx = db.transaction((list: { id: string; path: string }[]) => {
+    const tx = db.transaction((list: { id: string; path: string; size: number }[]) => {
       for (const r of list) {
         // 删文件
         try {
           const abs = path.join(attachmentsDir, r.path);
           if (fs.existsSync(abs)) {
+            const sz = fs.statSync(abs).size;
             fs.unlinkSync(abs);
             dbOrphanFilesRemoved++;
+            dbOrphanBytes += sz;
           }
         } catch { /* ignore */ }
         // 删 DB 行
@@ -366,13 +390,81 @@ app.post("/cleanup-orphans", (c) => {
     tx(dbOrphanRows);
   }
 
-  // 2) 磁盘孤儿：仅管理员才能做全量扫描（普通用户拿不到其它人上传的文件列表）
+  // 2) 内容孤儿：DB 行还在、note 还在，但没有任何 notes.content 引用这个 id
+  //    作用域 = 当前用户的所有附件（个人空间 + 工作区上传的），管理员全表
+  //    content 扫描范围 = 全表 notes.content（大库上一次性扫完够用，后面可改增量）
+  //
+  // 为什么把 haystack 限制为 content 不为空的 note：大量 note.content 是空字符串，
+  // 过滤掉能显著降 join 字符串的开销。
+  const allContents = db
+    .prepare(`SELECT content FROM notes WHERE content IS NOT NULL AND content <> ''`)
+    .all() as { content: string }[];
+  const haystack = allContents.map((n) => n.content).join("\n");
+
+  const contentCandidates = (isAdmin
+    ? db.prepare(
+        `SELECT a.id, a.path, COALESCE(a.size, 0) AS size, a.createdAt
+           FROM attachments a
+          INNER JOIN notes n ON n.id = a.noteId`,
+      ).all()
+    : db.prepare(
+        `SELECT a.id, a.path, COALESCE(a.size, 0) AS size, a.createdAt
+           FROM attachments a
+          INNER JOIN notes n ON n.id = a.noteId
+          WHERE a.userId = ?`,
+      ).all(userId)) as { id: string; path: string; size: number; createdAt: string }[];
+
+  const contentOrphanRows: { id: string; path: string; size: number }[] = [];
+  for (const r of contentCandidates) {
+    // 宽限期：刚上传的新附件跳过
+    const created = new Date(
+      r.createdAt && r.createdAt.includes("T") ? r.createdAt : (r.createdAt || "").replace(" ", "T") + "Z",
+    ).getTime();
+    if (Number.isFinite(created) && created > cutoffMs) continue;
+    // 引用判定：搜 `/api/attachments/<id>`（uuid 本身不会与其他随机字符串冲突）
+    if (haystack.indexOf(`/api/attachments/${r.id}`) >= 0) continue;
+    contentOrphanRows.push({ id: r.id, path: r.path, size: r.size || 0 });
+  }
+
+  let contentOrphansRemoved = 0;
+  let contentOrphanFilesRemoved = 0;
+  let contentOrphanBytes = 0;
+
+  if (dryRun) {
+    for (const r of contentOrphanRows) contentOrphanBytes += r.size || 0;
+  } else if (contentOrphanRows.length > 0) {
+    const delStmt = db.prepare("DELETE FROM attachments WHERE id = ?");
+    const tx = db.transaction((list: { id: string; path: string; size: number }[]) => {
+      for (const r of list) {
+        // 先删 DB 行（失败就跳过，保持一致）
+        try {
+          delStmt.run(r.id);
+          contentOrphansRemoved++;
+        } catch {
+          continue;
+        }
+        // 再删磁盘文件
+        try {
+          const abs = path.join(attachmentsDir, r.path);
+          if (fs.existsSync(abs)) {
+            const sz = fs.statSync(abs).size;
+            fs.unlinkSync(abs);
+            contentOrphanFilesRemoved++;
+            contentOrphanBytes += sz;
+          }
+        } catch { /* ignore */ }
+      }
+    });
+    tx(contentOrphanRows);
+  }
+
+  // 3) 磁盘孤儿：仅管理员才能做全量扫描（普通用户拿不到其它人上传的文件列表）
   let diskOrphansRemoved = 0;
   let diskOrphanBytes = 0;
   let diskScanSkipped = false;
   if (isAdmin) {
     try {
-      // 收集 DB 中已登记的全部 path
+      // 收集 DB 中已登记的全部 path（刚刚删的 DB 孤儿已经不在这批里，这正是我们要的）
       const rows = db.prepare("SELECT path FROM attachments").all() as { path: string }[];
       const knownPaths = new Set<string>();
       for (const r of rows) {
@@ -392,7 +484,7 @@ app.post("/cleanup-orphans", (c) => {
           const abs = path.join(attachmentsDir, ent.name);
           try {
             const size = fs.statSync(abs).size;
-            fs.unlinkSync(abs);
+            if (!dryRun) fs.unlinkSync(abs);
             diskOrphansRemoved++;
             diskOrphanBytes += size;
           } catch { /* ignore */ }
@@ -405,13 +497,28 @@ app.post("/cleanup-orphans", (c) => {
     diskScanSkipped = true;
   }
 
+  const totalFreedBytes = dbOrphanBytes + contentOrphanBytes + diskOrphanBytes;
+  const totalRemovedItems = dbOrphansRemoved + contentOrphansRemoved + diskOrphansRemoved;
+
   return c.json({
     success: true,
-    dbOrphansRemoved,        // 已清理的孤儿 attachments 行数
-    dbOrphanFilesRemoved,    // 与上面孤儿行关联的、成功 unlink 的磁盘文件数
-    diskOrphansRemoved,      // 磁盘上无 DB 对应的孤儿文件被清理数（管理员才执行）
-    diskOrphanBytes,         // 磁盘孤儿释放的字节数
-    diskScanSkipped,         // 非管理员时跳过磁盘全量扫描
+    dryRun,
+    graceHours: GRACE_HOURS,
+    // DB 孤儿（noteId 悬空）
+    dbOrphansRemoved,
+    dbOrphanFilesRemoved,
+    dbOrphanBytes,
+    // 内容孤儿（notes.content 不再引用；本次新增分类，解决"清理完文件管理里还在"的核心问题）
+    contentOrphansRemoved,
+    contentOrphanFilesRemoved,
+    contentOrphanBytes,
+    // 磁盘孤儿（物理文件无 DB 登记；仅管理员）
+    diskOrphansRemoved,
+    diskOrphanBytes,
+    diskScanSkipped,
+    // 汇总（前端展示"本次释放 X MB / 共清理 N 项"用）
+    totalFreedBytes,
+    totalRemovedItems,
   });
 });
 

@@ -178,10 +178,18 @@ app.post("/import", async (c) => {
       //     notes.content 撑大到 MB 级，后续 GET 性能崩塌（这是本次改造的根本目的）。
       //   - 短路策略保证"没有内联图"的常规导入完全无额外成本。
       if (note.content && note.content.indexOf("data:image") >= 0) {
+        // workspaceId 从刚插入的 note 行读回，确保附件与笔记同域。
+        // 当前导入链路统一落到个人空间（notes.workspaceId 为 NULL），
+        // 这里读一次让未来若给 INSERT 增加 workspaceId 也无需再改附件抽取。
+        const wsRow = db
+          .prepare("SELECT workspaceId FROM notes WHERE id = ?")
+          .get(id) as { workspaceId: string | null } | undefined;
+        const noteWorkspaceId = wsRow?.workspaceId ?? null;
         const { content: rewritten, replacedCount } = extractInlineBase64Images(
           note.content,
           userId,
           id,
+          noteWorkspaceId,
         );
         if (replacedCount > 0) {
           updateContent.run(rewritten, id);

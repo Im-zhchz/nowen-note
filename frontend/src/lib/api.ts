@@ -1,4 +1,4 @@
-import { Notebook, Note, NoteListItem, Tag, SearchResult, User, UserPublicInfo, Task, TaskStats, TaskFilter, CustomFont, MindMap, MindMapListItem, Diary, DiaryTimeline, DiaryStats, Share, ShareInfo, SharedNoteContent, NoteVersion, ShareComment, Workspace, WorkspaceMember, WorkspaceInvite, WorkspaceRole, FileItem, FileDetail, FileListResponse, FileStats, FileSortKey, FileCategory } from "@/types";
+import { Notebook, Note, NoteListItem, Tag, SearchResult, User, UserPublicInfo, Task, TaskStats, TaskFilter, CustomFont, MindMap, MindMapListItem, Diary, DiaryTimeline, DiaryStats, Share, ShareInfo, SharedNoteContent, NoteVersion, ShareComment, Workspace, WorkspaceMember, WorkspaceInvite, WorkspaceRole, WorkspaceFeatures, FileItem, FileDetail, FileListResponse, FileStats, FileSortKey, FileCategory } from "@/types";
 import {
   shouldEnqueue as _shouldEnqueue,
   enqueue as _enqueue,
@@ -674,7 +674,18 @@ export const api = {
   updateNote: (id: string, data: Partial<Note>) => request<Note>(`/notes/${id}`, { method: "PUT", body: JSON.stringify(data) }),
   deleteNote: (id: string) => request(`/notes/${id}`, { method: "DELETE" }),
   emptyTrash: () =>
-    request<{ success: boolean; count: number; skipped: number }>(`/notes/trash/empty`, { method: "DELETE" }),
+    request<{
+      success: boolean;
+      count: number;
+      skipped: number;
+      removedFiles?: number;
+      /** 后端是否做了 WAL checkpoint（把 -wal 并回主文件并截断） */
+      walTruncated?: boolean;
+      /** 本次是否触发了 VACUUM（释放体量 >= 阈值时才做） */
+      vacuumed?: boolean;
+      /** 估算释放的字节数（笔记文本 + 附件 size 登记值） */
+      freedBytesEstimate?: number;
+    }>(`/notes/trash/empty`, { method: "DELETE" }),
   reorderNotes: (items: { id: string; sortOrder: number }[]) =>
     request<{ success: boolean }>("/notes/reorder/batch", { method: "PUT", body: JSON.stringify({ items }) }),
   /**
@@ -685,8 +696,27 @@ export const api = {
     request<{ success: boolean }>(`/notes/${id}/yjs/release-room`, { method: "POST" }),
 
   // Tags
-  getTags: () => request<Tag[]>("/tags"),
-  createTag: (data: Partial<Tag>) => request<Tag>("/tags", { method: "POST", body: JSON.stringify(data) }),
+  // -----------------------------------------------------------------
+  // 与 notebooks / notes 一致的工作区隔离：
+  //   - getTags 自动带当前 workspaceId（'personal' | <uuid>）
+  //   - createTag 自动落到当前空间（除非调用方显式覆盖）
+  //   - update / delete / attach 由后端按 tag.id 反查空间做 ACL，前端无需传
+  getTags: (workspaceId?: string) => {
+    const ws = workspaceId ?? getCurrentWorkspace();
+    const qs = ws ? `?workspaceId=${encodeURIComponent(ws)}` : "";
+    return request<Tag[]>(`/tags${qs}`);
+  },
+  createTag: (data: Partial<Tag> & { workspaceId?: string | null }) => {
+    const payload: any = { ...data };
+    if (payload.workspaceId === undefined) {
+      const currentWs = getCurrentWorkspace();
+      // 'personal' 不显式传，让后端按缺省走 NULL（个人空间）
+      if (currentWs && currentWs !== "personal") {
+        payload.workspaceId = currentWs;
+      }
+    }
+    return request<Tag>("/tags", { method: "POST", body: JSON.stringify(payload) });
+  },
   updateTag: (id: string, data: Partial<Tag>) => request<Tag>(`/tags/${id}`, { method: "PUT", body: JSON.stringify(data) }),
   deleteTag: (id: string) => request(`/tags/${id}`, { method: "DELETE" }),
   addTagToNote: (noteId: string, tagId: string) => request(`/tags/note/${noteId}/tag/${tagId}`, { method: "POST" }),
@@ -704,19 +734,33 @@ export const api = {
   search: (q: string) => request<SearchResult[]>(`/search?q=${encodeURIComponent(q)}`),
 
   // Tasks
+  // Y3: 自动注入当前工作区——personal 不带，workspace 带 ?workspaceId=<uuid>。
+  //   - getTasks / getTaskStats / createTask 三个"集合"接口注入 workspaceId；
+  //   - getTask / updateTask / toggleTask / deleteTask 按 id 操作，后端按行自带的
+  //     workspaceId 做 ACL，不需注入。
   getTasks: (filter?: TaskFilter, noteId?: string) => {
     const params = new URLSearchParams();
     if (filter && filter !== "all") params.set("filter", filter);
     if (noteId) params.set("noteId", noteId);
+    const ws = getCurrentWorkspace();
+    if (ws && ws !== "personal") params.set("workspaceId", ws);
     const qs = params.toString() ? `?${params.toString()}` : "";
     return request<Task[]>(`/tasks${qs}`);
   },
   getTask: (id: string) => request<Task>(`/tasks/${id}`),
-  createTask: (data: Partial<Task>) => request<Task>("/tasks", { method: "POST", body: JSON.stringify(data) }),
+  createTask: (data: Partial<Task>) => {
+    const ws = getCurrentWorkspace();
+    const qs = ws && ws !== "personal" ? `?workspaceId=${encodeURIComponent(ws)}` : "";
+    return request<Task>(`/tasks${qs}`, { method: "POST", body: JSON.stringify(data) });
+  },
   updateTask: (id: string, data: Partial<Task>) => request<Task>(`/tasks/${id}`, { method: "PUT", body: JSON.stringify(data) }),
   toggleTask: (id: string) => request<Task>(`/tasks/${id}/toggle`, { method: "PATCH" }),
   deleteTask: (id: string) => request(`/tasks/${id}`, { method: "DELETE" }),
-  getTaskStats: () => request<TaskStats>("/tasks/stats/summary"),
+  getTaskStats: () => {
+    const ws = getCurrentWorkspace();
+    const qs = ws && ws !== "personal" ? `?workspaceId=${encodeURIComponent(ws)}` : "";
+    return request<TaskStats>(`/tasks/stats/summary${qs}`);
+  },
 
   // Security
   // 注意：后端在修改密码成功后会 bump tokenVersion，让其它端旧 token 立即失效，
@@ -969,7 +1013,13 @@ export const api = {
       const form = new FormData();
       form.append("file", file);
       if (taskId) form.append("taskId", taskId);
-      const res = await fetch(`${getBaseUrl()}/task-attachments`, {
+      // Y3: 孤儿态（未指定 taskId）时附件的 workspaceId 来自 query；
+      //     若指定了 taskId，后端从 task 行继承 workspaceId，query 被忽略。
+      const ws = getCurrentWorkspace();
+      const qs = !taskId && ws && ws !== "personal"
+        ? `?workspaceId=${encodeURIComponent(ws)}`
+        : "";
+      const res = await fetch(`${getBaseUrl()}/task-attachments${qs}`, {
         method: "POST",
         headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}) },
         body: form,
@@ -1028,17 +1078,34 @@ export const api = {
     }),
 
   // Mind Maps
-  getMindMaps: () => request<MindMapListItem[]>("/mindmaps"),
+  // Y4: 与 tasks/diary 一致——"集合"接口自动带当前 workspaceId（personal 不带），
+  //   "按 id"接口（get/update/delete）不带，后端按行自带的 workspaceId 做 ACL。
+  getMindMaps: () => {
+    const ws = getCurrentWorkspace();
+    const qs = ws && ws !== "personal" ? `?workspaceId=${encodeURIComponent(ws)}` : "";
+    return request<MindMapListItem[]>(`/mindmaps${qs}`);
+  },
   getMindMap: (id: string) => request<MindMap>(`/mindmaps/${id}`),
-  createMindMap: (data: { title?: string; data?: string }) =>
-    request<MindMap>("/mindmaps", { method: "POST", body: JSON.stringify(data) }),
+  createMindMap: (data: { title?: string; data?: string }) => {
+    const ws = getCurrentWorkspace();
+    const qs = ws && ws !== "personal" ? `?workspaceId=${encodeURIComponent(ws)}` : "";
+    return request<MindMap>(`/mindmaps${qs}`, { method: "POST", body: JSON.stringify(data) });
+  },
   updateMindMap: (id: string, data: { title?: string; data?: string }) =>
     request<MindMap>(`/mindmaps/${id}`, { method: "PUT", body: JSON.stringify(data) }),
   deleteMindMap: (id: string) => request(`/mindmaps/${id}`, { method: "DELETE" }),
 
   // Diary (说说/动态)
-  postDiary: (data: { contentText: string; mood?: string; images?: string[] }) =>
-    request<Diary>("/diary", { method: "POST", body: JSON.stringify(data) }),
+  // Y2: 自动注入当前工作区。后端按 workspaceId 隔离数据：
+  //   - 'personal' 或省略 → 个人空间（diaries.workspaceId IS NULL）
+  //   - <uuid>            → 指定工作区（要求成员身份 + diaries 功能开关未关闭）
+  // 在工作区中：发布权限按"是否成员 + 功能开关"，删除权限按 canManageResource
+  //   （创建者本人 / admin / owner）。
+  postDiary: (data: { contentText: string; mood?: string; images?: string[] }) => {
+    const ws = getCurrentWorkspace();
+    const qs = ws && ws !== "personal" ? `?workspaceId=${encodeURIComponent(ws)}` : "";
+    return request<Diary>(`/diary${qs}`, { method: "POST", body: JSON.stringify(data) });
+  },
   getDiaryTimeline: (
     cursor?: string,
     limit?: number,
@@ -1050,6 +1117,8 @@ export const api = {
     // from/to 接收 "YYYY-MM-DD" 或完整 ISO 时间；后端会做 normalize
     if (range?.from) params.set("from", range.from);
     if (range?.to) params.set("to", range.to);
+    const ws = getCurrentWorkspace();
+    if (ws && ws !== "personal") params.set("workspaceId", ws);
     const qs = params.toString();
     return request<DiaryTimeline>(`/diary/timeline${qs ? `?${qs}` : ""}`);
   },
@@ -1058,6 +1127,8 @@ export const api = {
     const params = new URLSearchParams();
     if (range?.from) params.set("from", range.from);
     if (range?.to) params.set("to", range.to);
+    const ws = getCurrentWorkspace();
+    if (ws && ws !== "personal") params.set("workspaceId", ws);
     const qs = params.toString();
     return request<DiaryStats>(`/diary/stats${qs ? `?${qs}` : ""}`);
   },
@@ -1072,7 +1143,10 @@ export const api = {
       const token = getToken();
       const form = new FormData();
       form.append("file", file);
-      const res = await fetch(`${getBaseUrl()}/diary/attachments`, {
+      // Y2: 上传时即记录目标工作区，发布时再 attach 一致。
+      const ws = getCurrentWorkspace();
+      const qs = ws && ws !== "personal" ? `?workspaceId=${encodeURIComponent(ws)}` : "";
+      const res = await fetch(`${getBaseUrl()}/diary/attachments${qs}`, {
         method: "POST",
         headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}) },
         body: form,
@@ -1101,12 +1175,23 @@ export const api = {
   // note 兜底外键约束，用户看到的只是"未归档文件"。
   //
   files: {
-    /** 分类聚合统计。侧栏/顶栏展示"X 张图片 / Y 个文件"用。 */
-    stats: () => request<FileStats>("/files/stats"),
+    /** 分类聚合统计。侧栏/顶栏展示"X 张图片 / Y 个文件"用。
+     *  Y4: 自动注入当前工作区 scope；personal 不带、workspace 带 ?workspaceId=。
+     */
+    stats: () => {
+      const ws = getCurrentWorkspace();
+      const qs = ws && ws !== "personal" ? `?workspaceId=${encodeURIComponent(ws)}` : "";
+      return request<FileStats>(`/files/stats${qs}`);
+    },
 
-    /** 分页列出文件。所有筛选字段可选；默认按 createdAt desc。 */
+    /** 分页列出文件。所有筛选字段可选；默认按 createdAt desc。
+     *  Y4: 自动注入 workspaceId（调用方未显式指定时）。
+     *  filter=unreferenced：仅返回 scope 内"没有被任何笔记引用"的附件（含 24h 宽限期）。
+     *    与 category 正交——可同时传 category=image 得到"孤儿图片"。
+     */
     list: (params: {
       category?: FileCategory;
+      filter?: "unreferenced";
       mime?: string;
       notebookId?: string;
       q?: string;
@@ -1120,6 +1205,7 @@ export const api = {
       // 调用方（FileManager）自己维护 "all" | FileCategory 的 UI 过滤，
       // 在传进来之前就会把 "all" 映射成 undefined，这里只需非空判断。
       if (params.category) qs.set("category", params.category);
+      if (params.filter) qs.set("filter", params.filter);
       if (params.mime) qs.set("mime", params.mime);
       if (params.notebookId) qs.set("notebookId", params.notebookId);
       if (params.q) qs.set("q", params.q);
@@ -1127,11 +1213,14 @@ export const api = {
       if (params.order) qs.set("order", params.order);
       if (typeof params.page === "number") qs.set("page", String(params.page));
       if (typeof params.pageSize === "number") qs.set("pageSize", String(params.pageSize));
+      // Y4: workspace scope
+      const ws = getCurrentWorkspace();
+      if (ws && ws !== "personal") qs.set("workspaceId", ws);
       const s = qs.toString();
       return request<FileListResponse>(`/files${s ? `?${s}` : ""}`);
     },
 
-    /** 取单个文件详情，含反向引用的笔记列表。 */
+    /** 取单个文件详情，含反向引用的笔记列表。按 id 查，无需 workspaceId。 */
     get: (id: string) => request<FileDetail>(`/files/${id}`),
 
     /** 删除单个附件（含磁盘文件）。会做 ACL 校验，被别的笔记引用也一并断链。 */
@@ -1156,6 +1245,8 @@ export const api = {
     /**
      * 上传一份文件到文件管理（无笔记归属时后端落到 holder note）。
      * 用 FormData；不要手动设 Content-Type，交给浏览器注入 multipart boundary。
+     * Y4: 自动把 workspaceId 作为 query 传给后端；后端会把 holder note 与
+     *     attachments.workspaceId 一起落到对应 scope。
      */
     upload: async (file: File, opts: { noteId?: string; notebookId?: string } = {}): Promise<FileItem> => {
       const token = getToken();
@@ -1163,7 +1254,9 @@ export const api = {
       form.append("file", file);
       if (opts.noteId) form.append("noteId", opts.noteId);
       if (opts.notebookId) form.append("notebookId", opts.notebookId);
-      const res = await fetch(`${getBaseUrl()}/files/upload`, {
+      const ws = getCurrentWorkspace();
+      const qs = ws && ws !== "personal" ? `?workspaceId=${encodeURIComponent(ws)}` : "";
+      const res = await fetch(`${getBaseUrl()}/files/upload${qs}`, {
         method: "POST",
         headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}) },
         body: form,
@@ -1623,6 +1716,19 @@ export const api = {
       { method: "POST", body: JSON.stringify({ code }) },
     ),
 
+  // ========== 工作区功能开关（Phase 1 数据隔离）==========
+  // 约定：
+  //   - 后端返回 normalized 结构（所有 key 都有 boolean 值，undefined 语义已被后端回填为 true）。
+  //   - 前端可直接 setState，无需再做 undefined=true 的容错。
+  //   - PUT 是 PATCH 语义：只传要改的 key，后端会与现有配置合并。
+  getWorkspaceFeatures: (id: string) =>
+    request<WorkspaceFeatures>(`/workspaces/${id}/features`),
+  updateWorkspaceFeatures: (id: string, patch: Partial<WorkspaceFeatures>) =>
+    request<WorkspaceFeatures>(`/workspaces/${id}/features`, {
+      method: "PUT",
+      body: JSON.stringify(patch),
+    }),
+
   // ========== 数据库文件（.data）导出 / 导入 / 占用统计 ==========
   //
   // - getDataFileInfo  所有登录用户可见；普通用户看自己数据量，管理员额外拿到整库文件大小/data 目录占用
@@ -1710,18 +1816,40 @@ export const api = {
 
     /**
      * 清理孤儿附件：
-     *   - 普通用户：仅清自己的 DB 孤儿（noteId 不存在的 attachments 行）
-     *   - 管理员：额外扫描磁盘孤儿（文件系统有、DB 中无登记的文件）
+     *   - DB 孤儿：attachments 行对应 note 不存在
+     *   - 内容孤儿：note 还在，但 notes.content 里不再引用该附件（解决"清理
+     *     完文件管理里还能看到孤立图片"的问题）。有 24h 宽限期避免误杀新上传。
+     *   - 磁盘孤儿：磁盘上有文件但 DB 无登记（仅管理员）
+     *
+     * @param dryRun 仅返回"将要清理"的统计，不真动磁盘/DB。
+     *               前端用来显示"可回收 X MB / 共 N 项"的徽标。
      */
-    cleanupOrphans: () =>
-      request<{
+    cleanupOrphans: (opts?: { dryRun?: boolean; graceHours?: number }) => {
+      const qs = new URLSearchParams();
+      if (opts?.dryRun) qs.set("dryRun", "1");
+      if (typeof opts?.graceHours === "number") qs.set("graceHours", String(opts.graceHours));
+      const suffix = qs.toString() ? `?${qs.toString()}` : "";
+      return request<{
         success: true;
+        dryRun: boolean;
+        graceHours: number;
+        // DB 孤儿
         dbOrphansRemoved: number;
         dbOrphanFilesRemoved: number;
+        dbOrphanBytes: number;
+        // 内容孤儿（本次新增）
+        contentOrphansRemoved: number;
+        contentOrphanFilesRemoved: number;
+        contentOrphanBytes: number;
+        // 磁盘孤儿
         diskOrphansRemoved: number;
         diskOrphanBytes: number;
         diskScanSkipped: boolean;
-      }>("/data-file/cleanup-orphans", { method: "POST" }),
+        // 汇总
+        totalFreedBytes: number;
+        totalRemovedItems: number;
+      }>(`/data-file/cleanup-orphans${suffix}`, { method: "POST" });
+    },
 
     /**
      * 压缩 SQLite 数据库（VACUUM）——真正把删除后的空闲 page 释放回磁盘。

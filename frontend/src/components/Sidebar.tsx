@@ -17,9 +17,9 @@ import WorkspaceSwitcher from "@/components/WorkspaceSwitcher";
 import { useContextMenu } from "@/hooks/useContextMenu";
 import { useApp, useAppActions } from "@/store/AppContext";
 import { useSiteSettings } from "@/hooks/useSiteSettings";
-import { api, broadcastLogout } from "@/lib/api";
+import { api, broadcastLogout, getCurrentWorkspace } from "@/lib/api";
 import { exportNotebook } from "@/lib/exportService";
-import { Notebook, ViewMode } from "@/types";
+import { Notebook, ViewMode, WorkspaceFeatures } from "@/types";
 import { cn } from "@/lib/utils";
 import { useTranslation } from "react-i18next";
 import { toast } from "@/lib/toast";
@@ -605,6 +605,9 @@ export default function Sidebar() {
   const { t } = useTranslation();
   const [searchInput, setSearchInput] = useState("");
   const [showSettings, setShowSettings] = useState(false);
+  // Y4: 当前工作区的功能开关。null = 个人空间（不受限），对象 = 工作区 normalized 配置。
+  //     由 workspace-changed / workspace-features-changed 两个事件驱动刷新。
+  const [features, setFeatures] = useState<WorkspaceFeatures | null>(null);
   // 标签区域折叠状态 - 从 localStorage 恢复
   const [tagsExpanded, setTagsExpanded] = useState(() => {
     try {
@@ -723,7 +726,19 @@ export default function Sidebar() {
       api.getNotebooks().then(actions.setNotebooks).catch(console.error);
       api.getTags().then(actions.setTags).catch(console.error);
     };
+    // Y4: 加载当前工作区的功能开关——个人空间固定置 null（全开）
+    const loadFeatures = () => {
+      const ws = getCurrentWorkspace();
+      if (!ws || ws === "personal") {
+        setFeatures(null);
+        return;
+      }
+      api.getWorkspaceFeatures(ws)
+        .then(setFeatures)
+        .catch(() => setFeatures(null));
+    };
     loadScopedData();
+    loadFeatures();
 
     // Phase 1: 工作区切换时重载数据
     const onWorkspaceChange = () => {
@@ -731,11 +746,18 @@ export default function Sidebar() {
       actions.setSelectedNotebook(null);
       actions.setViewMode("all");
       loadScopedData();
+      loadFeatures();
       // 触发 NoteList 重新拉取
       actions.refreshNotes();
     };
+    // Y4: MembersPanel 中 owner 改功能开关后会广播此事件，让 Sidebar 立即更新可见项
+    const onFeaturesChanged = () => loadFeatures();
     window.addEventListener("nowen:workspace-changed", onWorkspaceChange);
-    return () => window.removeEventListener("nowen:workspace-changed", onWorkspaceChange);
+    window.addEventListener("nowen:workspace-features-changed", onFeaturesChanged);
+    return () => {
+      window.removeEventListener("nowen:workspace-changed", onWorkspaceChange);
+      window.removeEventListener("nowen:workspace-features-changed", onFeaturesChanged);
+    };
   }, []);
 
   // 更换笔记本图标
@@ -1126,6 +1148,17 @@ export default function Sidebar() {
       } else {
         toast.success(t('sidebar.emptyTrashSuccess', { count: res.count }));
       }
+      // 后端已自动 WAL checkpoint + 超阈值 VACUUM；如果没 VACUUM 但体量较大，
+      // 友好提示用户可以手动压缩一次。阈值按"估算释放量 >= 10MB"判定。
+      if (!res.vacuumed && (res.freedBytesEstimate || 0) >= 10 * 1024 * 1024) {
+        toast.info(
+          "占用较大但数据库未自动压缩。可在「数据管理」里点击「压缩数据库」进一步回收磁盘空间。",
+        );
+      }
+      // 通知其他视图（FileManager / DataManager）刷新空间占用统计
+      try {
+        window.dispatchEvent(new CustomEvent("nowen:storage-changed", { detail: { reason: "trash-emptied" } }));
+      } catch { /* ignore */ }
       // 若当前正处于回收站视图，刷新列表
       if (state.viewMode === "trash") {
         actions.setNotes([]);
@@ -1144,17 +1177,31 @@ export default function Sidebar() {
     }
   };
 
-  const navItems: { icon: React.ReactNode; label: string; mode: ViewMode; active: boolean }[] = [
-    { icon: <BookOpen size={16} />, label: t('sidebar.allNotes'), mode: "all", active: state.viewMode === "all" },
-    { icon: <CalendarDays size={16} />, label: t('sidebar.diary'), mode: "diary", active: state.viewMode === "diary" },
-    { icon: <ListTodo size={16} />, label: t('sidebar.tasks'), mode: "tasks", active: state.viewMode === "tasks" },
-    { icon: <BrainCircuit size={16} />, label: t('sidebar.mindMaps'), mode: "mindmaps", active: state.viewMode === "mindmaps" },
+  // Y4: navItems 按工作区功能开关过滤。
+  //   - features === null（个人空间或未加载到）→ 全开，行为与之前一致；
+  //   - 工作区启用 JSON：显式 false 的模块被隐藏；未列出 / true 默认开启。
+  //   - "all"（所有笔记）、"favorites"、"trash" 永远显示——它们是笔记模块本身，
+  //     关掉 notes 相当于关掉整个工作区，产品上由 owner 在开关面板体现。
+  const navItemsRaw: {
+    icon: React.ReactNode;
+    label: string;
+    mode: ViewMode;
+    active: boolean;
+    feature?: keyof WorkspaceFeatures;
+  }[] = [
+    { icon: <BookOpen size={16} />, label: t('sidebar.allNotes'), mode: "all", active: state.viewMode === "all", feature: "notes" },
+    { icon: <CalendarDays size={16} />, label: t('sidebar.diary'), mode: "diary", active: state.viewMode === "diary", feature: "diaries" },
+    { icon: <ListTodo size={16} />, label: t('sidebar.tasks'), mode: "tasks", active: state.viewMode === "tasks", feature: "tasks" },
+    { icon: <BrainCircuit size={16} />, label: t('sidebar.mindMaps'), mode: "mindmaps", active: state.viewMode === "mindmaps", feature: "mindmaps" },
     { icon: <Bot size={16} />, label: t('sidebar.aiChat'), mode: "ai-chat", active: state.viewMode === "ai-chat" },
-    { icon: <Inbox size={16} />, label: t('sidebar.fileManager'), mode: "files", active: state.viewMode === "files" },
+    { icon: <Inbox size={16} />, label: t('sidebar.fileManager'), mode: "files", active: state.viewMode === "files", feature: "files" },
 
-    { icon: <Star size={16} />, label: t('sidebar.favorites'), mode: "favorites", active: state.viewMode === "favorites" },
+    { icon: <Star size={16} />, label: t('sidebar.favorites'), mode: "favorites", active: state.viewMode === "favorites", feature: "favorites" },
     { icon: <Trash2 size={16} />, label: t('sidebar.trash'), mode: "trash", active: state.viewMode === "trash" },
   ];
+  const navItems = features
+    ? navItemsRaw.filter((it) => !it.feature || features[it.feature] !== false)
+    : navItemsRaw;
 
   if (state.sidebarCollapsed) {
     return (

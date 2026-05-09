@@ -88,6 +88,37 @@ contextBridge.exposeInMainWorld("nowenDesktop", {
   /** 运行在 Electron 客户端的标识（前端用来条件渲染桌面专属 UI） */
   isDesktop: true,
   platform: process.platform,
+  /**
+   * Lite-only 发行版标识：通过 additionalArguments 传递。
+   * true 表示这份安装包里没有打包 backend，无法切回 full 模式，前端应隐藏
+   * "切回本地模式"等入口，登录页默认强制客户端模式。
+   */
+  isLiteOnly: (process.argv || []).includes("--nowen-lite-only"),
+
+  /**
+   * 凭据存储（记住密码 / 自动登录）。
+   * renderer 同步 / 异步都走这些接口；主进程用 safeStorage 加密落盘。
+   *
+   *   load():    { serverUrl, username, password, hasPassword, autoLogin } | null
+   *   save():    { ok, encrypted, error? }
+   *              payload 至少包含 { remember:boolean }，其余字段可选
+   *   clear():   { ok, error? }
+   *   isEncryptionAvailable(): boolean
+   */
+  credentials: {
+    load() {
+      return ipcRenderer.invoke("credentials:load");
+    },
+    save(payload) {
+      return ipcRenderer.invoke("credentials:save", payload);
+    },
+    clear() {
+      return ipcRenderer.invoke("credentials:clear");
+    },
+    isEncryptionAvailable() {
+      return ipcRenderer.invoke("credentials:is-encryption-available");
+    },
+  },
 
   /**
    * 局域网服务发现（mDNS）：

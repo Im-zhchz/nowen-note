@@ -253,7 +253,14 @@ app.post("/", async (c) => {
   }
 
   // ACL：必须对目标笔记有 write 权限
-  const { permission } = resolveNotePermission(noteId, userId);
+  // 同时拿到笔记的 workspaceId（null = 个人空间），用于附件行的 scope 归属：
+  // 这样"文件管理"在个人空间 / 工作区两处列表才能严格按空间区分——否则
+  // 所有通过编辑器粘贴 / 上传的图片都会落到 workspaceId IS NULL，
+  // 被个人空间的 list 捞到，而工作区的 list（a.workspaceId = ?）反而看不见。
+  const { permission, workspaceId: noteWorkspaceId } = resolveNotePermission(
+    noteId,
+    userId,
+  );
   if (!hasPermission(permission, "write")) {
     return c.json({ error: "无权向该笔记上传附件", code: "FORBIDDEN" }, 403);
   }
@@ -286,11 +293,26 @@ app.post("/", async (c) => {
 
   // 写 DB。attachments.path 存**文件名**（相对 ATTACHMENTS_DIR）而非绝对路径，
   // 换部署环境只需搬目录。
+  //
+  // workspaceId 继承自 noteId 所属笔记：
+  //   - 个人空间笔记 → workspaceId = NULL（文件管理"个人空间"可见）
+  //   - 工作区笔记   → workspaceId = <该工作区 id>（该工作区成员在"工作区文件管理"可见）
+  // 这与 files.ts 的 list/stats scope 过滤严格对齐，避免"上传到工作区笔记
+  // 却只在个人空间看得见"的错位。
   try {
     db.prepare(
-      `INSERT INTO attachments (id, noteId, userId, filename, mimeType, size, path)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-    ).run(id, noteId, userId, file.name || `${id}.${ext}`, mime, file.size, `${id}.${ext}`);
+      `INSERT INTO attachments (id, noteId, userId, filename, mimeType, size, path, workspaceId)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      id,
+      noteId,
+      userId,
+      file.name || `${id}.${ext}`,
+      mime,
+      file.size,
+      `${id}.${ext}`,
+      noteWorkspaceId,
+    );
   } catch (err: any) {
     // DB 写失败时把已落盘文件清掉，避免孤儿
     try { fs.unlinkSync(savePath); } catch { /* ignore */ }
@@ -377,11 +399,17 @@ export interface InlineImageExtractResult {
  *
  * 失败策略：单张图解码失败时**保留原 data URI**（不中断整批），并在返回结果里
  * 通过 replacedCount 反映真实写入数。
+ *
+ * @param workspaceId 目标笔记的 workspaceId（null = 个人空间）。必须传：
+ *   否则附件的 workspaceId 与笔记不同步，会导致"文件管理"切空间时看不到图。
+ *   调用方通常在调用前已经算出（notes.POST 的 inheritedWorkspaceId、
+ *   notes.PUT 通过 resolveNotePermission、export 导入从 note 行读回）。
  */
 export function extractInlineBase64Images(
   content: string,
   userId: string,
   noteId: string,
+  workspaceId: string | null,
 ): InlineImageExtractResult {
   if (!content || typeof content !== "string") {
     return { content: content || "", attachmentIds: [], replacedCount: 0 };
@@ -394,8 +422,8 @@ export function extractInlineBase64Images(
   ensureAttachmentsDir();
   const db = getDb();
   const insertStmt = db.prepare(
-    `INSERT INTO attachments (id, noteId, userId, filename, mimeType, size, path)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO attachments (id, noteId, userId, filename, mimeType, size, path, workspaceId)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
   );
 
   const attachmentIds: string[] = [];
@@ -429,7 +457,7 @@ export function extractInlineBase64Images(
         return _match;
       }
       try {
-        insertStmt.run(id, noteId, userId, filename, mimeLower, buffer.length, filename);
+        insertStmt.run(id, noteId, userId, filename, mimeLower, buffer.length, filename, workspaceId);
       } catch {
         // DB 写失败 → 清掉磁盘文件，保留原 data URI
         try { fs.unlinkSync(savePath); } catch { /* ignore */ }

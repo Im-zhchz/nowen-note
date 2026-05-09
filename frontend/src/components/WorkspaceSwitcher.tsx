@@ -395,11 +395,17 @@ export function Modal({
   children,
   onClose,
   widthClass = "max-w-md",
+  heightClass,
 }: {
   title: string;
   children: React.ReactNode;
   onClose: () => void;
   widthClass?: string;
+  /**
+   * 可选的高度约束。不传 → 内容自然高度；传如 "h-[80vh]" / "max-h-[80vh]" → 固定/限高
+   * 弹窗，body 区域自动滚动。
+   */
+  heightClass?: string;
 }) {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -419,10 +425,14 @@ export function Modal({
         animate={{ opacity: 1, scale: 1 }}
         exit={{ opacity: 0, scale: 0.96 }}
         transition={{ duration: 0.15 }}
-        className={cn("bg-card border border-border rounded-lg shadow-xl w-full", widthClass)}
+        className={cn(
+          "bg-card border border-border rounded-lg shadow-xl w-full flex flex-col",
+          widthClass,
+          heightClass,
+        )}
         onClick={(e) => e.stopPropagation()}
       >
-        <div className="flex items-center justify-between px-4 py-3 border-b border-border">
+        <div className="flex items-center justify-between px-4 py-3 border-b border-border shrink-0">
           <h3 className="font-semibold">{title}</h3>
           <button
             onClick={onClose}
@@ -432,7 +442,11 @@ export function Modal({
             <X className="w-4 h-4" />
           </button>
         </div>
-        <div className="p-4">{children}</div>
+        {/*
+          body 区域：flex-1 + min-h-0 让其在设置了 heightClass 时能正确收缩并
+          启用内部滚动；未设高度时（默认）仅按内容自然撑开，表现与旧版一致。
+        */}
+        <div className="p-4 flex-1 min-h-0 overflow-auto">{children}</div>
       </motion.div>
     </div>
   );

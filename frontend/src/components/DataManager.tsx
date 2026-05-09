@@ -723,6 +723,10 @@ export default function DataManager() {
 // - 所有登录用户都能看"我的数据"和"系统合计"
 // - 管理员额外看到 data 目录占用 + 导出 / 导入按钮
 // - 导入前弹窗二次确认，且要求输入当前密码换 sudoToken
+//
+// 对外暴露：命名导出，便于 SettingsModal「存储与空间」独立面板直接复用——
+// 该面板只想聚焦于磁盘占用 / 导入 / 导出 / 清理 / VACUUM，避免让用户在
+// "数据管理"大 tab 里被导入器 / 备份等无关子页干扰。
 // ============================================================================
 
 type DataFileInfo = Awaited<ReturnType<typeof api.dataFile.getInfo>>;
@@ -737,7 +741,7 @@ function fmtBytes(n: number | undefined | null): string {
   return `${v.toFixed(v >= 10 || i === 0 ? 0 : 1)} ${units[i]}`;
 }
 
-function DataFileSection() {
+export function DataFileSection() {
   const { t } = useTranslation();
   const [info, setInfo] = useState<DataFileInfo | null>(null);
   const [loadingInfo, setLoadingInfo] = useState(false);
@@ -884,7 +888,11 @@ function DataFileSection() {
         text: t("dataManager.dataFile.cleanupOrphansSuccess", {
           dbRows: res.dbOrphansRemoved,
           dbFiles: res.dbOrphanFilesRemoved,
+          // 本次新增：内容孤儿（notes.content 不再引用的附件）
+          contentRows: res.contentOrphansRemoved,
+          contentFiles: res.contentOrphanFilesRemoved,
           diskFiles: res.diskOrphansRemoved,
+          totalSize: fmtBytes(res.totalFreedBytes),
           diskSize: fmtBytes(res.diskOrphanBytes),
         }),
       });

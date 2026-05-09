@@ -61,6 +61,35 @@ export interface WorkspaceInvite {
   createdAt: string;
 }
 
+/**
+ * 工作区功能开关（Phase 1 数据隔离）
+ *   每个键代表一个可独立启用/禁用的功能模块。
+ *   后端 GET 会返回 normalized 结构（所有键都是 boolean），未显式设置视作 true。
+ *   前端根据此结构决定侧边栏是否展示该模块、以及对应路由是否可进入。
+ */
+export interface WorkspaceFeatures {
+  notes: boolean;
+  diaries: boolean;
+  tasks: boolean;
+  mindmaps: boolean;
+  files: boolean;
+  favorites: boolean;
+}
+
+/** 功能开关的稳定排序 + 展示元信息，UI 渲染列表用。 */
+export const WORKSPACE_FEATURE_META: Array<{
+  key: keyof WorkspaceFeatures;
+  label: string;
+  description: string;
+}> = [
+  { key: "notes", label: "笔记", description: "笔记本、正文、标签等核心功能" },
+  { key: "diaries", label: "说说", description: "时间线式短内容" },
+  { key: "tasks", label: "待办", description: "任务清单与看板" },
+  { key: "mindmaps", label: "思维导图", description: "节点式思维导图" },
+  { key: "files", label: "文件", description: "独立文件管理" },
+  { key: "favorites", label: "收藏", description: "快速收藏的笔记集合" },
+];
+
 export interface Notebook {
   id: string;
   userId: string;
@@ -115,6 +144,12 @@ export interface NoteListItem {
   version: number;
   createdAt: string;
   updatedAt: string;
+  /**
+   * 创建者用户名（后端 LEFT JOIN users.username）。
+   * 仅 list 接口返回；个人空间下也会有值（恒为自己），前端通常仅在工作区视图展示。
+   * null/undefined 表示用户已被删除或后端老版本未带该字段。
+   */
+  creatorName?: string | null;
 }
 
 export interface Tag {
@@ -142,6 +177,15 @@ export type ViewMode = "notebook" | "favorites" | "trash" | "all" | "search" | "
 
 /** 文件分类：按 MIME 粗分，UI 用图标/筛选。 */
 export type FileCategory = "image" | "file";
+
+/**
+ * 文件视图筛选（与 category 正交）：
+ *   - "unreferenced"：scope 内"没有任何笔记引用"的附件（含 24h 宽限期）。
+ *
+ * 前端单独维护 UI 选择（"孤儿"tab），传给后端 `filter=unreferenced`；
+ * 与 category=image/file 可并存（"孤儿图片" / "孤儿文件"）。
+ */
+export type FileFilter = "unreferenced";
 
 /** 文件排序键（与后端 resolveOrderBy 白名单一致）。 */
 export type FileSortKey =
@@ -207,6 +251,8 @@ export interface FileStats {
   totalBytes: number;
   images: { count: number; bytes: number };
   files: { count: number; bytes: number };
+  /** 孤儿视图徽标：scope 内没有被任何笔记引用的附件数 / 占用。 */
+  unreferenced: { count: number; bytes: number };
   byMime: Array<{ mime: string; count: number; bytes: number }>;
 }
 
@@ -223,6 +269,8 @@ export type TaskFilter = "all" | "today" | "week" | "overdue" | "completed";
 export interface Task {
   id: string;
   userId: string;
+  /** Y3: 任务归属的工作区 id；null = 个人空间。 */
+  workspaceId: string | null;
   title: string;
   isCompleted: number;
   priority: TaskPriority;
@@ -233,6 +281,8 @@ export interface Task {
   createdAt: string;
   updatedAt: string;
   children?: Task[];
+  /** 创建者用户名；仅 list/single read 时由后端 LEFT JOIN 返回。 */
+  creatorName?: string | null;
 }
 
 export interface TaskStats {
@@ -267,6 +317,8 @@ export interface MindMapData {
 export interface MindMap {
   id: string;
   userId: string;
+  /** Y4: 思维导图归属的工作区 id；null = 个人空间。 */
+  workspaceId: string | null;
   title: string;
   data: string; // JSON string of MindMapData
   createdAt: string;
@@ -276,19 +328,27 @@ export interface MindMap {
 export interface MindMapListItem {
   id: string;
   userId: string;
+  /** Y4: 同 MindMap.workspaceId。 */
+  workspaceId: string | null;
   title: string;
   createdAt: string;
   updatedAt: string;
+  /** 创建者用户名；仅 list 接口返回。 */
+  creatorName?: string | null;
 }
 
 export interface Diary {
   id: string;
   userId: string;
+  /** Y2: 说说归属的工作区 id；null = 个人空间。 */
+  workspaceId: string | null;
   contentText: string;
   mood: string;
   /** 已绑定的说说图片 id 数组（顺序即展示顺序）。需要 URL 时拼 /api/diary/attachments/<id>。 */
   images: string[];
   createdAt: string;
+  /** 创建者用户名；后端 LEFT JOIN users 返回，工作区视图下用于展示"谁发的"。 */
+  creatorName?: string | null;
 }
 
 export interface DiaryTimeline {

@@ -10,8 +10,9 @@ import {
   ImagePlus,
   X,
   Calendar,
+  User as UserIcon,
 } from "lucide-react";
-import { api } from "@/lib/api";
+import { api, getCurrentWorkspace } from "@/lib/api";
 import { Diary, DiaryStats } from "@/types";
 import { cn } from "@/lib/utils";
 import { useTranslation } from "react-i18next";
@@ -738,6 +739,9 @@ function DiaryCard({
   const [showConfirm, setShowConfirm] = useState(false);
   const [lightboxIdx, setLightboxIdx] = useState<number | null>(null);
   const moodEmoji = getMoodEmoji(item.mood);
+  // 工作区下展示发布者；个人空间下省略（一定是自己）。
+  const showCreator =
+    !!item.creatorName && getCurrentWorkspace() !== "personal";
 
   const handleDelete = () => {
     if (!showConfirm) {
@@ -773,9 +777,22 @@ function DiaryCard({
 
             {/* 底部元信息 */}
             <div className="flex items-center justify-between mt-3 pt-2 border-t border-app-border/40">
-              <div className="flex items-center gap-2 text-[11px] text-tx-tertiary">
+              <div className="flex items-center gap-2 text-[11px] text-tx-tertiary min-w-0">
                 {moodEmoji && <span className="text-sm">{moodEmoji}</span>}
-                <span>{timeAgo(item.createdAt, t)}</span>
+                <span className="shrink-0">{timeAgo(item.createdAt, t)}</span>
+                {/* 工作区下追加发布者；与时间用「·」分隔，弱化视觉权重 */}
+                {showCreator && (
+                  <>
+                    <span className="text-tx-tertiary/60 shrink-0">·</span>
+                    <span
+                      className="flex items-center gap-1 truncate"
+                      title={t('common.createdBy', { name: item.creatorName })}
+                    >
+                      <UserIcon size={11} className="shrink-0" />
+                      <span className="truncate">{item.creatorName}</span>
+                    </span>
+                  </>
+                )}
               </div>
 
               {/* 删除按钮 */}
@@ -1097,6 +1114,17 @@ export default function DiaryCenter() {
     loadStats();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // 工作区切换：重置游标后重新拉首屏 + 统计，保证跨 scope 切换时数据干净。
+  useEffect(() => {
+    const onWs = () => {
+      setNextCursor(null);
+      loadTimeline(true);
+      loadStats();
+    };
+    window.addEventListener("nowen:workspace-changed", onWs);
+    return () => window.removeEventListener("nowen:workspace-changed", onWs);
+  }, [loadTimeline, loadStats]);
 
   // 筛选变化 → 重新拉首屏 + 重新算统计。
   // 用 activeRange 的 from/to 字符串做依赖（而非对象引用），避免 useMemo 引用换了

@@ -1094,6 +1094,30 @@ if [ "$BUILD_ONLY" != "1" ]; then
     sync_root_pkg_version "$VERSION"
 fi
 
+# -------------------- 生成 CHANGELOG / README 区块 / public/changelog.json --------------------
+# 解析自上一个 v* tag 至 HEAD 之间的 conventional commits（feat/fix/docs/...），
+# 按分组写入：
+#   1) CHANGELOG.md       —— 单一真相源
+#   2) README.md / README.en.md 内的 <!-- CHANGELOG:BEGIN/END --> 区块
+#   3) frontend/public/changelog.json  —— 应用内「更新日志」Modal 的数据源
+# 仅在非 build-only 流程里跑；不影响 docker build 单跑场景。
+GEN_CHANGELOG_SCRIPT="${REPO_ROOT}/scripts/generate-changelog.mjs"
+if [ "$BUILD_ONLY" != "1" ] && [ -f "$GEN_CHANGELOG_SCRIPT" ]; then
+    info "生成 CHANGELOG / README 区块 / public/changelog.json"
+    GEN_ARGS=(
+        "$GEN_CHANGELOG_SCRIPT"
+        --version "$VERSION"
+        --write
+        --sync-readme
+        --emit-json
+    )
+    if [ "$DRY_RUN" = "1" ]; then
+        echo "  (dry-run) node ${GEN_ARGS[*]}"
+    else
+        run_argv node "${GEN_ARGS[@]}"
+    fi
+fi
+
 # -------------------- Android versionCode / versionName 同步 --------------------
 # frontend/android/app/build.gradle 里有硬编码的 `versionCode N` / `versionName "X"`，
 # 发版前必须改成本次 VERSION。versionCode 用 MAJOR*10000 + MINOR*100 + PATCH 生成
@@ -1925,6 +1949,12 @@ if [ "$DO_GIT_TAG" = "1" ]; then
     if [ -n "$(git status --porcelain -- frontend/android/app/build.gradle 2>/dev/null)" ]; then
         CHANGED_FILES+=( "frontend/android/app/build.gradle" )
     fi
+    # 由 generate-changelog.mjs 产生的 4 个文件，存在变更就一起进 commit
+    for f in CHANGELOG.md README.md README.en.md frontend/public/changelog.json; do
+        if [ -n "$(git status --porcelain -- "$f" 2>/dev/null)" ]; then
+            CHANGED_FILES+=( "$f" )
+        fi
+    done
     if [ "${#CHANGED_FILES[@]}" -gt 0 ]; then
         info "版本相关文件有变更，先 commit: ${CHANGED_FILES[*]}"
         if [ "$DRY_RUN" = "1" ]; then
@@ -2033,7 +2063,16 @@ if [ "$DO_GITHUB_RELEASE" = "1" ]; then
         NOTES_ARGS=( --notes "$RELEASE_NOTES" )
     else
         # 自动生成一份默认说明
-        AUTO_NOTES="Release ${VERSION_TAG}"$'\n\n'"Targets: ${TARGETS}"
+        # 优先取 generate-changelog.mjs --section 的输出（本版分组好的 markdown），
+        # 失败则退回到原始的 metadata 摘要。
+        AUTO_NOTES=""
+        if [ -f "$GEN_CHANGELOG_SCRIPT" ]; then
+            CHANGELOG_SECTION="$(node "$GEN_CHANGELOG_SCRIPT" --version "$VERSION" --section 2>/dev/null || true)"
+            if [ -n "$CHANGELOG_SECTION" ]; then
+                AUTO_NOTES="$CHANGELOG_SECTION"$'\n\n---\n'
+            fi
+        fi
+        AUTO_NOTES+="Release ${VERSION_TAG}"$'\n\n'"Targets: ${TARGETS}"
         if [ "$HAS_DOCKER" = "1" ]; then
             AUTO_NOTES+=$'\n\n'"Docker image: \`${IMAGE_NAME}:${VERSION_TAG}\`"
             [ "$DO_LATEST" = "1" ] && AUTO_NOTES+=$'\n'"Docker image: \`${IMAGE_NAME}:latest\`"

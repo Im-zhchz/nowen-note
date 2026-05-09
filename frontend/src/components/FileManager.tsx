@@ -49,6 +49,7 @@ import {
   Check,
   CheckSquare,
   Square,
+  Sparkles,
 } from "lucide-react";
 import { api, resolveAttachmentUrl } from "@/lib/api";
 import { FileItem, FileDetail, FileStats, FileSortKey, FileCategory } from "@/types";
@@ -120,7 +121,12 @@ function formatLocalTime(s: string): string {
 // 组件
 // ---------------------------------------------------------------------------
 
-type CategoryFilter = "all" | FileCategory;
+/**
+ * UI 侧的分类 Tab 值。在 FileCategory（"image" | "file"）基础上额外加：
+ *   - "all"          全部（不传 category / filter）
+ *   - "unreferenced" 孤儿视图（走 filter=unreferenced，category 不参与）
+ */
+type CategoryFilter = "all" | FileCategory | "unreferenced";
 
 const SORT_OPTIONS: Array<{ value: FileSortKey; label: string }> = [
   { value: "created_desc", label: "最新上传" },
@@ -171,6 +177,13 @@ export default function FileManager() {
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [batchDeleting, setBatchDeleting] = useState(false);
 
+  // 可回收空间（dryRun 扫出的"孤儿附件"汇总）：
+  //   顶部徽标展示"可清理 N 项 / 释放 X"，一键触发真清理。
+  //   挂载/上传/删除/清空回收站之后都会刷新。
+  //   不做轮询——只在明显会改变占用的操作后刷，避免 N+1 请求。
+  const [reclaimable, setReclaimable] = useState<{ items: number; bytes: number } | null>(null);
+  const [cleaningUp, setCleaningUp] = useState(false);
+
   // ---- 搜索防抖（300ms，避免每个字都打接口）----
   useEffect(() => {
     const h = setTimeout(() => {
@@ -190,16 +203,35 @@ export default function FileManager() {
     }
   }, []);
 
+  // ---- 扫描可回收空间（dryRun，不真改 DB/磁盘）----
+  // 走后端新增的 cleanup-orphans?dryRun=1，一次返回 DB 孤儿 + 内容孤儿 +
+  // 磁盘孤儿的合计字节数与数量。成本可接受（只扫 content，不写磁盘）。
+  const loadReclaimable = useCallback(async () => {
+    try {
+      const res = await api.dataFile.cleanupOrphans({ dryRun: true });
+      setReclaimable({ items: res.totalRemovedItems, bytes: res.totalFreedBytes });
+    } catch (err) {
+      // 扫描失败不打扰用户——徽标就不出现
+      console.warn("[FileManager] reclaimable scan failed:", err);
+      setReclaimable(null);
+    }
+  }, []);
+
   useEffect(() => {
     loadStats();
-  }, [loadStats]);
+    loadReclaimable();
+  }, [loadStats, loadReclaimable]);
 
   // ---- 拉列表（受 category / sort / searchQuery / page 驱动）----
   const loadList = useCallback(async () => {
     setLoading(true);
     try {
+      // category="unreferenced" 是 UI 上的伪分类，实际走后端 filter=unreferenced，
+      // 真正的 category 维度不参与（保持"孤儿"视图包含全部 MIME）。
+      const isOrphan = category === "unreferenced";
       const res = await api.files.list({
-        category: category === "all" ? undefined : category,
+        category: isOrphan ? undefined : category === "all" ? undefined : (category as FileCategory),
+        filter: isOrphan ? "unreferenced" : undefined,
         q: searchQuery || undefined,
         sort,
         page,
@@ -219,11 +251,75 @@ export default function FileManager() {
     loadList();
   }, [loadList]);
 
+  // ---- 一键清理孤儿附件（走真 cleanup）----
+  // 放在 loadList 之后声明，避免"使用前声明"的 TS 错误。
+  const handleCleanupOrphans = useCallback(async () => {
+    if (cleaningUp) return;
+    // 没有可回收的就不弹确认（按钮本来也不会出现，这里兜底）
+    if (reclaimable && reclaimable.items === 0) {
+      toast.success("没有可清理的孤儿附件");
+      return;
+    }
+    const sizeStr = reclaimable ? humanSize(reclaimable.bytes) : "";
+    const countStr = reclaimable ? reclaimable.items : "若干";
+    const ok = await confirmDialog({
+      title: "确定清理孤儿附件？",
+      description: `本次将清理 ${countStr} 个没有被任何笔记引用的附件，预计释放约 ${sizeStr}。刚上传 24 小时内的附件不会被清理。该操作不可撤销。`,
+      confirmText: "立即清理",
+      danger: true,
+    });
+    if (!ok) return;
+    setCleaningUp(true);
+    try {
+      const res = await api.dataFile.cleanupOrphans({ dryRun: false });
+      toast.success(
+        `已清理 ${res.totalRemovedItems} 个附件，释放 ${humanSize(res.totalFreedBytes)}`,
+      );
+      // 清理后刷新：列表 + 统计 + 可回收徽标
+      setPage(1);
+      loadList();
+      loadStats();
+      loadReclaimable();
+      // 广播：可能有别的视图（DataManager 的存储面板）也要同步
+      try {
+        window.dispatchEvent(new CustomEvent("nowen:storage-changed", { detail: { reason: "cleanup-orphans" } }));
+      } catch { /* ignore */ }
+    } catch (err: any) {
+      console.error("[FileManager] cleanup failed:", err);
+      toast.error(err?.message || "清理失败");
+    } finally {
+      setCleaningUp(false);
+    }
+  }, [cleaningUp, reclaimable, loadList, loadStats, loadReclaimable]);
+
+  // 工作区切换：清空多选 + 回到第 1 页，effect 链会自然触发 loadList/loadStats 重拉
+  useEffect(() => {
+    const onWs = () => {
+      setSelectedIds(new Set());
+      setPage(1);
+      loadStats();
+      loadReclaimable();
+      loadList();
+    };
+    // 跨组件的"空间占用变了"通知（清空回收站 / 数据库维护 等场景发）
+    const onStorage = () => {
+      loadStats();
+      loadReclaimable();
+      loadList();
+    };
+    window.addEventListener("nowen:workspace-changed", onWs);
+    window.addEventListener("nowen:storage-changed", onStorage);
+    return () => {
+      window.removeEventListener("nowen:workspace-changed", onWs);
+      window.removeEventListener("nowen:storage-changed", onStorage);
+    };
+  }, [loadStats, loadList, loadReclaimable]);
+
   // ---- 分类切换时重置到第 1 页 + 调整默认视图 ----
   const handleCategoryChange = useCallback((c: CategoryFilter) => {
     setCategory(c);
     setPage(1);
-    // 切到"文件"分类时默认列表视图；"图片" / "全部"默认网格视图。
+    // 切到"文件"分类时默认列表视图；"图片" / "全部" / "孤儿"默认网格视图。
     // 用户在同一分类里手动切换了视图就不再被覆盖（放在 effect 依赖外）。
     if (c === "file") setViewMode("list");
     else setViewMode("grid");
@@ -268,16 +364,17 @@ export default function FileManager() {
         await api.files.remove(id);
         toast.success("已删除");
         closeDetail();
-        // 本地列表即时剔除 + 刷统计
+        // 本地列表即时剔除 + 刷统计 + 刷可回收徽标
         setItems((prev) => prev.filter((it) => it.id !== id));
         setTotal((t) => Math.max(0, t - 1));
         loadStats();
+        loadReclaimable();
       } catch (err: any) {
         console.error("[FileManager] delete failed:", err);
         toast.error(err?.message || "删除失败");
       }
     },
-    [closeDetail, loadStats],
+    [closeDetail, loadStats, loadReclaimable],
   );
 
   // ---- 批量选择 ----
@@ -359,13 +456,14 @@ export default function FileManager() {
         );
       }
       loadStats();
+      loadReclaimable();
     } catch (err: any) {
       console.error("[FileManager] batch delete failed:", err);
       toast.error(err?.message || "批量删除失败");
     } finally {
       setBatchDeleting(false);
     }
-  }, [selectedIds, detailId, closeDetail, loadStats]);
+  }, [selectedIds, detailId, closeDetail, loadStats, loadReclaimable]);
 
   // 切换分类 / 搜索 / 排序 / 翻页时，已勾选的 id 可能不再在当前 items 里，
   // 体验上保留集合也容易让用户产生"幽灵勾选"。统一在这些维度变化时清空。
@@ -394,13 +492,14 @@ export default function FileManager() {
       setUploading(false);
       if (ok > 0) {
         toast.success(`已上传 ${ok} 个文件${fail > 0 ? `，失败 ${fail}` : ""}`);
-        // 重新拉首屏 + 刷统计
+        // 重新拉首屏 + 刷统计 + 刷可回收徽标（刚上传可能让旧孤儿的"宽限期"外延）
         setPage(1);
         loadList();
         loadStats();
+        loadReclaimable();
       }
     },
-    [loadList, loadStats],
+    [loadList, loadStats, loadReclaimable],
   );
 
   const onPickFiles = useCallback(() => {
@@ -602,6 +701,30 @@ export default function FileManager() {
           )}
         </Button>
 
+        {/* 可回收空间徽标：
+            - 仅在检测到"有可清理的孤儿"时显示（items>0），避免干扰正常使用；
+            - 点击触发真清理（含二次确认）；
+            - 扫描失败或还没扫完则不渲染，保持顶栏简洁。 */}
+        {reclaimable && reclaimable.items > 0 && (
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={handleCleanupOrphans}
+            disabled={cleaningUp}
+            className="shrink-0 text-amber-600 border-amber-500/40 hover:bg-amber-500/10 hover:text-amber-700 hover:border-amber-500/60"
+            title={`发现 ${reclaimable.items} 个没有被任何笔记引用的附件，可释放约 ${humanSize(reclaimable.bytes)}`}
+          >
+            {cleaningUp ? (
+              <Loader2 size={14} className="mr-1 animate-spin" />
+            ) : (
+              <Sparkles size={14} className="mr-1" />
+            )}
+            <span className="hidden sm:inline">可回收 </span>
+            <span>{humanSize(reclaimable.bytes)}</span>
+            <span className="ml-1 text-[10px] opacity-70">({reclaimable.items})</span>
+          </Button>
+        )}
+
         <Button size="sm" onClick={onPickFiles} disabled={uploading} className="shrink-0">
           {uploading ? <Loader2 size={14} className="animate-spin mr-1" /> : <Upload size={14} className="mr-1" />}
           {uploading ? "上传中" : "上传文件"}
@@ -623,6 +746,14 @@ export default function FileManager() {
             { key: "all", label: "全部", count: stats?.total ?? 0, icon: <Filter size={12} /> },
             { key: "image", label: "图片", count: stats?.images.count ?? 0, icon: <ImageIcon size={12} /> },
             { key: "file", label: "文件", count: stats?.files.count ?? 0, icon: <FileText size={12} /> },
+            // 孤儿（unreferenced）tab：高亮琥珀色，与顶栏"可回收"徽标视觉呼应；
+            // count 为 0 时也显示，方便用户确认"当前没有孤儿"。
+            {
+              key: "unreferenced",
+              label: "孤儿",
+              count: stats?.unreferenced?.count ?? 0,
+              icon: <Sparkles size={12} />,
+            },
           ] as const).map((tab) => (
             <button
               key={tab.key}
@@ -630,9 +761,18 @@ export default function FileManager() {
               className={cn(
                 "px-2.5 py-1 rounded-md flex items-center gap-1.5 transition-colors",
                 category === tab.key
-                  ? "bg-accent-primary/15 text-accent-primary"
-                  : "text-tx-secondary hover:bg-app-hover",
+                  ? tab.key === "unreferenced"
+                    ? "bg-amber-500/15 text-amber-600"
+                    : "bg-accent-primary/15 text-accent-primary"
+                  : tab.key === "unreferenced" && tab.count > 0
+                    ? "text-amber-600 hover:bg-amber-500/10"
+                    : "text-tx-secondary hover:bg-app-hover",
               )}
+              title={
+                tab.key === "unreferenced"
+                  ? "没有被任何笔记引用的附件（刚上传 24 小时内的不算）"
+                  : undefined
+              }
             >
               {tab.icon}
               <span>{tab.label}</span>

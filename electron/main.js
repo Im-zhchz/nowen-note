@@ -14,6 +14,11 @@ const { handleArgv, setupMacOpenFile, flushPending } = require("./fileAssoc");
 const { registerDiscoveryIpc, shutdown: shutdownDiscovery } = require("./discovery");
 const { setSettingsPath, readSettings, writeSettings } = require("./settings");
 const { openSetupWindow } = require("./setupWindow");
+const {
+  setCredentialsPath,
+  registerCredentialsIpc,
+  clear: clearCredentials,
+} = require("./credentials");
 
 // 日志 & 崩溃上报需尽早初始化（crashReporter.start 建议在 ready 之前）
 initLogger({
@@ -102,6 +107,24 @@ function getBackendEntry() {
     return path.join(process.resourcesPath, "backend", "dist", "index.js");
   }
   return path.join(__dirname, "..", "backend", "dist", "index.js");
+}
+
+/**
+ * 当前是否为"Lite-only 发行版"：打包产物内不含 backend。
+ *
+ * 判断依据：
+ *   1. 环境变量 NOWEN_LITE_ONLY=1（CI / 调试可强制声明）
+ *   2. 已 packaged 但 backend/dist/index.js 不存在（lite builder.config 剥掉了 backend）
+ * 开发环境下始终返回 false，避免误切。
+ */
+function isLiteOnlyBuild() {
+  if (process.env.NOWEN_LITE_ONLY === "1") return true;
+  if (!app.isPackaged) return false;
+  try {
+    return !fs.existsSync(getBackendEntry());
+  } catch {
+    return false;
+  }
 }
 
 function getFrontendDist() {
@@ -271,14 +294,20 @@ function safeHost(url) {
 
 // Lite 启动失败后的恢复路径：让用户选择"换服务器 / 回到本地模式 / 退出"
 async function offerLiteRecovery() {
+  const liteOnly = isLiteOnlyBuild();
+  const buttons = liteOnly
+    ? ["更换服务器…", "退出"]
+    : ["更换服务器…", "回到本地模式", "退出"];
   const r = await dialog.showMessageBox({
     type: "warning",
-    buttons: ["更换服务器…", "回到本地模式", "退出"],
+    buttons,
     defaultId: 0,
-    cancelId: 2,
+    cancelId: buttons.length - 1,
     title: "无法连接到远端服务",
     message: `远端服务 ${safeHost(currentRemoteUrl)} 当前不可达。`,
-    detail: "你可以更换服务器、切回内置本地模式，或者退出应用稍后再试。",
+    detail: liteOnly
+      ? "当前是轻量发行版，只能连接远端服务。你可以更换服务器或退出稍后再试。"
+      : "你可以更换服务器、切回内置本地模式，或者退出应用稍后再试。",
   });
   if (r.response === 0) {
     const sel = await openSetupWindow({ initialUrl: currentRemoteUrl });
@@ -289,7 +318,7 @@ async function offerLiteRecovery() {
     } else {
       app.quit();
     }
-  } else if (r.response === 1) {
+  } else if (!liteOnly && r.response === 1) {
     writeSettings({ mode: "full", remoteUrl: "" });
     await clearWebStorage();
     relaunchApp();
@@ -496,6 +525,9 @@ function createWindow() {
       nodeIntegration: false,
       contextIsolation: true,
       preload: path.join(__dirname, "preload.js"),
+      // 通过 additionalArguments 把 lite-only 标识带给 preload.js
+      // （preload 里读 process.env.NOWEN_LITE_ONLY；sandbox 关闭时可用 env）
+      additionalArguments: isLiteOnlyBuild() ? ["--nowen-lite-only"] : [],
     },
   });
 
@@ -626,6 +658,9 @@ async function clearWebStorage() {
   } catch (e) {
     console.warn("[mode-switch] clearStorageData failed:", e?.message || e);
   }
+  // 切服务器 / 切模式 = 旧凭据已无效，连同"记住密码"一起清掉，
+  // 否则下次自动登录会打到旧服务器。
+  try { clearCredentials(); } catch { /* ignore */ }
 }
 
 function relaunchApp() {
@@ -659,6 +694,16 @@ async function switchToLite(parentWin) {
  * 切换到 Full（本地）模式。
  */
 async function switchToFull() {
+  if (isLiteOnlyBuild()) {
+    dialog.showMessageBox(mainWindow || undefined, {
+      type: "info",
+      buttons: ["知道了"],
+      title: "轻量端不支持切换",
+      message: "当前是"轻量发行版"，不包含本地后端。",
+      detail: "如需使用本地后端，请下载完整版安装包。",
+    });
+    return;
+  }
   const choice = await dialog.showMessageBox(mainWindow || undefined, {
     type: "question",
     buttons: ["切换", "取消"],
@@ -847,11 +892,35 @@ setupMacOpenFile(() => mainWindow);
 app.whenReady().then(async () => {
   // 先把 settings 路径定下来（依赖 app.getPath("userData")，必须 ready 后调）
   setSettingsPath(getUserDataPath());
+  setCredentialsPath(getUserDataPath());
+  const liteOnly = isLiteOnlyBuild();
   const settings = readSettings();
   currentMode = settings.mode;
   currentRemoteUrl = settings.remoteUrl;
+
+  // Lite-only 包强制使用 lite 模式：哪怕用户手改 settings.json 为 full 也纠正回来
+  if (liteOnly && currentMode !== "lite") {
+    console.log("[Electron] lite-only build detected, forcing mode=lite");
+    currentMode = "lite";
+    writeSettings({ mode: "lite", remoteUrl: currentRemoteUrl });
+  }
+
+  // Lite-only 首启没有服务器地址：立刻弹 setup 窗口
+  if (liteOnly && currentMode === "lite" && !currentRemoteUrl) {
+    console.log("[Electron] lite-only first launch, opening setup window");
+    registerDiscoveryIpc(); // setup 依赖
+    const r = await openSetupWindow({ initialUrl: "" });
+    if (!r.ok) {
+      // 用户取消 → 直接退出
+      app.quit();
+      return;
+    }
+    currentRemoteUrl = r.url;
+    writeSettings({ mode: "lite", remoteUrl: r.url });
+  }
+
   console.log(
-    `[Electron] mode=${currentMode}` +
+    `[Electron] mode=${currentMode}${liteOnly ? " (lite-only build)" : ""}` +
       (currentMode === "lite" ? ` remoteUrl=${currentRemoteUrl}` : "")
   );
 
@@ -891,6 +960,7 @@ app.whenReady().then(async () => {
     onCheckForUpdates: () => checkForUpdatesManually(),
     openAboutWindow,
     mode: currentMode,
+    liteOnly: isLiteOnlyBuild(),
     onSwitchToLite: () => switchToLite(mainWindow),
     onSwitchToFull: () => switchToFull(),
     onChangeServer: () => changeRemoteServer(),
@@ -942,6 +1012,7 @@ app.whenReady().then(async () => {
       }
     },
     mode: currentMode,
+    liteOnly: isLiteOnlyBuild(),
     onSwitchToLite: () => switchToLite(mainWindow),
     onSwitchToFull: () => switchToFull(),
     onChangeServer: () => changeRemoteServer(),
@@ -949,6 +1020,7 @@ app.whenReady().then(async () => {
 
   // IPC
   registerAppIpc();
+  registerCredentialsIpc();
   // 局域网服务发现的 IPC 已在更早处注册（setup 窗口依赖它）；这里不重复注册
 
   // 自动更新（生产环境生效）

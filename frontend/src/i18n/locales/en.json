@@ -23,7 +23,9 @@
     "needNotebookFirstTitle": "No Notebooks",
     "createNotebookNow": "Create Notebook",
     "selectNotebook": "Select Notebook",
-    "selectNotebookHint": "Please choose which notebook this note belongs to"
+    "selectNotebookHint": "Please choose which notebook this note belongs to",
+    "createdBy": "by {{name}}",
+    "unknownUser": "Unknown user"
   },
   "auth": {
     "verifying": "Verifying identity...",
@@ -36,6 +38,8 @@
     "usernamePlaceholder": "Enter username",
     "password": "Password",
     "loginButton": "Sign In",
+    "rememberMe": "Remember me",
+    "autoLogin": "Sign in automatically next time",
     "defaultCredentials": "Default: admin / admin123",
     "serverAddress": "Server Address",
     "serverPlaceholder": "e.g. 192.168.1.100:3001 or note.example.com",
@@ -290,6 +294,13 @@
     "imageUploading": "Uploading image...",
     "imageUploadSuccess": "Image uploaded",
     "imageUploadFailed": "Image upload failed",
+    "rtfRescueProcessing": "Processing {{count}} image(s) from pasted content...",
+    "rtfRescueDone": "Pasted {{count}} image(s)",
+    "rtfRescueUploading": "Uploading images to server ({{done}}/{{total}})...",
+    "rtfRescueUploadDone": "Uploaded {{uploaded}}/{{total}} image(s)",
+    "rtfRescueUploadPartial": "Uploaded {{uploaded}}/{{total}}, {{failed}} failed",
+    "imagesNotLoaded": "{{count}} image(s) were not fully loaded and got dropped. Please wait until all images are visible on the source page before copying.",
+    "wordImagesNotPastable": "{{count}} Word image(s) could not be pasted (when copying large selections, Word leaves only local temp paths on the clipboard). Try: 1) copy a few paragraphs + images at a time; 2) or use Data Manager → Import Word.",
     "imageSize25": "25%",
     "imageSize50": "50%",
     "imageSize75": "75%",
@@ -615,7 +626,7 @@
       "maintenanceDescription": "Clean up orphan attachments (physical files) and compact the database to reclaim disk space. Recommended after emptying the trash.",
       "cleanupOrphansButton": "Clean orphan attachments",
       "cleaningOrphans": "Cleaning...",
-      "cleanupOrphansSuccess": "Done: DB rows {{dbRows}}, linked files {{dbFiles}}; disk orphans {{diskFiles}} ({{diskSize}})",
+      "cleanupOrphansSuccess": "Done: DB orphans {{dbRows}} (files {{dbFiles}}), content orphans {{contentRows}} (files {{contentFiles}}), disk orphans {{diskFiles}}; freed {{totalSize}}",
       "cleanupOrphansFailed": "Cleanup failed: {{error}}",
       "vacuumButton": "Compact database",
       "vacuuming": "Compacting...",
@@ -1183,7 +1194,20 @@
     "sponsorAction": "Show QR code",
     "sponsorCollapse": "Hide",
     "sponsorTip": "Scan with WeChat · buy the author a keyboard / a bug fix",
-    "madeWith": "Made with ❤️"
+    "madeWith": "Made with ❤️",
+    "changelog": "What's New",
+    "changelogDesc": "See this release's new features and past fixes",
+    "viewChangelog": "View updates"
+  },
+  "whatsNew": {
+    "title": "What's New",
+    "currentVersion": "Current version",
+    "newBadge": "NEW",
+    "empty": "No release notes yet",
+    "loadFailed": "Failed to load release notes",
+    "viewOnGithub": "View all releases on GitHub",
+    "viewAll": "View full history",
+    "gotIt": "Got it"
   },
   "versions": {
     "title": "Version History",

@@ -2,10 +2,11 @@ import React, { useState, useEffect, useCallback, useRef, useMemo } from "react"
 import {
   BrainCircuit, Plus, Trash2, Edit2,
   ZoomIn, ZoomOut, Maximize2,
-  Loader2, Check, Map, Menu, PanelLeftClose, Image, FileImage, FileDown
+  Loader2, Check, Map, Menu, PanelLeftClose, Image, FileImage, FileDown,
+  User as UserIcon
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
-import { api } from "@/lib/api";
+import { api, getCurrentWorkspace } from "@/lib/api";
 import { MindMap, MindMapListItem, MindMapNode, MindMapData } from "@/types";
 import { cn } from "@/lib/utils";
 
@@ -322,6 +323,10 @@ function MindMapListRow({
   const date = new Date(item.updatedAt + (item.updatedAt.endsWith("Z") ? "" : "Z"));
   const dateStr = date.toLocaleDateString();
   const longPressTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // 工作区下展示创建者（与 Note/Task/Diary 一致）。User 图标本身具语义，
+  // 此处不再额外加 i18n 文案前缀，节省横向空间。
+  const showCreator =
+    !!item.creatorName && getCurrentWorkspace() !== "personal";
 
   return (
     <div
@@ -364,7 +369,21 @@ function MindMapListRow({
       <BrainCircuit size={18} className="text-indigo-500 flex-shrink-0" />
       <div className="flex-1 min-w-0">
         <div className="text-sm font-medium text-tx-primary truncate">{item.title}</div>
-        <div className="text-xs text-tx-tertiary mt-0.5">{dateStr}</div>
+        <div className="flex items-center gap-2 text-xs text-tx-tertiary mt-0.5 min-w-0">
+          <span className="shrink-0">{dateStr}</span>
+          {showCreator && (
+            <>
+              <span className="text-tx-tertiary/60 shrink-0">·</span>
+              <span
+                className="flex items-center gap-1 truncate"
+                title={item.creatorName ?? ""}
+              >
+                <UserIcon size={11} className="shrink-0" />
+                <span className="truncate">{item.creatorName}</span>
+              </span>
+            </>
+          )}
+        </div>
       </div>
       <button
         onClick={(e) => { e.stopPropagation(); onDelete(); }}
@@ -426,6 +445,19 @@ export default function MindMapCenter() {
 
   useEffect(() => {
     loadMaps();
+  }, [loadMaps]);
+
+  // 工作区切换：清空当前打开的导图 + 重拉列表，避免显示其他 scope 的图
+  useEffect(() => {
+    const onWs = () => {
+      setActiveMap(null);
+      setMapData(null);
+      setSelectedNodeId(null);
+      setEditingNodeId(null);
+      loadMaps();
+    };
+    window.addEventListener("nowen:workspace-changed", onWs);
+    return () => window.removeEventListener("nowen:workspace-changed", onWs);
   }, [loadMaps]);
 
   // 选择一个导图

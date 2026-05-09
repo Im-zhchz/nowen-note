@@ -23,7 +23,9 @@
     "needNotebookFirstTitle": "暂无笔记本",
     "createNotebookNow": "创建笔记本",
     "selectNotebook": "选择笔记本",
-    "selectNotebookHint": "请选择这篇笔记所属的笔记本"
+    "selectNotebookHint": "请选择这篇笔记所属的笔记本",
+    "createdBy": "由 {{name}} 创建",
+    "unknownUser": "未知用户"
   },
   "auth": {
     "verifying": "正在验证身份...",
@@ -36,6 +38,8 @@
     "usernamePlaceholder": "请输入用户名",
     "password": "密码",
     "loginButton": "登录工作台",
+    "rememberMe": "记住密码",
+    "autoLogin": "下次自动登录",
     "defaultCredentials": "默认账号: admin / admin123",
     "serverAddress": "服务器地址",
     "serverPlaceholder": "例如: 192.168.1.100:3001 或 note.example.com",
@@ -297,6 +301,13 @@
     "imageUploading": "正在上传图片...",
     "imageUploadSuccess": "图片上传成功",
     "imageUploadFailed": "图片上传失败",
+    "rtfRescueProcessing": "正在处理粘贴内容中的 {{count}} 张图片...",
+    "rtfRescueDone": "已粘贴 {{count}} 张图片",
+    "rtfRescueUploading": "正在上传图片到服务器 ({{done}}/{{total}})...",
+    "rtfRescueUploadDone": "已上传 {{uploaded}}/{{total}} 张图片",
+    "rtfRescueUploadPartial": "已上传 {{uploaded}}/{{total}} 张，{{failed}} 张失败",
+    "imagesNotLoaded": "有 {{count}} 张图片未加载完，已丢失。请在原网页等图片全部显示后再复制",
+    "wordImagesNotPastable": "有 {{count}} 张 Word 图片未能粘贴进来（全选长文时 Word 不会把图片放进剪贴板，只留本地临时路径）。可尝试：1) 每次只选几段带图片分次复制；2) 或使用 数据管理 → 导入 Word 文档",
     "imageSize25": "25%",
     "imageSize50": "50%",
     "imageSize75": "75%",
@@ -622,7 +633,7 @@
       "maintenanceDescription": "清理孤儿附件（物理文件）并压缩数据库，真正释放磁盘空间。建议在清空回收站后执行一次。",
       "cleanupOrphansButton": "清理孤儿附件",
       "cleaningOrphans": "清理中...",
-      "cleanupOrphansSuccess": "清理完成：DB 行 {{dbRows}} 条、关联文件 {{dbFiles}} 个；磁盘孤儿文件 {{diskFiles}} 个（{{diskSize}}）",
+      "cleanupOrphansSuccess": "清理完成：DB 孤儿 {{dbRows}} 条（含文件 {{dbFiles}} 个）、内容孤儿 {{contentRows}} 条（含文件 {{contentFiles}} 个）、磁盘孤儿 {{diskFiles}} 个；共释放 {{totalSize}}",
       "cleanupOrphansFailed": "清理失败：{{error}}",
       "vacuumButton": "压缩数据库",
       "vacuuming": "压缩中...",
@@ -1192,7 +1203,20 @@
     "sponsorAction": "展开赞赏码",
     "sponsorCollapse": "收起",
     "sponsorTip": "微信扫一扫 · 支持作者买键盘 / 修 Bug",
-    "madeWith": "用 ❤️ 打造"
+    "madeWith": "用 ❤️ 打造",
+    "changelog": "更新日志",
+    "changelogDesc": "查看本版新功能与历次修复",
+    "viewChangelog": "查看更新"
+  },
+  "whatsNew": {
+    "title": "更新日志",
+    "currentVersion": "当前版本",
+    "newBadge": "本次更新",
+    "empty": "暂无更新记录",
+    "loadFailed": "更新日志加载失败",
+    "viewOnGithub": "在 GitHub 查看所有版本",
+    "viewAll": "查看完整历史",
+    "gotIt": "我知道了"
   },
   "versions": {
     "title": "版本历史",

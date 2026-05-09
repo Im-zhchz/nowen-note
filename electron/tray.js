@@ -35,11 +35,14 @@ function createTray(deps) {
   tray.setToolTip("Nowen Note");
 
   const isLite = deps.mode === "lite";
+  const liteOnly = !!deps.liteOnly;
   // 模式相关项：与系统菜单的"模式"子菜单保持一致
   const modeItems = isLite
     ? [
         { label: "更换服务器…", click: () => deps.onChangeServer?.() },
-        { label: "切换到本地模式", click: () => deps.onSwitchToFull?.() },
+        ...(liteOnly
+          ? []
+          : [{ label: "切换到本地模式", click: () => deps.onSwitchToFull?.() }]),
       ]
     : [
         { label: "切换到轻量模式…", click: () => deps.onSwitchToLite?.() },
@@ -59,7 +62,7 @@ function createTray(deps) {
     },
     { type: "separator" },
     {
-      label: `当前模式：${isLite ? "轻量（远端）" : "本地"}`,
+      label: `当前模式：${isLite ? (liteOnly ? "轻量发行版" : "轻量（远端）") : "本地"}`,
       submenu: modeItems,
     },
     { type: "separator" },

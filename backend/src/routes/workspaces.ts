@@ -24,7 +24,10 @@ import { getDb } from "../db/schema";
 import {
   getUserWorkspaceRole,
   requireWorkspaceRole,
+  resolveWorkspaceFeatures,
   WorkspaceRole,
+  type EnabledFeaturesConfig,
+  type WorkspaceFeature,
 } from "../middleware/acl";
 
 const app = new Hono();
@@ -380,6 +383,70 @@ app.post("/join", async (c) => {
 
   const ws = db.prepare("SELECT * FROM workspaces WHERE id = ?").get(invite.workspaceId);
   return c.json({ success: true, workspace: ws, role: invite.role });
+});
+
+// ===================== 功能开关（Phase 1）=====================
+//
+// GET  /api/workspaces/:id/features  - 任何成员可读（侧边栏渲染需要）
+// PUT  /api/workspaces/:id/features  - 仅 owner 可写（owner 决定启用哪些模块）
+//
+// 存储格式：workspaces.enabledFeatures 是 TEXT（JSON 字符串或空串）。
+// 空串视为"未配置 = 全开"，这样老工作区无需数据迁移就能正常用。
+// 白名单校验：只接受已知的 feature 键，防止前端乱写污染 DB。
+
+const FEATURE_KEYS: WorkspaceFeature[] = [
+  "notes",
+  "diaries",
+  "tasks",
+  "mindmaps",
+  "files",
+  "favorites",
+];
+
+app.get("/:id/features", (c) => {
+  const userId = c.req.header("X-User-Id") || "";
+  const id = c.req.param("id");
+
+  // 任何成员都可以读（侧边栏需要据此决定显隐）
+  const role = getUserWorkspaceRole(id, userId);
+  if (!role) return c.json({ error: "无权访问该工作区" }, 403);
+
+  const features = resolveWorkspaceFeatures(id);
+
+  // 统一回填默认值 true，前端拿到的永远是完整形态，省得各处再做 undefined=true 的容错
+  const normalized: Record<WorkspaceFeature, boolean> = {} as any;
+  for (const k of FEATURE_KEYS) {
+    normalized[k] = features[k] !== false;
+  }
+  return c.json(normalized);
+});
+
+app.put("/:id/features", requireWorkspaceRole("owner"), async (c) => {
+  const db = getDb();
+  const id = c.req.param("id");
+  const body = (await c.req.json()) as Partial<Record<string, unknown>>;
+
+  // 白名单 + 类型过滤：只接受 boolean 值的已知键
+  const sanitized: EnabledFeaturesConfig = {};
+  for (const k of FEATURE_KEYS) {
+    const v = body?.[k];
+    if (typeof v === "boolean") sanitized[k] = v;
+  }
+
+  // 与老配置合并：允许 PATCH 语义（只传 {tasks:false} 就只改 tasks）
+  const current = resolveWorkspaceFeatures(id);
+  const merged: EnabledFeaturesConfig = { ...current, ...sanitized };
+
+  db.prepare(
+    "UPDATE workspaces SET enabledFeatures = ?, updatedAt = datetime('now') WHERE id = ?",
+  ).run(JSON.stringify(merged), id);
+
+  // 返回归一化后的完整形态，便于前端直接替换缓存
+  const normalized: Record<WorkspaceFeature, boolean> = {} as any;
+  for (const k of FEATURE_KEYS) {
+    normalized[k] = merged[k] !== false;
+  }
+  return c.json(normalized);
 });
 
 export default app;

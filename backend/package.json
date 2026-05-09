@@ -3,7 +3,8 @@
   "version": "1.0.0",
   "scripts": {
     "dev": "tsx watch src/index.ts",
-    "build": "tsc",
+    "build": "node build.bundle.mjs",
+    "build:tsc": "tsc",
     "start": "node dist/index.js",
     "migrate:inline-images": "node ../scripts/migrate-inline-images-to-attachments.mjs",
     "migrate:inline-images:apply": "node ../scripts/migrate-inline-images-to-attachments.mjs --apply"
