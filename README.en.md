@@ -123,7 +123,26 @@ If this project helps you, feel free to scan the QR code and buy the author a co
 
 > 最近 2 个版本的更新内容，完整历史见 [CHANGELOG.md](./CHANGELOG.md)。
 
-### v1.0.32 - 2026-05-08
+### v1.0.32 - 2026-05-09
+
+### ✨ 新增
+
+- **release**: wire NOWEN_BUILD_TIME/APP_VERSION into Docker, add lite/clipper targets (d3ab15f)
+- **update**: tighten cross-platform update flow (8b56551)
+- **update**: in-app update notifier & clipper pack tweaks (1ba6730)
+- **about**: add sponsor QR card in Settings -> About (9f78cd3)
+
+### 🐛 修复
+
+- bug (de5b1dc)
+- **update**: suppress banner when appVersion already matches (127c1ee)
+- **notes**: enforce workspace isolation on note move (a783d31)
+- **clipper**: derive firefox manifest from chrome manifest (bef9e82)
+- **attachments**: inherit workspaceId from note on upload (65a71cd)
+
+### 📝 文档
+
+- document fpk one-click install for fnOS (6d7c588)
 
 ### ✨ 新增
 
