@@ -16,7 +16,7 @@ import { common, createLowlight } from "lowlight";
 import { DOMParser as ProseMirrorDOMParser, Node as ProseMirrorNode } from "@tiptap/pm/model";
 import { TextSelection } from "@tiptap/pm/state";
 import { markdownToSimpleHtml } from "@/lib/importService";
-import { markdownToHtml as mdToFullHtml, detectFormat as detectContentFormat } from "@/lib/contentFormat";
+import { markdownToHtml as mdToFullHtml, detectFormat as detectContentFormat, tiptapJsonToMarkdown } from "@/lib/contentFormat";
 import { api } from "@/lib/api";
 import { extractRtfImagesAsync } from "@/lib/rtfImageWorkerClient";
 import { replaceDataUrlImagesWithAttachments } from "@/lib/rtfImageUploader";
@@ -2293,8 +2293,32 @@ export default forwardRef<NoteEditorHandle, TiptapEditorProps>(function TiptapEd
   const openAIAssistant = useCallback(() => {
     if (!editor) return;
     const { from, to } = editor.state.selection;
-    const selected = editor.state.doc.textBetween(from, to, " ");
-    setAiSelectedText(selected || editor.getText().slice(0, 500));
+
+    // ⚠️ 关键修复：不要用 doc.textBetween(from, to) ——它只提取 text 节点的
+    // 纯文本，会把 link mark、image 节点、bold/italic 等格式全部丢弃。
+    // 用户选中带链接 / 图片的内容让 AI "Markdown 格式化"时，AI 收到的是
+    // 已经丢失链接 URL 和图片 URL 的纯文本，再怎么排版也补不回来 → 替换
+    // 写回后链接/图片消失（issue：AI 写作助手 markdown 格式化丢链接图片）。
+    //
+    // 正确做法：用 doc.cut(from, to) 把选区切成一个合法的子文档 Node
+    // （PM 会自动补齐开放的 block 节点），再走 tiptap JSON → HTML →
+    // Markdown 链路。这条链路在 MarkdownEditor 那边天然没问题（因为它
+    // 本身就是 Markdown 源码字符串），现在 Tiptap 侧也对齐到 Markdown。
+    // 这样 AI 拿到的就是 `[text](url)` / `![alt](url)` 形式，能完整保留。
+    let selectedMd = "";
+    if (from < to) {
+      try {
+        const sliceDoc = editor.state.doc.cut(from, to);
+        selectedMd = tiptapJsonToMarkdown(sliceDoc.toJSON()).trim();
+      } catch (err) {
+        console.warn("[TiptapEditor] selection → markdown failed, fallback to textBetween:", err);
+      }
+    }
+    // 兜底：若 Markdown 序列化失败或选区为空，退回纯文本（至少不崩）
+    if (!selectedMd) {
+      selectedMd = editor.state.doc.textBetween(from, to, " ");
+    }
+    setAiSelectedText(selectedMd || editor.getText().slice(0, 500));
 
     // 获取选区在屏幕上的位置
     const coords = editor.view.coordsAtPos(from);
@@ -2926,7 +2950,19 @@ export default forwardRef<NoteEditorHandle, TiptapEditorProps>(function TiptapEd
         {showAI && (
           <AIWritingAssistant
             selectedText={aiSelectedText}
-            fullText={editor?.getText() || ""}
+            // fullText 作为上下文传给 AI（截前 2000 字），同样用 Markdown
+            // 序列化而非 editor.getText()，保留链接 / 图片 URL，让 AI 在
+            // 续写、改写等任务里也能感知到这些资源。失败时回退到纯文本。
+            fullText={(() => {
+              if (!editor) return "";
+              try {
+                const md = tiptapJsonToMarkdown(editor.getJSON());
+                if (md) return md;
+              } catch (err) {
+                console.warn("[TiptapEditor] fullText → markdown failed:", err);
+              }
+              return editor.getText();
+            })()}
             onInsert={handleAIInsert}
             onReplace={handleAIReplace}
             onClose={() => setShowAI(false)}
@@ -3116,6 +3152,14 @@ function looksLikeCode(text: string): boolean {
  * 通过匹配多种 Markdown 语法特征来判断
  */
 function looksLikeMarkdown(text: string): boolean {
+  // 短路：图片 / 链接 Markdown 语法在自然文本里几乎不会自然出现，一旦
+  // 命中立刻判定为 Markdown。这是为了配合 AI 写作助手的"格式化"路径：
+  // 若用户只选了一段含链接的短文本，AI 输出依然可能是单段，按下方累计
+  // 评分仅 1~2 分（链接 +1、粗体 +1）拿不到 3 分阈值，就会被当纯文本
+  // 插入 → 链接 URL 被吞掉。这条短路把这种情况兜住。
+  if (/!\[[^\]]*\]\([^)\s]+(?:\s+"[^"]*")?\)/.test(text)) return true;  // 图片 ![](url)
+  if (/(?<!!)\[[^\]]+\]\([^)\s]+(?:\s+"[^"]*")?\)/.test(text)) return true;  // 链接 [](url)
+
   const lines = text.split("\n");
   let score = 0;
 
