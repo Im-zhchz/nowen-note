@@ -451,6 +451,10 @@ function QuickAdd({
   const { t } = useTranslation();
   const fileRef = useRef<HTMLInputElement>(null);
   const [uploading, setUploading] = useState(false);
+  // 拖拽态：把整条输入框做成 dropzone，与 onPaste 粘贴图片体验对齐。
+  // 用 counter 处理 enter/leave 的子节点冒泡（缩略图、按钮等）抖动问题。
+  const [dragOver, setDragOver] = useState(false);
+  const dragCounter = useRef(0);
   // 已上传但还未与任务绑定的"孤儿附件 id" —— 用于：
   //   1) 在输入框旁渲染缩略图供用户预览/移除；
   //   2) 提交任务后调用 bind 把它们绑回新创建的 task。
@@ -547,7 +551,43 @@ function QuickAdd({
   };
 
   return (
-    <div className="px-4 py-2.5 rounded-lg border border-dashed border-app-border bg-app-elevated/50 hover:border-accent-primary/40 transition-colors">
+    <div
+      className={cn(
+        "px-4 py-2.5 rounded-lg border border-dashed bg-app-elevated/50 transition-colors",
+        dragOver
+          ? "border-accent-primary bg-accent-primary/5 ring-2 ring-accent-primary/30"
+          : "border-app-border hover:border-accent-primary/40",
+      )}
+      onDragEnter={(e) => {
+        if (!e.dataTransfer.types.includes("Files")) return;
+        e.preventDefault();
+        dragCounter.current++;
+        setDragOver(true);
+      }}
+      onDragOver={(e) => {
+        if (e.dataTransfer.types.includes("Files")) {
+          e.preventDefault();
+          e.dataTransfer.dropEffect = "copy";
+        }
+      }}
+      onDragLeave={() => {
+        dragCounter.current--;
+        if (dragCounter.current <= 0) {
+          dragCounter.current = 0;
+          setDragOver(false);
+        }
+      }}
+      onDrop={(e) => {
+        e.preventDefault();
+        dragCounter.current = 0;
+        setDragOver(false);
+        // accept="image/*" 与 input 对齐：拖入非图片直接忽略
+        const files = Array.from(e.dataTransfer.files || []).filter(
+          (f) => f.type.startsWith("image/"),
+        );
+        if (files.length > 0) void uploadFiles(files);
+      }}
+    >
       <div className="flex items-center gap-3">
         <Plus size={16} className="text-tx-tertiary flex-shrink-0" />
         <input

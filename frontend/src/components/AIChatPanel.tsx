@@ -188,9 +188,9 @@ export default function AIChatPanel({ onClose, onNavigateToNote }: {
   const [docFileName, setDocFileName] = useState("");
   const docInputRef = useRef<HTMLInputElement>(null);
 
-  const handleDocUpload = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
+  // 真正的"处理一个文件"逻辑。抽出来是为了让 <input type=file> change
+  // 和拖拽 drop 两条入口走同一段代码——避免逻辑分叉。
+  const doParseDocument = useCallback(async (file: File) => {
     setDocParsing(true);
     setDocFileName(file.name);
     setDocResult(null);
@@ -205,6 +205,12 @@ export default function AIChatPanel({ onClose, onNavigateToNote }: {
     }
   }, []);
 
+  const handleDocUpload = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    void doParseDocument(file);
+  }, [doParseDocument]);
+
   const handleCopyMarkdown = useCallback(() => {
     if (docResult) {
       navigator.clipboard.writeText(docResult);
@@ -216,13 +222,13 @@ export default function AIChatPanel({ onClose, onNavigateToNote }: {
   const [importResult, setImportResult] = useState<string | null>(null);
   const importInputRef = useRef<HTMLInputElement>(null);
 
-  const handleKnowledgeImport = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const files = e.target.files;
-    if (!files || files.length === 0) return;
+  // 同样抽出"接收一组 File"的核心逻辑，让点击和拖拽复用
+  const doKnowledgeImport = useCallback(async (files: File[]) => {
+    if (files.length === 0) return;
     setImportLoading(true);
     setImportResult(null);
     try {
-      const result = await api.importToKnowledge(Array.from(files));
+      const result = await api.importToKnowledge(files);
       setImportResult(t("aiChat.importSuccess", { success: result.success, failed: result.failed }));
       // 刷新统计
       api.getKnowledgeStats().then(setStats).catch(() => {});
@@ -233,6 +239,83 @@ export default function AIChatPanel({ onClose, onNavigateToNote }: {
       if (importInputRef.current) importInputRef.current.value = "";
     }
   }, [t]);
+
+  const handleKnowledgeImport = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = e.target.files;
+    if (!files || files.length === 0) return;
+    void doKnowledgeImport(Array.from(files));
+  }, [doKnowledgeImport]);
+
+  // ===== 拖拽上传支持 =====
+  // 把两个上传卡片本身做成 dropzone：拖文件进去时高亮边框，松手即触发
+  // 与点击按钮完全一致的处理流程（共用 doParseDocument / doKnowledgeImport）。
+  // 用 counter 记 enter/leave 是因为子节点会冒泡 dragleave，单纯靠 boolean
+  // 会在子元素切换时闪烁；累计计数能正确处理嵌套。
+  const [docDragOver, setDocDragOver] = useState(false);
+  const docDragCounter = useRef(0);
+  const [importDragOver, setImportDragOver] = useState(false);
+  const importDragCounter = useRef(0);
+
+  // 按后缀名过滤拖入的文件。dragover 阶段拿不到文件名（仅有 dataTransfer.items
+  // 的 kind/type），所以高亮总是显示——真正过滤放在 drop 阶段。
+  const filterByExt = useCallback((files: File[], accept: string): File[] => {
+    const exts = accept.split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
+    if (exts.length === 0) return files;
+    return files.filter(f => {
+      const name = f.name.toLowerCase();
+      return exts.some(ext => name.endsWith(ext));
+    });
+  }, []);
+
+  const makeDropHandlers = useCallback(
+    (
+      setOver: (v: boolean) => void,
+      counterRef: React.MutableRefObject<number>,
+      onFiles: (files: File[]) => void,
+      accept: string,
+    ) => ({
+      onDragEnter: (e: React.DragEvent) => {
+        if (!e.dataTransfer.types.includes("Files")) return;
+        e.preventDefault();
+        counterRef.current++;
+        setOver(true);
+      },
+      onDragOver: (e: React.DragEvent) => {
+        if (e.dataTransfer.types.includes("Files")) {
+          e.preventDefault();
+          e.dataTransfer.dropEffect = "copy";
+        }
+      },
+      onDragLeave: () => {
+        counterRef.current--;
+        if (counterRef.current <= 0) {
+          counterRef.current = 0;
+          setOver(false);
+        }
+      },
+      onDrop: (e: React.DragEvent) => {
+        e.preventDefault();
+        counterRef.current = 0;
+        setOver(false);
+        const files = filterByExt(Array.from(e.dataTransfer.files || []), accept);
+        if (files.length > 0) onFiles(files);
+      },
+    }),
+    [filterByExt],
+  );
+
+  const docDropHandlers = makeDropHandlers(
+    setDocDragOver,
+    docDragCounter,
+    files => { if (files[0]) void doParseDocument(files[0]); },
+    ".doc,.docx,.csv,.tsv,.txt,.md,.html,.htm",
+  );
+  const importDropHandlers = makeDropHandlers(
+    setImportDragOver,
+    importDragCounter,
+    files => void doKnowledgeImport(files),
+    ".doc,.docx,.csv,.tsv,.txt,.md,.html,.htm,.json",
+  );
 
   // ===== ⑤ 批量格式化状态 =====
   const [batchLoading, setBatchLoading] = useState(false);
@@ -363,7 +446,15 @@ export default function AIChatPanel({ onClose, onNavigateToNote }: {
                 {showTools && (
                   <div className="space-y-2 mt-2">
                     {/* ③ 文档解析 */}
-                    <div className="rounded-xl bg-app-surface border border-app-border p-3">
+                    <div
+                      {...docDropHandlers}
+                      className={cn(
+                        "rounded-xl bg-app-surface border p-3 transition-colors",
+                        docDragOver
+                          ? "border-blue-500 bg-blue-500/5 ring-2 ring-blue-500/30"
+                          : "border-app-border",
+                      )}
+                    >
                       <div className="flex items-center gap-2 mb-1.5">
                         <FileUp size={14} className="text-blue-500" />
                         <span className="text-xs font-medium text-tx-primary">{t("aiChat.docParse")}</span>
@@ -407,7 +498,15 @@ export default function AIChatPanel({ onClose, onNavigateToNote }: {
                     </div>
 
                     {/* ⑥ 知识库导入 */}
-                    <div className="rounded-xl bg-app-surface border border-app-border p-3">
+                    <div
+                      {...importDropHandlers}
+                      className={cn(
+                        "rounded-xl bg-app-surface border p-3 transition-colors",
+                        importDragOver
+                          ? "border-emerald-500 bg-emerald-500/5 ring-2 ring-emerald-500/30"
+                          : "border-app-border",
+                      )}
+                    >
                       <div className="flex items-center gap-2 mb-1.5">
                         <FolderUp size={14} className="text-emerald-500" />
                         <span className="text-xs font-medium text-tx-primary">{t("aiChat.importKnowledge")}</span>
