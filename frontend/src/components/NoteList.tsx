@@ -1,7 +1,7 @@
 import React, { useEffect, useCallback, useState, useRef, useMemo } from "react";
 import { createPortal } from "react-dom";
 import { motion, AnimatePresence } from "framer-motion";
-import { Plus, Pin, PinOff, Star, StarOff, Clock, FileText, Trash2, ArchiveRestore, Menu, FolderInput, ChevronRight, ChevronDown, ChevronLeft, Folder, X, Check, Lock, Unlock, CalendarDays, RefreshCw, Share2, GripVertical, Download, ArrowUpDown, ArrowUp, ArrowDown, Image as ImageIcon, Printer, User as UserIcon } from "lucide-react";
+import { Plus, Pin, PinOff, Star, StarOff, Clock, FileText, Trash2, ArchiveRestore, Menu, FolderInput, ChevronRight, ChevronDown, ChevronLeft, Folder, X, Check, Lock, Unlock, CalendarDays, RefreshCw, Share2, GripVertical, Download, ArrowUpDown, ArrowUp, ArrowDown, Image as ImageIcon, Printer, User as UserIcon, Sparkles, Tag as TagIcon, Loader2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import ContextMenu, { ContextMenuItem } from "@/components/ContextMenu";
@@ -991,6 +991,14 @@ export default function NoteList() {
   // 多选：Ctrl/Cmd+Click 切换、Shift+Click 范围；为空即未进入多选
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [lastClickedId, setLastClickedId] = useState<string | null>(null);
+  // P4：批量 AI 操作运行时状态
+  //   kind     当前正在跑的批量动作；非 null 时禁用按钮防止并发启动
+  //   progress 已完成数 / 总数，用于底部工具栏显示 "AI 处理中 3/10"
+  const [bulkAiRunning, setBulkAiRunning] = useState<{
+    kind: "tags" | "classify";
+    done: number;
+    total: number;
+  } | null>(null);
   // 移动端触摸拖拽状态
   const touchDragRef = useRef<{
     noteId: string;
@@ -1274,6 +1282,168 @@ export default function NoteList() {
       toast.error(err?.message || t('noteList.createFailed'));
     }
   };
+
+  // =========================================================================
+  // P4：批量 AI 操作
+  // -------------------------------------------------------------------------
+  // 两个动作：
+  //   1) 批量 AI 标签 —— 对选中的每条笔记生成标签并关联；已有标签会被复用，不会
+  //      重复创建；失败条目独立计入错误数不阻断其他。
+  //   2) 批量 AI 归类 —— 调 /ai/classify 拿 top-1 建议；仅当 confidence >= 0.6
+  //      且建议的 notebookId 与当前不同，才自动移动。阈值保守，避免把用户笔记
+  //      错误移走；低于阈值视作"跳过"并单独计数。
+  //
+  // 并发控制：LLM API 容易撞 rate-limit，硬编码并发上限 3；总量超过 20 直接 toast
+  //   提示用户分批操作（避免一次发 100 个请求）。
+  //
+  // 容错：每条独立 try/catch；最终只用一个汇总 toast，不刷屏。
+  // =========================================================================
+
+  /** 将数组切成每批 concurrency 大小，串行推进，每项独立容错 */
+  const runInBatches = async <T,>(
+    items: T[],
+    concurrency: number,
+    fn: (item: T, index: number) => Promise<void>,
+    onProgress?: (done: number, total: number) => void,
+  ) => {
+    let done = 0;
+    for (let i = 0; i < items.length; i += concurrency) {
+      const batch = items.slice(i, i + concurrency);
+      await Promise.all(batch.map((it, k) => fn(it, i + k).catch(() => { /* swallow */ })));
+      done += batch.length;
+      onProgress?.(done, items.length);
+    }
+  };
+
+  const BULK_AI_HARD_LIMIT = 20;
+  const BULK_AI_CONCURRENCY = 3;
+  const BULK_CLASSIFY_THRESHOLD = 0.6;
+
+  const bulkAiGenerateTags = useCallback(async () => {
+    if (bulkAiRunning) return;
+    const ids = Array.from(selectedIds).filter((id) => {
+      const n = state.notes.find((x) => x.id === id);
+      return n && !n.isLocked && n.contentText;
+    });
+    if (ids.length === 0) {
+      toast.warning(t('noteList.bulkAiNoEligible') || "没有可处理的笔记（空白或已锁定的不参与）");
+      return;
+    }
+    if (ids.length > BULK_AI_HARD_LIMIT) {
+      toast.warning(t('noteList.bulkAiTooMany', { limit: BULK_AI_HARD_LIMIT }) || `单次最多处理 ${BULK_AI_HARD_LIMIT} 条，请分批操作`);
+      return;
+    }
+
+    setBulkAiRunning({ kind: "tags", done: 0, total: ids.length });
+    let okCount = 0;
+    let failCount = 0;
+
+    await runInBatches(ids, BULK_AI_CONCURRENCY, async (id) => {
+      const note = state.notes.find((x) => x.id === id);
+      if (!note || !note.contentText) { failCount++; return; }
+      try {
+        // 复用单笔记 aiChat("tags") 流程：一次 LLM 调用 + 解析 + 批量加标签
+        const result = await api.aiChat("tags", note.contentText.slice(0, 2000));
+        const tagNames = result.split(/[,，、\s]+/).map((s) => s.replace(/^#/, "").trim()).filter(Boolean);
+        // 逐个确保 tag 存在并关联；此处串行是为避免并发对同一 tag 名重复 INSERT
+        for (const name of tagNames) {
+          const existing = state.tags.find((t) => t.name === name);
+          let tagId: string;
+          if (existing) {
+            tagId = existing.id;
+          } else {
+            const newTag = await api.createTag({ name });
+            tagId = newTag.id;
+          }
+          // 轻量防重：后端对已存在关联会返回 409/200，都视作成功
+          try {
+            await api.addTagToNote(id, tagId);
+          } catch { /* ignore already-linked */ }
+        }
+        okCount++;
+      } catch {
+        failCount++;
+      }
+    }, (done, total) => {
+      setBulkAiRunning({ kind: "tags", done, total });
+    });
+
+    setBulkAiRunning(null);
+    // 刷新 tags & notes 以让左侧标签栏和笔记卡片上的 tag 胶囊立刻更新
+    api.getTags().then(actions.setTags).catch(() => { /* ignore */ });
+    actions.refreshNotes();
+    if (failCount === 0) {
+      toast.success(t('noteList.bulkAiTagsDone', { count: okCount }) || `已为 ${okCount} 条笔记生成标签`);
+    } else {
+      toast.warning(t('noteList.bulkAiTagsPartial', { ok: okCount, fail: failCount }) || `完成 ${okCount} 条，失败 ${failCount} 条`);
+    }
+  }, [bulkAiRunning, selectedIds, state.notes, state.tags, actions, t]);
+
+  const bulkAiClassify = useCallback(async () => {
+    if (bulkAiRunning) return;
+    const ids = Array.from(selectedIds).filter((id) => {
+      const n = state.notes.find((x) => x.id === id);
+      return n && !n.isLocked;
+    });
+    if (ids.length === 0) {
+      toast.warning(t('noteList.bulkAiNoEligible') || "没有可处理的笔记（已锁定的不参与）");
+      return;
+    }
+    if (ids.length > BULK_AI_HARD_LIMIT) {
+      toast.warning(t('noteList.bulkAiTooMany', { limit: BULK_AI_HARD_LIMIT }) || `单次最多处理 ${BULK_AI_HARD_LIMIT} 条，请分批操作`);
+      return;
+    }
+    // 跨工作区的笔记不允许批量归类——候选集是单 scope 的，
+    // 混着的话后半段 notebook 会被 cross-workspace move 拒绝。
+    const wsSet = new Set<string | null>(
+      ids.map((id) => {
+        const n = state.notes.find((x) => x.id === id);
+        return (n?.workspaceId || null) as string | null;
+      }),
+    );
+    if (wsSet.size > 1) {
+      toast.warning(t('noteList.bulkAiCrossWs') || "所选笔记跨多个工作区，请分别操作");
+      return;
+    }
+
+    setBulkAiRunning({ kind: "classify", done: 0, total: ids.length });
+    let movedCount = 0;
+    let skippedCount = 0;
+    let failCount = 0;
+
+    await runInBatches(ids, BULK_AI_CONCURRENCY, async (id) => {
+      const note = state.notes.find((x) => x.id === id);
+      if (!note) { failCount++; return; }
+      try {
+        const res = await api.aiClassify({ noteId: id });
+        // 取 top-1 建议；需要不同于当前、且 confidence 达阈值
+        const top = res.suggestions.find((s) => s.notebookId !== note.notebookId);
+        if (!top || top.confidence < BULK_CLASSIFY_THRESHOLD) {
+          skippedCount++;
+          return;
+        }
+        await api.updateNote(id, { notebookId: top.notebookId } as any);
+        movedCount++;
+        actions.updateNoteInList({ id, notebookId: top.notebookId });
+      } catch {
+        failCount++;
+      }
+    }, (done, total) => {
+      setBulkAiRunning({ kind: "classify", done, total });
+    });
+
+    setBulkAiRunning(null);
+    actions.refreshNotebooks();
+    actions.refreshNotes();
+    // 汇总一次性提示；三组数字齐全，避免多次 toast 叠加
+    toast.success(
+      t('noteList.bulkAiClassifyDone', {
+        moved: movedCount,
+        skipped: skippedCount,
+        failed: failCount,
+      }) || `批量归类完成：已移动 ${movedCount} 条，跳过 ${skippedCount} 条，失败 ${failCount} 条`,
+    );
+  }, [bulkAiRunning, selectedIds, state.notes, actions, t]);
 
   // 根据当前视图和目标笔记动态构建菜单项
   const getMenuItems = (): ContextMenuItem[] => {
@@ -1923,6 +2093,43 @@ export default function NoteList() {
                 >
                   <FolderInput size={12} />
                   <span>{t('noteList.moveSelected')}</span>
+                </button>
+                {/* ── P4：批量 AI 操作 ──
+                    两颗按钮复用当前 selectedIds；运行中按钮 disabled 并替换为进度文本，
+                    避免用户误触发二次请求把额度烧掉。 */}
+                <button
+                  className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium rounded-md text-violet-600 dark:text-violet-400 hover:bg-violet-500/10 disabled:opacity-50 disabled:cursor-wait transition-colors"
+                  onClick={bulkAiGenerateTags}
+                  disabled={!!bulkAiRunning}
+                  title={t('noteList.bulkAiTagsTip') || "为所选笔记批量生成标签"}
+                >
+                  {bulkAiRunning?.kind === "tags" ? (
+                    <Loader2 size={12} className="animate-spin" />
+                  ) : (
+                    <TagIcon size={12} />
+                  )}
+                  <span>
+                    {bulkAiRunning?.kind === "tags"
+                      ? `${bulkAiRunning.done}/${bulkAiRunning.total}`
+                      : (t('noteList.bulkAiTags') || "AI 标签")}
+                  </span>
+                </button>
+                <button
+                  className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium rounded-md text-violet-600 dark:text-violet-400 hover:bg-violet-500/10 disabled:opacity-50 disabled:cursor-wait transition-colors"
+                  onClick={bulkAiClassify}
+                  disabled={!!bulkAiRunning}
+                  title={t('noteList.bulkAiClassifyTip') || "AI 自动归类（置信度≥60% 才会移动）"}
+                >
+                  {bulkAiRunning?.kind === "classify" ? (
+                    <Loader2 size={12} className="animate-spin" />
+                  ) : (
+                    <Sparkles size={12} />
+                  )}
+                  <span>
+                    {bulkAiRunning?.kind === "classify"
+                      ? `${bulkAiRunning.done}/${bulkAiRunning.total}`
+                      : (t('noteList.bulkAiClassify') || "AI 归类")}
+                  </span>
                 </button>
                 <button
                   className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium rounded-md text-red-500 hover:bg-red-500/10 transition-colors"

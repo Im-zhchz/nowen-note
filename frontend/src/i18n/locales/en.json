@@ -174,6 +174,16 @@
     "bulkMoveFailed": "Move failed: {{error}}",
     "bulkMovePartial": "Moved {{success}}, {{failed}} failed",
     "bulkTrashSuccess": "Moved {{count}} notes to Trash",
+    "bulkAiTags": "AI tags",
+    "bulkAiTagsTip": "Generate tags for all selected notes",
+    "bulkAiTagsDone": "Generated tags for {{count}} notes",
+    "bulkAiTagsPartial": "Done {{ok}} notes, {{fail}} failed",
+    "bulkAiClassify": "AI classify",
+    "bulkAiClassifyTip": "Auto-classify (move only when confidence ≥ 60%)",
+    "bulkAiClassifyDone": "Bulk classify done: moved {{moved}}, skipped {{skipped}}, failed {{failed}}",
+    "bulkAiNoEligible": "No eligible notes (empty or locked are skipped)",
+    "bulkAiTooMany": "Up to {{limit}} notes per batch; please split into smaller batches",
+    "bulkAiCrossWs": "Selected notes span multiple workspaces; please operate per workspace",
     "multiSelectHint": "Ctrl/Cmd-click to multi-select, Shift-click for range"
   },
   "editor": {

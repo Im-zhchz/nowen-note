@@ -181,6 +181,16 @@
     "bulkMoveFailed": "移动失败：{{error}}",
     "bulkMovePartial": "已移动 {{success}} 条，{{failed}} 条失败",
     "bulkTrashSuccess": "已移入回收站 {{count}} 条",
+    "bulkAiTags": "AI 标签",
+    "bulkAiTagsTip": "为所选笔记批量生成标签",
+    "bulkAiTagsDone": "已为 {{count}} 条笔记生成标签",
+    "bulkAiTagsPartial": "完成 {{ok}} 条，失败 {{fail}} 条",
+    "bulkAiClassify": "AI 归类",
+    "bulkAiClassifyTip": "AI 自动归类（置信度≥60% 才会移动）",
+    "bulkAiClassifyDone": "批量归类完成：已移动 {{moved}} 条，跳过 {{skipped}} 条，失败 {{failed}} 条",
+    "bulkAiNoEligible": "没有可处理的笔记（空白或已锁定的不参与）",
+    "bulkAiTooMany": "单次最多处理 {{limit}} 条，请分批操作",
+    "bulkAiCrossWs": "所选笔记跨多个工作区，请分别操作",
     "multiSelectHint": "Ctrl/Cmd 点击多选，Shift 点击范围选择"
   },
   "editor": {
