@@ -732,7 +732,11 @@ const NoteCard = React.memo(React.forwardRef<HTMLDivElement, {
   onTouchMove?: (e: React.TouchEvent) => void;
   onTouchEnd?: () => void;
 }>(function NoteCard({ note, isActive, onClick, onContextMenu, isContextTarget, isShared, isSelected, draggable, onDragStart, onDragOver, onDragEnd, onDrop, isDragOver, onTouchStart, onTouchMove, onTouchEnd }, ref) {
-  const preview = note.contentText?.slice(0, 100) || "";
+  // 预览文本：取正文前 100 字，并把所有空白序列（含 \n、\r、\t、连续空格）
+  // 压成单个空格。否则 markdown 多段落正文里的换行会被 <p> 当作空白渲染，
+  // 配合 line-clamp-2 + break-words 出现"每句被切到独立一行"的错觉
+  // （短标题时不明显，因为预览整体行数少；长标题挤占空间后尤为严重）。
+  const preview = (note.contentText?.slice(0, 100) || "").replace(/\s+/g, " ").trim();
   const { t } = useTranslation();
   const wordCount = note.contentText?.length || 0;
   // 工作区视图下笔记可能由不同成员创建，需要在卡片底部展示创建者；
@@ -793,7 +797,15 @@ const NoteCard = React.memo(React.forwardRef<HTMLDivElement, {
             <GripVertical size={14} className="text-tx-tertiary opacity-0 group-hover:opacity-60 transition-opacity shrink-0 cursor-grab active:cursor-grabbing" />
           )}
           <h3 className={cn(
-            "text-sm font-medium truncate flex-1 min-w-0",
+            // 标题强制单行：这里**故意**不用 `truncate`（white-space: nowrap）。
+            // 历史踩坑：`truncate` 在 flex item 里偶发被外层富文本/prose 全局样式覆盖
+            // （某些主题会把 h3 的 white-space 重置为 normal），导致超长英文+空格的标题
+            // 仍然在空格处折行变成 2 行，把后面的 line-clamp-2 预览挤成只剩 1 行。
+            // 改用 line-clamp-1：基于 -webkit-box 实现，不依赖 nowrap，对 flex 容器
+            // 和 CJK/英文/空格混排都稳定，并自带省略号。
+            // break-all：兜底——遇到极长不可断词（连续超长英文/无空格 URL）也强制裁断，
+            // 不让一行的"内容宽度"超过容器，导致 flex 容器再被撑变形。
+            "text-sm font-medium line-clamp-1 break-all flex-1 min-w-0",
             isActive ? "text-tx-primary" : "text-tx-secondary group-hover:text-tx-primary"
           )}>
             {note.title || t('common.untitledNote')}
@@ -806,9 +818,14 @@ const NoteCard = React.memo(React.forwardRef<HTMLDivElement, {
           </div>
         </div>
 
-        {/* 内容预览 */}
+        {/* 内容预览
+            折行策略：
+            - 用 break-words 而非 break-all：CJK 默认就能在任意字符间折行，
+              break-all 会让英文也按字符硬切，反而更难读；break-words 只在
+              "整行装不下的长不可断词"时才强制打破，对中英混排最友好。
+            - overflow-wrap-anywhere 避免极长 URL 撑破容器。 */}
         {preview && (
-          <p className="text-xs text-tx-tertiary mt-1.5 line-clamp-2 leading-relaxed break-all">{preview}</p>
+          <p className="text-xs text-tx-tertiary mt-1.5 line-clamp-2 leading-relaxed break-words [overflow-wrap:anywhere]">{preview}</p>
         )}
 
         {/* 底部元信息行
