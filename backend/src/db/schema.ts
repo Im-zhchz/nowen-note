@@ -813,10 +813,19 @@ function initSchema(db: Database.Database) {
 
     CREATE INDEX IF NOT EXISTS idx_note_embeddings_note ON note_embeddings(noteId);
     CREATE INDEX IF NOT EXISTS idx_note_embeddings_user ON note_embeddings(userId);
-    CREATE INDEX IF NOT EXISTS idx_note_embeddings_user_ws ON note_embeddings(userId, workspaceId);
-    CREATE INDEX IF NOT EXISTS idx_note_embeddings_ws ON note_embeddings(workspaceId);
     CREATE INDEX IF NOT EXISTS idx_note_embeddings_model ON note_embeddings(model);
-    CREATE INDEX IF NOT EXISTS idx_note_embeddings_attachment ON note_embeddings(attachmentId);
+    -- 注意：以下几条索引**不能**放在 initSchema 里，必须交给 migrations.ts 单一负责：
+    --   idx_note_embeddings_user_ws (userId, workspaceId)   -- 由 v7 建，依赖 v7 补的 workspaceId 列
+    --   idx_note_embeddings_ws      (workspaceId)           -- 由 v7 建
+    --   idx_note_embeddings_attachment (attachmentId)        -- 由 v8 建，依赖 v8 补的 attachmentId 列
+    --
+    -- 原因（与 idx_ai_chat_msg_conv 同构）：对 v6 或更早版本创建的老库，
+    -- note_embeddings 表早已存在但缺 workspaceId / attachmentId 列。此处
+    -- CREATE TABLE IF NOT EXISTS 不会补列，紧接着建索引会抛：
+    --   SqliteError: no such column: workspaceId  (schema.js:806 附近)
+    -- 报错发生在 initSchema 内，早于 runMigrations，v7/v8 的 addColumnIfMissing
+    -- 根本来不及跑 —— 死锁。对全新库，v7/v8 首次启动也会运行一次
+    -- (getCurrentSchemaVersion=0)，CREATE INDEX IF NOT EXISTS 幂等补建。
 
     CREATE TABLE IF NOT EXISTS embedding_queue (
       noteId TEXT PRIMARY KEY,
@@ -831,7 +840,7 @@ function initSchema(db: Database.Database) {
     );
 
     CREATE INDEX IF NOT EXISTS idx_embedding_queue_status ON embedding_queue(status, enqueuedAt);
-    CREATE INDEX IF NOT EXISTS idx_embedding_queue_user_ws ON embedding_queue(userId, workspaceId);
+    -- idx_embedding_queue_user_ws (userId, workspaceId) 由 v7 单一负责，见上方长注释。
 
     -- INSERT 触发：新笔记入队（contentText 可能为空，由 worker 决定是否真的算 embedding）
     -- workspaceId 同步从 notes.workspaceId 取（NULL = 个人空间）
