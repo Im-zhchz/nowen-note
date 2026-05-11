@@ -30,6 +30,54 @@ function checkNativeModule() {
     `[builder] ✓ better-sqlite3.node found (${(stat.size / 1024 / 1024).toFixed(1)} MB, ` +
       `mtime=${stat.mtime.toISOString()})`
   );
+
+  // ===== 强校验：必须存在 rebuild-native 脚本写入的 .electron-abi.json stamp =====
+  // 没有 stamp 通常意味着这份 .node 是 npm ci 时 prebuild-install 拉下来的
+  // 裸 Node 版本（NODE_MODULE_VERSION 与 Electron 不一致），到用户机会 ERR_DLOPEN_FAILED。
+  const stampFile = path.resolve(
+    path.dirname(nodeFile),
+    ".electron-abi.json"
+  );
+  if (!fs.existsSync(stampFile)) {
+    throw new Error(
+      `[builder] 未找到 Electron ABI stamp（${stampFile}）。\n` +
+        `这说明 better_sqlite3.node 没有经过 rebuild-native 重新编译，\n` +
+        `打出来的包到用户机会报 ERR_DLOPEN_FAILED。\n` +
+        `修复：执行 npm run rebuild:native 后再打包。`
+    );
+  }
+  // 读取 stamp 校验目标 Electron 版本
+  let stamp;
+  try {
+    stamp = JSON.parse(fs.readFileSync(stampFile, "utf8"));
+  } catch (e) {
+    throw new Error(`[builder] stamp 文件解析失败：${e.message}`);
+  }
+  const rootPkg = JSON.parse(
+    fs.readFileSync(path.resolve(__dirname, "..", "package.json"), "utf8")
+  );
+  const electronDep =
+    rootPkg.devDependencies?.electron || rootPkg.dependencies?.electron;
+  const expectedElectron = (electronDep || "").replace(/^[^\d]*/, "");
+  if (stamp.electronVersion !== expectedElectron) {
+    throw new Error(
+      `[builder] better_sqlite3.node 是为 Electron ${stamp.electronVersion} 编译的，\n` +
+        `但当前 package.json 声明的 electron 版本是 ${expectedElectron}。\n` +
+        `请重新执行 npm run rebuild:native。`
+    );
+  }
+  // mtime 一致性校验（防止有人手工换了 .node 但忘了改 stamp）
+  if (stamp.nodeMtime && stamp.nodeMtime !== stat.mtime.toISOString()) {
+    console.warn(
+      `[builder] ⚠ stamp 中记录的 .node mtime 与当前文件不一致：\n` +
+        `   stamp: ${stamp.nodeMtime}\n` +
+        `   actual: ${stat.mtime.toISOString()}\n` +
+        `   建议重新执行 npm run rebuild:native。`
+    );
+  }
+  console.log(
+    `[builder] ✓ ABI stamp verified (electron=${stamp.electronVersion}, rebuiltAt=${stamp.rebuiltAt})`
+  );
 }
 
 // 允许把输出目录放到工作区外，避免 IDE / Defender 对打包产物做文件监听锁
