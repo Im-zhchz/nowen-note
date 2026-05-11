@@ -121,7 +121,31 @@ If this project helps you, feel free to scan the QR code and buy the author a co
 <!-- CHANGELOG:BEGIN -->
 ## 更新日志
 
-> 最近 2 个版本的更新内容，完整历史见 [CHANGELOG.md](./CHANGELOG.md)。
+> 最近 3 个版本的更新内容，完整历史见 [CHANGELOG.md](./CHANGELOG.md)。
+
+### v1.0.33 - 2026-05-11
+
+### ✨ 新增
+
+- **ai**: 知识问答支持多会话（多聊天并行保存） (d10764c)
+- **ai**: 批量 AI 操作（标签/归类） (a11bdc2)
+- **ai**: 笔记归类建议（AI 自动目录归类） (313b200)
+- **ai**: 自定义指令模板可保存与复用 (2395a93)
+- **ai**: RAG 知识库支持附件内容索引（PDF/文本/docx 等） (afdc482)
+- **backup**: 自动备份支持每日定时/保留数量/邮件通知 (eded447)
+- **users**: 个人空间导出/导入开关下沉为 per-user 字段 (4769c7f)
+- **upload**: 附件上传支持拖拽 (beb74d8)
+- **ios**: 接入 Capacitor iOS 工程骨架与 GitHub Actions TestFlight 发版 (0320ba8)
+
+### 🐛 修复
+
+- **build**: unpdf 加入 esbuild external 名单，修复后端 bundle 失败 (bb46727)
+- **backend**: 修复 backup.ts 重载签名默认参数导致的 TS2371 编译错误 (b69d66a)
+- **security**: RAG 知识库索引按工作区/个人空间隔离 (5e5e899)
+- **ui**: 修复笔记列表长标题挤掉预览行 (2b9d4c9)
+- **ai**: AI 写作助手 markdown 格式化丢失链接和图片 (91e42e4)
+- **electron**: 修复 main.js 第 702 行非法字符串导致主进程启动崩溃 (e851eeb)
+- **release**: 仅上传当前版本产物到 GitHub Release，避免历史包混入 (91edab8)
 
 ### v1.0.32 - 2026-05-09
 
