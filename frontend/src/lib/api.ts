@@ -1758,6 +1758,58 @@ export const api = {
     return res.json();
   },
 
+  // ========== AI 自定义指令模板（P2）==========
+  // 与写作助手的"自定义指令"配合：列出 / 创建 / 更新 / 删除 / 点击计数。
+  // 所有失败情况都抛 Error，调用方自行 toast；列表失败退化为空数组由组件容错。
+  aiPrompts: {
+    list: () =>
+      request<{
+        items: {
+          id: string;
+          name: string;
+          prompt: string;
+          usageCount: number;
+          lastUsedAt: string | null;
+          createdAt: string;
+          updatedAt: string;
+        }[];
+      }>("/ai/prompts"),
+    create: (data: { name: string; prompt: string }) =>
+      request<{
+        id: string;
+        name: string;
+        prompt: string;
+        usageCount: number;
+        lastUsedAt: string | null;
+        createdAt: string;
+        updatedAt: string;
+      }>("/ai/prompts", {
+        method: "POST",
+        body: JSON.stringify(data),
+      }),
+    update: (id: string, data: { name: string; prompt: string }) =>
+      request<{
+        id: string;
+        name: string;
+        prompt: string;
+        usageCount: number;
+        lastUsedAt: string | null;
+        createdAt: string;
+        updatedAt: string;
+      }>(`/ai/prompts/${encodeURIComponent(id)}`, {
+        method: "PUT",
+        body: JSON.stringify(data),
+      }),
+    remove: (id: string) =>
+      request<{ ok: boolean }>(`/ai/prompts/${encodeURIComponent(id)}`, {
+        method: "DELETE",
+      }),
+    touch: (id: string) =>
+      request<{ ok: boolean }>(`/ai/prompts/${encodeURIComponent(id)}/touch`, {
+        method: "POST",
+      }),
+  },
+
   // ③ 文档智能解析
   parseDocument: async (
     file: File,

@@ -720,6 +720,39 @@ function initSchema(db: Database.Database) {
   `);
 
   // ==============================================================
+  // AI 自定义指令（P2）：用户保存的可复用 prompt 模板
+  // ==============================================================
+  //
+  // 场景：AI 写作助手里的"自定义指令"每次都要现场输入，用户希望能把常用的
+  //   prompt（例如"翻译成德语并保留原文格式"）保存下来一键复用。
+  //
+  // 设计要点：
+  //   - 按 userId 隔离（同一账号的所有设备共享，不按工作区区分——写作风格
+  //     是人的属性不是工作区的属性）；
+  //   - name 在同一用户下唯一，保证列表里不会出现重名条目；前端先做客户端校验、
+  //     后端再用唯一索引兜底（UNIQUE(userId, name)）；
+  //   - usageCount 记点击次数，用于"按使用频次排序"以把常用指令置顶；
+  //   - 软失败策略：prompt 字段允许任意长度文本，不做长度限制（前端可自限 2000）。
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS ai_custom_prompts (
+      id TEXT PRIMARY KEY,
+      userId TEXT NOT NULL,
+      name TEXT NOT NULL,
+      prompt TEXT NOT NULL DEFAULT '',
+      usageCount INTEGER NOT NULL DEFAULT 0,
+      lastUsedAt TEXT,
+      createdAt TEXT NOT NULL DEFAULT (datetime('now')),
+      updatedAt TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (userId) REFERENCES users(id) ON DELETE CASCADE
+    );
+
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_ai_custom_prompts_user_name
+      ON ai_custom_prompts(userId, name);
+    CREATE INDEX IF NOT EXISTS idx_ai_custom_prompts_user_usage
+      ON ai_custom_prompts(userId, usageCount DESC, updatedAt DESC);
+  `);
+
+  // ==============================================================
   // RAG Phase 1：笔记向量化（Embedding）基础表
   // ==============================================================
   //

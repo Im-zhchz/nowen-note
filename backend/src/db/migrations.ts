@@ -678,6 +678,48 @@ export const MIGRATIONS: Migration[] = [
       `).run();
     },
   },
+
+  // ==========================================================================
+  // v9：AI 自定义指令模板（P2）
+  // --------------------------------------------------------------------------
+  // 背景：
+  //   v8 之前用户在"AI 写作助手 → 自定义指令"里输入的 prompt 一次性使用、
+  //   不会保存。常用指令需要反复键入，体验差。
+  //
+  // 方案：
+  //   新增 ai_custom_prompts 表，按 (userId, name) 唯一约束保存用户命名的
+  //   prompt 模板。写路径走新 REST 端点 /api/ai/prompts（GET/POST/PUT/DELETE）。
+  //
+  // 零风险：纯新增表，不触及任何现有数据。
+  //
+  // 回滚：回到 v8 时表仍在但不被访问，保留用户已保存的模板数据。
+  {
+    version: 9,
+    name: "ai-custom-prompts",
+    up: (db) => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS ai_custom_prompts (
+          id TEXT PRIMARY KEY,
+          userId TEXT NOT NULL,
+          name TEXT NOT NULL,
+          prompt TEXT NOT NULL DEFAULT '',
+          usageCount INTEGER NOT NULL DEFAULT 0,
+          lastUsedAt TEXT,
+          createdAt TEXT NOT NULL DEFAULT (datetime('now')),
+          updatedAt TEXT NOT NULL DEFAULT (datetime('now')),
+          FOREIGN KEY (userId) REFERENCES users(id) ON DELETE CASCADE
+        );
+      `);
+      db.exec(`
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_ai_custom_prompts_user_name
+          ON ai_custom_prompts(userId, name);
+      `);
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS idx_ai_custom_prompts_user_usage
+          ON ai_custom_prompts(userId, usageCount DESC, updatedAt DESC);
+      `);
+    },
+  },
 ];
 
 /** 当前代码已知的最高 schema 版本（== MIGRATIONS 里 max(version)）。 */

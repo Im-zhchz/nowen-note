@@ -1426,4 +1426,158 @@ ai.delete("/chat-history", (c) => {
   return c.json({ ok: true, deleted: info.changes });
 });
 
+// ============================================================
+// AI 自定义指令模板（P2）
+// ------------------------------------------------------------
+// 给写作助手的"自定义指令"提供可持久化、可命名、可复用的模板仓库。
+//
+// 约定：
+//   - 作用域：按 userId 隔离（不按工作区；写作风格属于个人属性）；
+//   - 唯一性：同一用户下 name 唯一——UNIQUE(userId,name) 兜底，写路径
+//     去重时把重名当成 400 而非 500，给前端更明确的错误语义；
+//   - 排序：GET 默认按 usageCount DESC, updatedAt DESC，让"常用 + 最近编辑"
+//     的模板自然置顶；
+//   - 点击计数：专门的 POST /:id/touch 端点，避免把"使用一次"污染成写操作
+//     导致 updatedAt 被扰动；usageCount 用它自增，lastUsedAt 独立更新。
+// ============================================================
+
+interface AiCustomPromptRow {
+  id: string;
+  userId: string;
+  name: string;
+  prompt: string;
+  usageCount: number;
+  lastUsedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+function toPromptDto(r: AiCustomPromptRow) {
+  return {
+    id: r.id,
+    name: r.name,
+    prompt: r.prompt,
+    usageCount: r.usageCount,
+    lastUsedAt: r.lastUsedAt,
+    createdAt: r.createdAt,
+    updatedAt: r.updatedAt,
+  };
+}
+
+/** 标准化输入字符串：trim 并做基础长度校验 */
+function normalizePromptInput(body: { name?: unknown; prompt?: unknown }):
+  | { ok: true; name: string; prompt: string }
+  | { ok: false; error: string } {
+  const name = typeof body.name === "string" ? body.name.trim() : "";
+  const prompt = typeof body.prompt === "string" ? body.prompt.trim() : "";
+  if (!name) return { ok: false, error: "名称不能为空" };
+  if (name.length > 80) return { ok: false, error: "名称长度不能超过 80 个字符" };
+  if (!prompt) return { ok: false, error: "指令内容不能为空" };
+  if (prompt.length > 4000) return { ok: false, error: "指令内容长度不能超过 4000 个字符" };
+  return { ok: true, name, prompt };
+}
+
+// GET /api/ai/prompts — 列出当前用户所有自定义指令
+ai.get("/prompts", (c) => {
+  const db = getDb();
+  const userId = c.req.header("X-User-Id") || "demo";
+  const rows = db.prepare(`
+    SELECT id, userId, name, prompt, usageCount, lastUsedAt, createdAt, updatedAt
+      FROM ai_custom_prompts
+     WHERE userId = ?
+     ORDER BY usageCount DESC, updatedAt DESC, createdAt DESC
+     LIMIT 200
+  `).all(userId) as AiCustomPromptRow[];
+  return c.json({ items: rows.map(toPromptDto) });
+});
+
+// POST /api/ai/prompts — 新建
+ai.post("/prompts", async (c) => {
+  const db = getDb();
+  const userId = c.req.header("X-User-Id") || "demo";
+  const body = await c.req.json().catch(() => ({})) as { name?: unknown; prompt?: unknown };
+  const norm = normalizePromptInput(body);
+  if (!norm.ok) return c.json({ error: norm.error }, 400);
+
+  const id = `p_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+  try {
+    db.prepare(`
+      INSERT INTO ai_custom_prompts (id, userId, name, prompt, usageCount, createdAt, updatedAt)
+      VALUES (?, ?, ?, ?, 0, datetime('now'), datetime('now'))
+    `).run(id, userId, norm.name, norm.prompt);
+  } catch (e: any) {
+    // UNIQUE(userId,name) 冲突 → 400 给前端明确信号
+    if (String(e?.message || "").includes("UNIQUE")) {
+      return c.json({ error: "已存在同名指令，请换一个名称" }, 400);
+    }
+    throw e;
+  }
+  const row = db.prepare(
+    "SELECT id, userId, name, prompt, usageCount, lastUsedAt, createdAt, updatedAt FROM ai_custom_prompts WHERE id = ?",
+  ).get(id) as AiCustomPromptRow;
+  return c.json(toPromptDto(row));
+});
+
+// PUT /api/ai/prompts/:id — 更新（可改名、可改内容）
+ai.put("/prompts/:id", async (c) => {
+  const db = getDb();
+  const userId = c.req.header("X-User-Id") || "demo";
+  const id = c.req.param("id");
+  const body = await c.req.json().catch(() => ({})) as { name?: unknown; prompt?: unknown };
+  const norm = normalizePromptInput(body);
+  if (!norm.ok) return c.json({ error: norm.error }, 400);
+
+  // 先确认归属——防止跨用户篡改
+  const own = db.prepare(
+    "SELECT id FROM ai_custom_prompts WHERE id = ? AND userId = ?",
+  ).get(id, userId) as { id: string } | undefined;
+  if (!own) return c.json({ error: "指令不存在" }, 404);
+
+  try {
+    db.prepare(`
+      UPDATE ai_custom_prompts
+         SET name = ?, prompt = ?, updatedAt = datetime('now')
+       WHERE id = ? AND userId = ?
+    `).run(norm.name, norm.prompt, id, userId);
+  } catch (e: any) {
+    if (String(e?.message || "").includes("UNIQUE")) {
+      return c.json({ error: "已存在同名指令，请换一个名称" }, 400);
+    }
+    throw e;
+  }
+  const row = db.prepare(
+    "SELECT id, userId, name, prompt, usageCount, lastUsedAt, createdAt, updatedAt FROM ai_custom_prompts WHERE id = ?",
+  ).get(id) as AiCustomPromptRow;
+  return c.json(toPromptDto(row));
+});
+
+// DELETE /api/ai/prompts/:id
+ai.delete("/prompts/:id", (c) => {
+  const db = getDb();
+  const userId = c.req.header("X-User-Id") || "demo";
+  const id = c.req.param("id");
+  const info = db.prepare(
+    "DELETE FROM ai_custom_prompts WHERE id = ? AND userId = ?",
+  ).run(id, userId);
+  if (info.changes === 0) return c.json({ error: "指令不存在" }, 404);
+  return c.json({ ok: true });
+});
+
+// POST /api/ai/prompts/:id/touch — 上报"被使用一次"
+// 仅更新 usageCount/lastUsedAt，不动 updatedAt，避免"使用一次"扰动排序语义
+// 里的"最近编辑"维度。
+ai.post("/prompts/:id/touch", (c) => {
+  const db = getDb();
+  const userId = c.req.header("X-User-Id") || "demo";
+  const id = c.req.param("id");
+  const info = db.prepare(`
+    UPDATE ai_custom_prompts
+       SET usageCount = usageCount + 1,
+           lastUsedAt = datetime('now')
+     WHERE id = ? AND userId = ?
+  `).run(id, userId);
+  if (info.changes === 0) return c.json({ error: "指令不存在" }, 404);
+  return c.json({ ok: true });
+});
+
 export default ai;
