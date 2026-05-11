@@ -6,8 +6,55 @@ const path = require("path");
 const os = require("os");
 const fs = require("fs");
 
-// ===== 打包前校验：better-sqlite3 原生模块必须已 rebuild 为 Electron ABI =====
-// 防止忘记 `npm run rebuild:native` 就打包，导致安装后 ERR_DLOPEN_FAILED。
+// ===== 打包前校验：better-sqlite3 原生模块必须已 rebuild 为 Electron ABI + 目标平台 =====
+// 防止忘记 `npm run rebuild:native` 就打包，或在 Linux 上为 Win 目标编出 Linux .so，
+// 导致安装后 ERR_DLOPEN_FAILED / "is not a valid Win32 application"。
+//
+// argv 中可能包含 --win / --mac / --linux（electron-builder 的平台开关）；
+// 没有则按 process.platform 推断。
+function inferTargetPlatformFromArgv() {
+  const argv = process.argv.join(" ");
+  if (/\s--win(\s|=|$)/.test(argv)) return "win32";
+  if (/\s--mac(\s|=|$)/.test(argv)) return "darwin";
+  if (/\s--linux(\s|=|$)/.test(argv)) return "linux";
+  return process.platform;
+}
+
+/**
+ * 通过文件魔数识别 .node 目标平台，避免 stamp 被错误标注时假通过。
+ *   Windows PE:   "MZ"
+ *   Linux ELF:    "\x7FELF"
+ *   macOS Mach-O: 0xFEEDFACE/0xCEFAEDFE/0xFEEDFACF/0xCFFAEDFE/0xCAFEBABE
+ */
+function detectNodeFilePlatform(nodeFile) {
+  try {
+    const fd = fs.openSync(nodeFile, "r");
+    const buf = Buffer.alloc(4);
+    fs.readSync(fd, buf, 0, 4, 0);
+    fs.closeSync(fd);
+    if (buf[0] === 0x4d && buf[1] === 0x5a) return "win32";
+    if (
+      buf[0] === 0x7f &&
+      buf[1] === 0x45 &&
+      buf[2] === 0x4c &&
+      buf[3] === 0x46
+    )
+      return "linux";
+    const m = buf.readUInt32BE(0);
+    if (
+      m === 0xfeedface ||
+      m === 0xcefaedfe ||
+      m === 0xfeedfacf ||
+      m === 0xcffaedfe ||
+      m === 0xcafebabe
+    )
+      return "darwin";
+    return "unknown";
+  } catch {
+    return "unknown";
+  }
+}
+
 function checkNativeModule() {
   const nodeFile = path.resolve(
     __dirname,
@@ -31,13 +78,7 @@ function checkNativeModule() {
       `mtime=${stat.mtime.toISOString()})`
   );
 
-  // ===== 强校验：必须存在 rebuild-native 脚本写入的 .electron-abi.json stamp =====
-  // 没有 stamp 通常意味着这份 .node 是 npm ci 时 prebuild-install 拉下来的
-  // 裸 Node 版本（NODE_MODULE_VERSION 与 Electron 不一致），到用户机会 ERR_DLOPEN_FAILED。
-  const stampFile = path.resolve(
-    path.dirname(nodeFile),
-    ".electron-abi.json"
-  );
+  const stampFile = path.resolve(path.dirname(nodeFile), ".electron-abi.json");
   if (!fs.existsSync(stampFile)) {
     throw new Error(
       `[builder] 未找到 Electron ABI stamp（${stampFile}）。\n` +
@@ -46,7 +87,6 @@ function checkNativeModule() {
         `修复：执行 npm run rebuild:native 后再打包。`
     );
   }
-  // 读取 stamp 校验目标 Electron 版本
   let stamp;
   try {
     stamp = JSON.parse(fs.readFileSync(stampFile, "utf8"));
@@ -66,7 +106,47 @@ function checkNativeModule() {
         `请重新执行 npm run rebuild:native。`
     );
   }
-  // mtime 一致性校验（防止有人手工换了 .node 但忘了改 stamp）
+
+  // ===== 目标平台/架构强校验 =====
+  // 这是 2026-05 事故（Linux 上打 Win 包 → 装包后 "not a valid Win32 application"）
+  // 的根治修复：只看 electronVersion 不足，必须还要对齐 platform + arch。
+  const targetPlatform = inferTargetPlatformFromArgv();
+  const targetArch = process.env.npm_config_target_arch || process.arch;
+  const stampPlatform = stamp.platform;
+  const stampArch = stamp.arch;
+  if (!stampPlatform || !stampArch) {
+    throw new Error(
+      `[builder] stamp 缺少 platform/arch 字段（旧版 rebuild-native 产物）。\n` +
+        `请重新执行 npm run rebuild:native。`
+    );
+  }
+  if (stampPlatform !== targetPlatform) {
+    throw new Error(
+      `[builder] ✗ better_sqlite3.node 的 platform 与打包目标不匹配！\n` +
+        `   stamp  : ${stampPlatform}-${stampArch}\n` +
+        `   target : ${targetPlatform}-${targetArch}\n` +
+        `   修复：npm run rebuild:native -- --target-platform=${targetPlatform} --target-arch=${targetArch}`
+    );
+  }
+
+  // 文件魔数兜底校验（stamp 可能被手工改过）
+  const detected = detectNodeFilePlatform(nodeFile);
+  const expectDetected =
+    targetPlatform === "win32"
+      ? "win32"
+      : targetPlatform === "darwin"
+        ? "darwin"
+        : "linux";
+  if (detected !== expectDetected) {
+    throw new Error(
+      `[builder] ✗ better_sqlite3.node 文件格式不匹配目标平台！\n` +
+        `   expected (by magic) : ${expectDetected}\n` +
+        `   actual               : ${detected}\n` +
+        `   这份 .node 打进安装包后会报 ERR_DLOPEN_FAILED / "not a valid Win32 application"。\n` +
+        `   修复：npm run rebuild:native -- --target-platform=${targetPlatform} --target-arch=${targetArch}`
+    );
+  }
+
   if (stamp.nodeMtime && stamp.nodeMtime !== stat.mtime.toISOString()) {
     console.warn(
       `[builder] ⚠ stamp 中记录的 .node mtime 与当前文件不一致：\n` +
@@ -76,7 +156,9 @@ function checkNativeModule() {
     );
   }
   console.log(
-    `[builder] ✓ ABI stamp verified (electron=${stamp.electronVersion}, rebuiltAt=${stamp.rebuiltAt})`
+    `[builder] ✓ ABI stamp verified (electron=${stamp.electronVersion}, ` +
+      `platform=${stampPlatform}-${stampArch}, mode=${stamp.mode || "native-rebuild"}, ` +
+      `rebuiltAt=${stamp.rebuiltAt})`
   );
 }
 

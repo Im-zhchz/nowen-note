@@ -2,41 +2,43 @@
 /**
  * rebuild-native.mjs
  * --------------------------------------------------
- * 将 backend/ 下的原生模块（主要是 better-sqlite3）重新编译为
- * 当前 Electron 版本可用的 ABI 版本。
+ * 将 backend/ 下的原生模块（主要是 better-sqlite3）准备为
+ * 当前 Electron 版本 + 目标平台可用的二进制。
  *
- * 背景：
- *   走"让后端跑在 Electron 自身（ELECTRON_RUN_AS_NODE=1）"方案后，
- *   better-sqlite3 的 .node 必须使用 Electron 内置的 node headers 编译，
- *   否则会在 require 阶段抛 "ERR_DLOPEN_FAILED" / "was compiled against
- *   a different Node.js version" 等错误。
+ * 两种模式：
+ *   1) 同平台 rebuild（host == target）
+ *        - 调 @electron/rebuild 真编译
+ *        - 覆盖 electron ABI、目标平台的 PE/ELF/Mach-O 文件格式
+ *   2) 跨平台 prepare（host != target，例如 Linux 上打 Win 包）
+ *        - @electron/rebuild 只能编 host 架构，编出来装到目标平台会
+ *          报 "is not a valid Win32 application" / "wrong ELF class" 等
+ *        - 改为通过 prebuild-install 直接下载 better-sqlite3 官方为
+ *          该 Electron 版本 + 目标 platform/arch 预编译好的 .node
  *
- *   electron-builder 自带的 `install-app-deps` 只扫根 node_modules，进不到 backend，
- *   所以需要显式调用 @electron/rebuild。
- *
- * 关键陷阱（2026-05 修复）：
- *   `npm ci` 安装时 prebuild-install 会下载 **针对裸 Node 的 prebuilt 二进制**
- *   （NODE_MODULE_VERSION=115，对应 Node 20）。
- *   此时 build/Release/better_sqlite3.node 已经存在，
- *   即便加了 force:true，@electron/rebuild 在某些版本下仍可能在 < 1s 内
- *   "完成"——它实际上跑了一次 prebuild-install 重新拉了一份针对 electron 的
- *   预编译包；但若网络或 registry 拿到的还是 node 版的，就会无声失败。
- *
- *   保险做法：rebuild 前 **强制删掉旧的 .node 和整个 build/ 目录**，
- *   并通过环境变量 `npm_config_build_from_source=true` 让 prebuild-install
- *   跳过下载、强制走源码编译。这样若环境缺少 python/MSVC 会直接报错，
- *   而不是装一个 ABI 错位的二进制后到用户机才崩。
+ * 关键陷阱（历史教训）：
+ *   A) `npm ci` 会先让 prebuild-install 下载 **裸 Node 版** prebuilt
+ *      (NODE_MODULE_VERSION=115，非 Electron ABI)，装包后崩。
+ *      → 必须在 rebuild/download 前先清掉旧 build/prebuilds。
+ *   B) 只校验 electronVersion 不校验 platform/arch 时，Linux 上编出的
+ *      `.so` 可以糊弄 stamp 通过，打进 Win 安装包后 dlopen 失败。
+ *      → 现在 stamp 里写入 platform + arch，builder.config.js 强校验。
  *
  * 用法：
  *   node scripts/rebuild-native.mjs
+ *       同平台构建（默认）
+ *   node scripts/rebuild-native.mjs --target-platform=win32 --target-arch=x64
+ *       跨平台准备（例：Linux 上打 Win 包前）
+ *   环境变量等价：TARGET_PLATFORM / TARGET_ARCH
  *
  * 要求：
  *   npm i -D @electron/rebuild
- *   Windows 还需要 VS Build Tools（含 C++）+ Python 3
+ *   Windows（同平台 rebuild）还需要 VS Build Tools（含 C++）+ Python 3
+ *   跨平台 prepare 不需要编译工具链，只需要网络能下载 better-sqlite3 prebuilt
  */
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { spawnSync } from "node:child_process";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -48,7 +50,69 @@ function rimrafSync(p) {
   fs.rmSync(p, { recursive: true, force: true });
 }
 
+/** 解析 --key=value 或 --key value 形式的命令行参数 */
+function parseArgs(argv) {
+  const out = {};
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (!a.startsWith("--")) continue;
+    const eq = a.indexOf("=");
+    if (eq > 0) {
+      out[a.slice(2, eq)] = a.slice(eq + 1);
+    } else {
+      const next = argv[i + 1];
+      if (next && !next.startsWith("--")) {
+        out[a.slice(2)] = next;
+        i++;
+      } else {
+        out[a.slice(2)] = "true";
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * 通过读取文件魔数判断 `.node` 的目标平台，避免 stamp 被手工篡改后仍然放行。
+ *   Windows PE:   "MZ"        (0x4D 0x5A)
+ *   Linux ELF:    "\x7FELF"   (0x7F 0x45 0x4C 0x46)
+ *   macOS Mach-O: 0xCF FA ED FE / 0xCE FA ED FE / 0xCA FE BA BE (fat)
+ */
+function detectNodeFilePlatform(nodeFile) {
+  try {
+    const fd = fs.openSync(nodeFile, "r");
+    const buf = Buffer.alloc(4);
+    fs.readSync(fd, buf, 0, 4, 0);
+    fs.closeSync(fd);
+    if (buf[0] === 0x4d && buf[1] === 0x5a) return "win32";
+    if (buf[0] === 0x7f && buf[1] === 0x45 && buf[2] === 0x4c && buf[3] === 0x46)
+      return "linux";
+    // Mach-O 32/64-bit, little/big endian, plus fat binary
+    const m = buf.readUInt32BE(0);
+    if (
+      m === 0xfeedface ||
+      m === 0xcefaedfe ||
+      m === 0xfeedfacf ||
+      m === 0xcffaedfe ||
+      m === 0xcafebabe
+    )
+      return "darwin";
+    return "unknown";
+  } catch {
+    return "unknown";
+  }
+}
+
 async function main() {
+  const args = parseArgs(process.argv.slice(2));
+  const targetPlatform =
+    args["target-platform"] || process.env.TARGET_PLATFORM || process.platform;
+  const targetArch =
+    args["target-arch"] || process.env.TARGET_ARCH || process.arch;
+  const hostPlatform = process.platform;
+  const hostArch = process.arch;
+  const isCross = targetPlatform !== hostPlatform || targetArch !== hostArch;
+
   const rootPkg = JSON.parse(
     fs.readFileSync(path.join(ROOT, "package.json"), "utf8")
   );
@@ -58,21 +122,12 @@ async function main() {
     console.error("[rebuild-native] 根 package.json 未找到 electron 依赖");
     process.exit(1);
   }
-  // 去掉 ^ ~ >= 等前缀
   const electronVersion = electronDep.replace(/^[^\d]*/, "");
-  console.log("[rebuild-native] target electron:", electronVersion);
 
-  let rebuild;
-  try {
-    ({ rebuild } = await import("@electron/rebuild"));
-  } catch (e) {
-    console.error(
-      "[rebuild-native] 缺少依赖 @electron/rebuild。请先安装：\n" +
-        "  npm i -D @electron/rebuild\n" +
-        "然后再运行本脚本。"
-    );
-    process.exit(1);
-  }
+  console.log(`[rebuild-native] host:   ${hostPlatform}-${hostArch}`);
+  console.log(`[rebuild-native] target: ${targetPlatform}-${targetArch}`);
+  console.log(`[rebuild-native] mode:   ${isCross ? "CROSS (prebuild-install)" : "NATIVE (@electron/rebuild)"}`);
+  console.log(`[rebuild-native] electron: ${electronVersion}`);
 
   const backendDir = path.join(ROOT, "backend");
   if (!fs.existsSync(path.join(backendDir, "node_modules"))) {
@@ -82,11 +137,10 @@ async function main() {
     process.exit(1);
   }
 
-  // ===== 关键步骤 1：清掉 npm ci 时 prebuild-install 拉下来的 Node 版 .node =====
-  // 这是 ERR_DLOPEN_FAILED 的根因——若不清理，rebuild 可能跳过实际编译。
+  // ===== 关键步骤 1：清掉旧产物（npm ci 时 prebuild-install 拉的 Node 版 .node）=====
   const bsRoot = path.join(backendDir, "node_modules", "better-sqlite3");
   const bsBuildDir = path.join(bsRoot, "build");
-  const bsPrebuildsDir = path.join(bsRoot, "prebuilds"); // 极少数包用 prebuilds 目录
+  const bsPrebuildsDir = path.join(bsRoot, "prebuilds");
   if (fs.existsSync(bsBuildDir)) {
     console.log(`[rebuild-native] 清理旧的编译产物：${bsBuildDir}`);
     rimrafSync(bsBuildDir);
@@ -96,67 +150,124 @@ async function main() {
     rimrafSync(bsPrebuildsDir);
   }
 
-  // ===== 关键步骤 2：让 prebuild-install 不要再去拉预编译包，强制源码编译 =====
-  // 这样能保证编译出来的 .node 严格对齐我们指定的 electronVersion 的 ABI。
-  process.env.npm_config_build_from_source = "true";
-  process.env.PREBUILD_INSTALL_FORCE_BUILD = "true";
-
-  console.log(`[rebuild-native] rebuilding native modules under ${backendDir} ...`);
+  const nodFile = path.join(bsBuildDir, "Release", "better_sqlite3.node");
   const start = Date.now();
-  await rebuild({
-    buildPath: backendDir,
-    electronVersion,
-    force: true,
-    // 只 rebuild 真正需要原生编译的模块（避免把 jszip/mammoth 之类纯 JS 的也扫一遍）
-    onlyModules: ["better-sqlite3"],
-    // 显式禁用 prebuild 缓存，确保走 node-gyp 真编译
-    disablePreGypCopy: true,
-  });
+
+  if (isCross) {
+    // ===== 跨平台分支：用 prebuild-install 直接下 target 平台的 .node =====
+    // @electron/rebuild 只能编出 host 架构，跨平台编出来装不上。
+    // better-sqlite3 官方为每个 Electron ABI × 每个平台都发布了 prebuilt 包，
+    // 直接拉即可。
+    console.log(
+      `[rebuild-native] cross-platform prepare via prebuild-install ` +
+        `(runtime=electron, target=${electronVersion}, platform=${targetPlatform}, arch=${targetArch})`
+    );
+    const npmExec = process.platform === "win32" ? "npx.cmd" : "npx";
+    const res = spawnSync(
+      npmExec,
+      [
+        "--yes",
+        "prebuild-install",
+        "--runtime=electron",
+        `--target=${electronVersion}`,
+        `--platform=${targetPlatform}`,
+        `--arch=${targetArch}`,
+        "--tag-prefix=v",
+      ],
+      {
+        cwd: bsRoot,
+        stdio: "inherit",
+        env: {
+          ...process.env,
+          // 禁止 prebuild-install 把它当成"源码构建回退"——跨平台必须拿到预编译，
+          // 拿不到就直接失败而不是尝试在 host 编译出错 ABI 的产物。
+          npm_config_build_from_source: "false",
+        },
+      }
+    );
+    if (res.status !== 0) {
+      console.error(
+        `[rebuild-native] prebuild-install 失败（退出码 ${res.status}）\n` +
+          `  可能原因：\n` +
+          `    1) 网络无法访问 GitHub Releases（better-sqlite3 prebuilt 托管在那里）\n` +
+          `    2) 该 electron ABI × platform × arch 组合没有官方 prebuilt\n` +
+          `  建议：\n` +
+          `    - 换到 ${targetPlatform} 机器上直接 native rebuild\n` +
+          `    - 或为网络设置代理：HTTPS_PROXY / HTTP_PROXY`
+      );
+      process.exit(1);
+    }
+  } else {
+    // ===== 同平台分支：@electron/rebuild 真编译 =====
+    let rebuild;
+    try {
+      ({ rebuild } = await import("@electron/rebuild"));
+    } catch {
+      console.error(
+        "[rebuild-native] 缺少依赖 @electron/rebuild。请先 npm i -D @electron/rebuild。"
+      );
+      process.exit(1);
+    }
+    // 强制走源码编译，不要被 prebuild-install 捡回裸 Node 版
+    process.env.npm_config_build_from_source = "true";
+    process.env.PREBUILD_INSTALL_FORCE_BUILD = "true";
+    console.log(`[rebuild-native] rebuilding native modules under ${backendDir} ...`);
+    await rebuild({
+      buildPath: backendDir,
+      electronVersion,
+      force: true,
+      onlyModules: ["better-sqlite3"],
+      disablePreGypCopy: true,
+    });
+  }
+
   const elapsed = (Date.now() - start) / 1000;
   console.log(`[rebuild-native] ✓ done in ${elapsed.toFixed(1)}s`);
 
-  // 异常短的耗时几乎一定意味着没有真正编译（C++ 编译至少 10s+）
-  if (elapsed < 3) {
-    console.warn(
-      `[rebuild-native] ⚠ rebuild 仅耗时 ${elapsed.toFixed(1)}s，远低于真实编译时间。\n` +
-        `   这通常意味着实际并未触发 C++ 编译，打出来的包到用户机会 ERR_DLOPEN_FAILED。\n` +
-        `   请检查：\n` +
-        `     1) 是否安装了 C++ 工具链（Windows: VS Build Tools；macOS: Xcode CLT；Linux: build-essential）\n` +
-        `     2) 是否安装了 Python 3\n` +
-        `     3) 网络是否劫持了 prebuild-install 的下载\n`
-    );
-  }
-
-  // 验证 .node 文件确实存在
-  const nodFile = path.join(
-    backendDir,
-    "node_modules",
-    "better-sqlite3",
-    "build",
-    "Release",
-    "better_sqlite3.node"
-  );
+  // ===== 验证产物 =====
   if (!fs.existsSync(nodFile)) {
     console.error(
-      `[rebuild-native] ⚠ 编译后未找到 ${nodFile}，打包后 Electron 启动会报 ERR_DLOPEN_FAILED！`
+      `[rebuild-native] ⚠ 未找到 ${nodFile}，打包后 Electron 启动会报 ERR_DLOPEN_FAILED！`
     );
     process.exit(1);
   }
   const stat = fs.statSync(nodFile);
+  const detectedPlatform = detectNodeFilePlatform(nodFile);
+  const expectDetected =
+    targetPlatform === "win32"
+      ? "win32"
+      : targetPlatform === "darwin"
+        ? "darwin"
+        : "linux";
+  if (detectedPlatform !== expectDetected) {
+    console.error(
+      `[rebuild-native] ✗ 产物平台不匹配！\n` +
+        `   期望: ${expectDetected}（${targetPlatform}-${targetArch}）\n` +
+        `   实际: ${detectedPlatform}（根据文件魔数识别）\n` +
+        `   这份 .node 拷到目标机器一定 dlopen 失败。`
+    );
+    process.exit(1);
+  }
   console.log(
-    `[rebuild-native] ✓ verified: ${nodFile} (${(stat.size / 1024 / 1024).toFixed(1)} MB, mtime=${stat.mtime.toISOString()})`
+    `[rebuild-native] ✓ verified: ${nodFile} ` +
+      `(${(stat.size / 1024 / 1024).toFixed(1)} MB, detected=${detectedPlatform})`
   );
 
-  // ===== 步骤 3：写一个 stamp 文件，记录这份 .node 是为哪个 Electron 编译的 =====
-  // 后续可被 builder.config.js 的 beforeBuild 读取做更强校验。
+  // ===== 写 stamp =====
   const stampPath = path.join(bsBuildDir, "Release", ".electron-abi.json");
   fs.writeFileSync(
     stampPath,
     JSON.stringify(
       {
         electronVersion,
+        platform: targetPlatform,
+        arch: targetArch,
+        detectedPlatform,
         rebuiltAt: new Date().toISOString(),
         nodeMtime: stat.mtime.toISOString(),
+        mode: isCross ? "cross-prebuild" : "native-rebuild",
+        hostPlatform,
+        hostArch,
       },
       null,
       2

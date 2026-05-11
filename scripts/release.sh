@@ -1580,52 +1580,79 @@ if [ "$HAS_PC" = "1" ]; then
     if [ "$UNAME_S_PC" = "Linux" ] || [ "$UNAME_S_PC" = "Darwin" ]; then
         # 输出目录：在 Linux/macOS 上不做 tmpdir 切换，默认 dist-electron/
         # （NOWEN_BUILD_OUT 主要是 Windows 下避免 IDE 监听，Linux/macOS 不需要）
-        info "rebuild:native + build:all"
+        info "build:all"
         if [ "$DRY_RUN" = "1" ]; then
-            echo "  (dry-run) npm run rebuild:native"
             echo "  (dry-run) npm run build:all"
         else
-            ( cd "$REPO_ROOT" && run_argv npm run rebuild:native )
             ( cd "$REPO_ROOT" && run_argv npm run build:all )
         fi
 
-        # 拼 electron-builder 平台参数
+        # ---- rebuild:native 按平台各打一遍 ----
+        # 历史教训（2026-05）：原先一次 rebuild:native + 多平台 electron-builder，
+        # 在 Linux 宿主上会把 better-sqlite3 编成 Linux .so 塞进 Win 安装包，
+        # 用户启动时 LoadLibrary 报 "is not a valid Win32 application"。
+        # 修复：每跑一个平台目标前，按 target-platform 重新准备 better-sqlite3.node：
+        #   - host == target：调 @electron/rebuild 真编
+        #   - host != target：跨平台分支，用 prebuild-install 下官方 prebuilt
+        # 然后 electron-builder 只打这一个平台。
+        #
+        # HOST_PLATFORM：Linux -> linux, Darwin -> darwin（macOS）
+        if [ "$UNAME_S_PC" = "Linux" ]; then HOST_PLATFORM="linux"; else HOST_PLATFORM="darwin"; fi
+
+        _build_one_pc_target() {
+            local _eb_flag="$1"     # --win / --linux / --mac
+            local _target_plat="$2" # win32 / linux / darwin
+            local _target_arch="${3:-x64}"
+            info "rebuild:native for ${_target_plat}-${_target_arch} (host=${HOST_PLATFORM})"
+            if [ "$DRY_RUN" = "1" ]; then
+                echo "  (dry-run) npm run rebuild:native -- --target-platform=${_target_plat} --target-arch=${_target_arch}"
+                echo "  (dry-run) npx electron-builder --config electron/builder.config.js --publish never ${_eb_flag}"
+                return 0
+            fi
+            ( cd "$REPO_ROOT" && run_argv npm run rebuild:native -- \
+                --target-platform="${_target_plat}" --target-arch="${_target_arch}" )
+            info "electron-builder ${_eb_flag}"
+            set +e
+            ( cd "$REPO_ROOT" && run_argv npx electron-builder \
+                --config electron/builder.config.js \
+                --publish never \
+                "${_eb_flag}" )
+            local _ec=$?
+            set -e
+            if [ "$_ec" != "0" ]; then
+                echo
+                warn "electron-builder ${_eb_flag} 退出码 $_ec"
+                if [ "$_eb_flag" = "--win" ] && [ "$UNAME_S_PC" = "Linux" ]; then
+                    warn "你正在 Linux 下打 Windows 目标，常见失败原因："
+                    warn "  1) wine 跑 rcedit 被 OOM-kill (signal: killed) → 给 WSL2 加内存：%UserProfile%\\.wslconfig 设 memory=12GB swap=8GB，再 wsl --shutdown"
+                    warn "  2) wine 32 位子系统未装 → sudo dpkg --add-architecture i386 && sudo apt install -y wine32:i386 && wineboot -i"
+                    warn "  3) winCodeSign 下载被墙 → 设 NOWEN_SKIP_RCEDIT=1 跳过 rcedit/签名"
+                    warn "  4) prebuild-install 拉 win32 better-sqlite3 超时 → 设 HTTPS_PROXY"
+                fi
+                die "PC 端打包失败（原子发布：未推送任何东西）"
+            fi
+        }
+
+        if [ "$PC_HAS_WIN" = "1" ]; then
+            _build_one_pc_target --win win32 x64
+        fi
+        if [ "$PC_HAS_LINUX" = "1" ]; then
+            _build_one_pc_target --linux linux x64
+        fi
+        if [ "$PC_HAS_MAC" = "1" ]; then
+            _build_one_pc_target --mac darwin x64
+        fi
+
+        # 兼容后续步骤可能引用的变量（原实现使用一次性 EB_PLATFORM_ARGS）
         EB_PLATFORM_ARGS=()
         [ "$PC_HAS_WIN" = "1" ]   && EB_PLATFORM_ARGS+=( --win )
         [ "$PC_HAS_LINUX" = "1" ] && EB_PLATFORM_ARGS+=( --linux )
         [ "$PC_HAS_MAC" = "1" ]   && EB_PLATFORM_ARGS+=( --mac )
 
-        info "electron-builder ${EB_PLATFORM_ARGS[*]}"
-        if [ "$DRY_RUN" = "1" ]; then
-            echo "  (dry-run) npx electron-builder --config electron/builder.config.js ${EB_PLATFORM_ARGS[*]}"
-        else
-            # 临时关闭 publish（避免 electron-builder 自动推 GitHub；我们自己用 gh release 上传）
-            # --publish never 是 CLI 标准开关，-c.publish=never 在 25.x 会被当成非法 provider
-            #
-            # 这里特意临时关掉 set -e 跑 electron-builder，捕获退出码后再决定怎么报错：
-            # - electron-builder 在 Linux 上跑 win 目标时常见失败：wine 跑 rcedit 被 OOM-kill (signal: killed)
-            # - 直接 set -e die 出来用户只看到一串 builder 日志，不知道根因
-            # 这里失败就主动 die，并附上常见原因提示，原子发布时更友好
-            set +e
-            ( cd "$REPO_ROOT" && run_argv npx electron-builder \
-                --config electron/builder.config.js \
-                --publish never \
-                "${EB_PLATFORM_ARGS[@]}" )
-            _EB_EXIT=$?
-            set -e
-            if [ "$_EB_EXIT" != "0" ]; then
-                echo
-                warn "electron-builder 退出码 $_EB_EXIT"
-                if [ "$PC_HAS_WIN" = "1" ] && [ "$UNAME_S_PC" = "Linux" ]; then
-                    warn "你正在 Linux 下打 Windows 目标，常见失败原因："
-                    warn "  1) wine 跑 rcedit 被 OOM-kill (signal: killed) → 给 WSL2 加内存：%UserProfile%\\.wslconfig 设 memory=12GB swap=8GB，再 wsl --shutdown"
-                    warn "  2) wine 32 位子系统未装 → sudo dpkg --add-architecture i386 && sudo apt install -y wine32:i386 && wineboot -i"
-                    warn "  3) winCodeSign 下载被墙 → 设 NOWEN_SKIP_RCEDIT=1 跳过 rcedit/签名（产物可用，仅缺 exe 元信息）"
-                    warn "  4) 想绕过 PC 段：删掉 win 目标 → ./release.sh --pc-platform linux"
-                fi
-                die "PC 端打包失败（原子发布：未推送任何东西）"
-            fi
-        fi
+        # 注：每个平台目标已经在上面的 _build_one_pc_target 中独立打过了
+        # （每打一个平台前都会重新 rebuild:native 为对应平台准备 better-sqlite3.node）
+        # 这里不能再 `electron-builder ${EB_PLATFORM_ARGS[*]}`，否则最后一个 rebuild 的
+        # 目标会把之前平台的 .node 覆盖，产物再次错位。
     else
         # Windows 宿主：沿用 safe-build.mjs（只会出 win 目标，这里忽略用户 --pc-platform 里的 linux/mac）
         if [ "$PC_HAS_LINUX" = "1" ] || [ "$PC_HAS_MAC" = "1" ]; then
