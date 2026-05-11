@@ -1,6 +1,11 @@
 {
-  "generatedAt": "2026-05-11T08:07:25.781Z",
+  "generatedAt": "2026-05-11T09:09:22.844Z",
   "entries": [
+    {
+      "version": "1.0.34",
+      "date": "2026-05-11",
+      "body": "### 🐛 修复\n\n- **db**: 修复老库启动崩溃 SqliteError: no such column: conversationId (984b1c4)\n- **electron**: 修复 Win 安装包启动报 ERR_DLOPEN_FAILED 的根因 (8d2da99)\n- **tasks**: 更新任务后同步刷新左侧分组计数（今天/未来7天/已逾期） (b39a825)\n- **tasks**: 修复待办按日期分组/展示的时区错位（今天/本周/逾期） (edcc285)"
+    },
     {
       "version": "1.0.33",
       "date": "2026-05-11",

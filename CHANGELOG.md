@@ -12,6 +12,16 @@
 
 <!-- ADD_NEW_HERE -->
 
+## v1.0.34 - 2026-05-11
+
+### 🐛 修复
+
+- **db**: 修复老库启动崩溃 SqliteError: no such column: conversationId (984b1c4)
+- **electron**: 修复 Win 安装包启动报 ERR_DLOPEN_FAILED 的根因 (8d2da99)
+- **tasks**: 更新任务后同步刷新左侧分组计数（今天/未来7天/已逾期） (b39a825)
+- **tasks**: 修复待办按日期分组/展示的时区错位（今天/本周/逾期） (edcc285)
+
+
 ## v1.0.33 - 2026-05-11
 
 ### ✨ 新增
