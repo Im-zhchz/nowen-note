@@ -735,7 +735,13 @@ function initSchema(db: Database.Database) {
     );
 
     CREATE INDEX IF NOT EXISTS idx_ai_chat_user_created ON ai_chat_messages(userId, createdAt);
-    CREATE INDEX IF NOT EXISTS idx_ai_chat_msg_conv ON ai_chat_messages(conversationId, createdAt);
+    -- 注意：idx_ai_chat_msg_conv (conversationId, createdAt) 的建立**不能**放在
+    -- initSchema 里。原因：对 v9 或更早版本创建的老库，ai_chat_messages 表已存在
+    -- 但没有 conversationId 列，此处 CREATE TABLE IF NOT EXISTS 不会补列，紧接着
+    -- 建索引会抛 SqliteError: no such column: conversationId，导致 initSchema
+    -- 崩溃，连后面的 runMigrations（v10 会补列）都没机会跑 —— 死锁。
+    -- 该索引由 migrations.ts 的 v10 迁移统一创建（addColumnIfMissing 后建索引），
+    -- 对全新库也会在同一次启动补建（IF NOT EXISTS 幂等）。
   `);
 
   // ==============================================================
