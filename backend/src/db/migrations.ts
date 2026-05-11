@@ -720,6 +720,108 @@ export const MIGRATIONS: Migration[] = [
       `);
     },
   },
+
+  // ==========================================================================
+  // v10：AI 知识问答"多会话"支持
+  // --------------------------------------------------------------------------
+  // 背景：
+  //   v9 之前 ai_chat_messages 只按 userId 挂载，没有"会话 / 对话分组"概念。
+  //   所有消息渲染为一条长滚动记录，用户无法像 ChatGPT 那样分主题保存多段
+  //   对话。用户要求：「AI 知识问答支持多个聊天、保存多个聊天记录」。
+  //
+  // 方案：
+  //   1) 新建 ai_chat_conversations 表，按 userId 分组；每个用户可创建多条
+  //      会话，记录 title（可空=自动命名）、createdAt、updatedAt、archived。
+  //   2) 给 ai_chat_messages 加 conversationId 列 + 索引；外键指向
+  //      ai_chat_conversations.id，ON DELETE CASCADE 让"删除会话"连带清理
+  //      消息（SQLite ALTER ADD COLUMN 不能直接加 FOREIGN KEY，但 CASCADE
+  //      行为由业务层 DELETE 显式触发即可，这里不走 FK 级联）。
+  //   3) 存量回填：给每个"有历史消息"的 userId 创建一条"默认对话"，并把该
+  //      用户的所有已有消息挂到该对话。这样老用户升级后已经沉淀的 AI 对话
+  //      自动落到"默认对话"里，不会丢。
+  //
+  // 索引：
+  //   - ai_chat_conversations: (userId, archived, updatedAt DESC) 用于会话列表
+  //   - ai_chat_messages: (conversationId, createdAt) 用于单会话时间线渲染
+  //
+  // 回滚：回到 v9 时新表仍在但不读、ai_chat_messages.conversationId 列仍在但
+  //   被忽略——v9 代码走 (userId, createdAt) 一次性全拉回来，跨会话的消息会
+  //   混在一起显示。虽然视觉上不再"分组"，但数据不丢。
+  //
+  // 幂等：
+  //   - CREATE TABLE / INDEX IF NOT EXISTS；
+  //   - ALTER ADD COLUMN 走 addColumnIfMissing；
+  //   - 回填用 INSERT ... WHERE NOT EXISTS + UPDATE ... WHERE conversationId IS NULL，
+  //     二次重放不产生重复对话行。
+  {
+    version: 10,
+    name: "ai-chat-conversations",
+    up: (db) => {
+      const addColumnIfMissing = (
+        table: string,
+        column: string,
+        definition: string,
+      ) => {
+        const cols = db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
+        if (cols.length === 0) return;
+        if (cols.some((c) => c.name === column)) return;
+        db.prepare(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`).run();
+      };
+
+      // ---- 1. 会话表 ----
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS ai_chat_conversations (
+          id TEXT PRIMARY KEY,
+          userId TEXT NOT NULL,
+          title TEXT NOT NULL DEFAULT '',
+          archived INTEGER NOT NULL DEFAULT 0,
+          createdAt TEXT NOT NULL DEFAULT (datetime('now')),
+          updatedAt TEXT NOT NULL DEFAULT (datetime('now')),
+          FOREIGN KEY (userId) REFERENCES users(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_ai_chat_conv_user
+          ON ai_chat_conversations(userId, archived, updatedAt DESC);
+      `);
+
+      // ---- 2. 给 ai_chat_messages 加 conversationId + 索引 ----
+      addColumnIfMissing("ai_chat_messages", "conversationId", "TEXT");
+      db.exec(
+        "CREATE INDEX IF NOT EXISTS idx_ai_chat_msg_conv ON ai_chat_messages(conversationId, createdAt);",
+      );
+
+      // ---- 3. 回填：为每个有历史消息且还没有默认会话的 userId 创建一个 ----
+      // 策略：找出"有消息但任意消息 conversationId 仍为 NULL"的 userId，
+      // 为其生成一个 id 前缀 "legacy-" 的默认会话；title 置空（前端展示
+      // i18n 的"默认对话"），updatedAt 取该用户最新一条消息时间。
+      const orphanUsers = db.prepare(`
+        SELECT DISTINCT userId
+        FROM ai_chat_messages
+        WHERE conversationId IS NULL
+      `).all() as { userId: string }[];
+
+      const insertConv = db.prepare(`
+        INSERT INTO ai_chat_conversations (id, userId, title, archived, createdAt, updatedAt)
+        VALUES (?, ?, '', 0, COALESCE(?, datetime('now')), COALESCE(?, datetime('now')))
+      `);
+      const updateMsg = db.prepare(`
+        UPDATE ai_chat_messages
+           SET conversationId = ?
+         WHERE userId = ? AND conversationId IS NULL
+      `);
+      const pickTime = db.prepare(`
+        SELECT MIN(createdAt) AS minT, MAX(createdAt) AS maxT
+        FROM ai_chat_messages
+        WHERE userId = ?
+      `);
+
+      for (const u of orphanUsers) {
+        const t = pickTime.get(u.userId) as { minT: string | null; maxT: string | null };
+        const convId = `legacy-${u.userId}-${Date.now().toString(36)}`;
+        insertConv.run(convId, u.userId, t.minT || null, t.maxT || null);
+        updateMsg.run(convId, u.userId);
+      }
+    },
+  },
 ];
 
 /** 当前代码已知的最高 schema 版本（== MIGRATIONS 里 max(version)）。 */

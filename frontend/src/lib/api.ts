@@ -1694,9 +1694,12 @@ export const api = {
     return res.json();
   },
 
-  // AI 聊天记录：跨会话持久化到后端
+  // AI 聊天记录：跨会话持久化到后端（v10 起支持多会话）
   // 这些方法失败时抛错由调用方决定如何容错（通常面板加载失败就退回空列表即可）。
-  getAiChatHistory: async (limit = 100): Promise<{
+  getAiChatHistory: async (
+    limit = 100,
+    conversationId?: string,
+  ): Promise<{
     messages: {
       id: string;
       role: "user" | "assistant";
@@ -1710,9 +1713,13 @@ export const api = {
       }[];
       createdAt: string;
     }[];
+    conversationId: string | null;
   }> => {
     const token = getToken();
-    const res = await fetch(`${getBaseUrl()}/ai/chat-history?limit=${encodeURIComponent(limit)}`, {
+    const params = new URLSearchParams();
+    params.set("limit", String(limit));
+    if (conversationId) params.set("conversationId", conversationId);
+    const res = await fetch(`${getBaseUrl()}/ai/chat-history?${params.toString()}`, {
       headers: {
         ...(token ? { Authorization: `Bearer ${token}` } : {}),
       },
@@ -1723,6 +1730,7 @@ export const api = {
 
   appendAiChatHistory: async (msg: {
     id?: string;
+    conversationId?: string;
     role: "user" | "assistant";
     content: string;
     references?: {
@@ -1732,7 +1740,7 @@ export const api = {
       attachmentId?: string;
       attachmentFilename?: string;
     }[];
-  }): Promise<{ ok: boolean; id?: string; createdAt?: string; skipped?: boolean }> => {
+  }): Promise<{ ok: boolean; id?: string; createdAt?: string; skipped?: boolean; conversationId?: string }> => {
     const token = getToken();
     const res = await fetch(`${getBaseUrl()}/ai/chat-history`, {
       method: "POST",
@@ -1746,9 +1754,12 @@ export const api = {
     return res.json();
   },
 
-  clearAiChatHistory: async (): Promise<{ ok: boolean; deleted: number }> => {
+  clearAiChatHistory: async (conversationId?: string): Promise<{ ok: boolean; deleted: number }> => {
     const token = getToken();
-    const res = await fetch(`${getBaseUrl()}/ai/chat-history`, {
+    const params = new URLSearchParams();
+    if (conversationId) params.set("conversationId", conversationId);
+    const qs = params.toString();
+    const res = await fetch(`${getBaseUrl()}/ai/chat-history${qs ? `?${qs}` : ""}`, {
       method: "DELETE",
       headers: {
         ...(token ? { Authorization: `Bearer ${token}` } : {}),
@@ -1756,6 +1767,50 @@ export const api = {
     });
     if (!res.ok) throw new Error("清空聊天记录失败");
     return res.json();
+  },
+
+  // ========== AI 会话（多对话）==========
+  // 约定：一个会话就是一个"话题"，可改名、可删除。消息通过 conversationId 挂到会话。
+  // 列表失败由组件自行兜底（退化到"空列表 + 创建默认会话"即可）。
+  aiConversations: {
+    list: () =>
+      request<{
+        conversations: {
+          id: string;
+          title: string;
+          archived: boolean;
+          createdAt: string;
+          updatedAt: string;
+          messageCount: number;
+          lastMessage: string | null;
+          lastRole: string | null;
+        }[];
+      }>("/ai/conversations"),
+    create: (data?: { title?: string }) =>
+      request<{
+        conversation: {
+          id: string;
+          title: string;
+          archived: boolean;
+          createdAt: string;
+          updatedAt: string;
+          messageCount: number;
+          lastMessage: string | null;
+          lastRole: string | null;
+        };
+      }>("/ai/conversations", {
+        method: "POST",
+        body: JSON.stringify(data || {}),
+      }),
+    update: (id: string, data: { title?: string; archived?: boolean }) =>
+      request<{ ok: boolean }>(`/ai/conversations/${encodeURIComponent(id)}`, {
+        method: "PATCH",
+        body: JSON.stringify(data),
+      }),
+    remove: (id: string) =>
+      request<{ ok: boolean }>(`/ai/conversations/${encodeURIComponent(id)}`, {
+        method: "DELETE",
+      }),
   },
 
   // ========== AI 自定义指令模板（P2）==========

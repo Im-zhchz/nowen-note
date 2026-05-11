@@ -1289,38 +1289,229 @@ ai.post("/embeddings/reindex-vec", (c) => {
 });
 
 // ==============================================================
-// AI 聊天记录持久化
+// AI 聊天记录持久化（多会话）
 // ==============================================================
 //
-// 设计：按用户维度保存消息列表，单条一行（见 schema.ai_chat_messages）。
-// 不做会话（session）分组，面板就是"一条长滚动记录"，和当前前端行为一致。
-// 前端职责：
-//   - 打开面板时 GET /chat-history 恢复
-//   - 用户发送时先 POST 一条 user 消息
-//   - AI 流式结束后再 POST 一条 assistant 消息（附 references）
-//   - 点"清空"调用 DELETE /chat-history
-// 这样即便流式中途断线，assistant 那一条不会入库，下次刷新不会出现半截回复。
+// 设计（v10 起）：
+//   每条消息挂到 ai_chat_conversations 的一条会话下，一个用户可以创建
+//   多条会话（类似 ChatGPT 左侧对话列表），前端默认打开"最近一条会话"。
+//
+//   前端职责：
+//     - 打开面板时 GET /conversations 拉列表、GET /chat-history?conversationId=...
+//       拉当前会话的消息
+//     - 点"新建对话"调 POST /conversations 拿 id
+//     - 用户发送时：POST /chat-history 必须带 conversationId；AI 流式结束后
+//       再 POST assistant 消息（同一个 conversationId）
+//     - 点"删除会话"调 DELETE /conversations/:id（级联删除该会话下所有消息）
+//     - 点"重命名"调 PATCH /conversations/:id
+//
+//   兼容旧前端：POST /chat-history 未传 conversationId 时，会自动挂到"最近一次
+//   活跃的会话"（没有任何会话时现场建一条）——这样旧前端升级前后都能写入，
+//   但多会话语义只有新前端才能真正用起来。
 
 // 最多保留的历史条数；超过时按时间最老的裁掉（每次 POST 后兜底修剪）
+// 注意：v10 起裁剪范围从"用户"收紧到"会话"，避免一条活跃会话挤掉其它会话
+// 的历史——多会话的本意就是把各个话题隔开保存。
 const CHAT_HISTORY_KEEP = 200;
 
-// GET /api/ai/chat-history?limit=100
-// 返回当前用户的聊天记录，按 createdAt 升序（便于前端直接渲染）
+/** 获取或现场创建一个"最近活跃"的会话 id，用于兼容未传 conversationId 的旧前端调用 */
+function ensureDefaultConversation(db: ReturnType<typeof getDb>, userId: string): string {
+  const row = db.prepare(`
+    SELECT id FROM ai_chat_conversations
+    WHERE userId = ? AND archived = 0
+    ORDER BY updatedAt DESC, createdAt DESC
+    LIMIT 1
+  `).get(userId) as { id: string } | undefined;
+  if (row) return row.id;
+  const id = `conv-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  db.prepare(`
+    INSERT INTO ai_chat_conversations (id, userId, title, archived, createdAt, updatedAt)
+    VALUES (?, ?, '', 0, datetime('now'), datetime('now'))
+  `).run(id, userId);
+  return id;
+}
+
+/** 校验会话归属；不存在或跨用户返回 null */
+function getConversation(
+  db: ReturnType<typeof getDb>,
+  userId: string,
+  conversationId: string,
+): { id: string; title: string } | null {
+  const row = db.prepare(`
+    SELECT id, title FROM ai_chat_conversations
+    WHERE id = ? AND userId = ?
+  `).get(conversationId, userId) as { id: string; title: string } | undefined;
+  return row ?? null;
+}
+
+// ---------- 会话列表 ----------
+// GET /api/ai/conversations
+// 返回当前用户的会话（按 updatedAt 倒序），每条附最近一条消息做 preview
+ai.get("/conversations", (c) => {
+  const db = getDb();
+  const userId = c.req.header("X-User-Id") || "demo";
+
+  const rows = db.prepare(`
+    SELECT
+      conv.id,
+      conv.title,
+      conv.archived,
+      conv.createdAt,
+      conv.updatedAt,
+      (SELECT COUNT(*) FROM ai_chat_messages m WHERE m.conversationId = conv.id) AS messageCount,
+      (SELECT content FROM ai_chat_messages m WHERE m.conversationId = conv.id
+        ORDER BY createdAt DESC, id DESC LIMIT 1) AS lastMessage,
+      (SELECT role FROM ai_chat_messages m WHERE m.conversationId = conv.id
+        ORDER BY createdAt DESC, id DESC LIMIT 1) AS lastRole
+    FROM ai_chat_conversations conv
+    WHERE conv.userId = ?
+    ORDER BY conv.updatedAt DESC, conv.createdAt DESC
+  `).all(userId) as {
+    id: string;
+    title: string;
+    archived: number;
+    createdAt: string;
+    updatedAt: string;
+    messageCount: number;
+    lastMessage: string | null;
+    lastRole: string | null;
+  }[];
+
+  return c.json({
+    conversations: rows.map(r => ({
+      id: r.id,
+      title: r.title || "",
+      archived: r.archived === 1,
+      createdAt: r.createdAt,
+      updatedAt: r.updatedAt,
+      messageCount: r.messageCount,
+      lastMessage: r.lastMessage ? r.lastMessage.slice(0, 80) : null,
+      lastRole: r.lastRole,
+    })),
+  });
+});
+
+// POST /api/ai/conversations
+// body: { title? }  创建新会话并返回其 id
+ai.post("/conversations", async (c) => {
+  const db = getDb();
+  const userId = c.req.header("X-User-Id") || "demo";
+  let body: { title?: string } = {};
+  try { body = await c.req.json(); } catch { /* 允许空 body */ }
+  const title = typeof body.title === "string" ? body.title.trim().slice(0, 100) : "";
+
+  const id = `conv-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  db.prepare(`
+    INSERT INTO ai_chat_conversations (id, userId, title, archived, createdAt, updatedAt)
+    VALUES (?, ?, ?, 0, datetime('now'), datetime('now'))
+  `).run(id, userId, title);
+
+  const row = db.prepare(
+    "SELECT id, title, archived, createdAt, updatedAt FROM ai_chat_conversations WHERE id = ?"
+  ).get(id) as {
+    id: string; title: string; archived: number; createdAt: string; updatedAt: string;
+  };
+
+  return c.json({
+    conversation: {
+      id: row.id,
+      title: row.title || "",
+      archived: row.archived === 1,
+      createdAt: row.createdAt,
+      updatedAt: row.updatedAt,
+      messageCount: 0,
+      lastMessage: null,
+      lastRole: null,
+    },
+  });
+});
+
+// PATCH /api/ai/conversations/:id   body: { title?, archived? }
+ai.patch("/conversations/:id", async (c) => {
+  const db = getDb();
+  const userId = c.req.header("X-User-Id") || "demo";
+  const id = c.req.param("id");
+
+  let body: { title?: string; archived?: boolean } = {};
+  try { body = await c.req.json(); } catch { /* ignore */ }
+
+  const conv = getConversation(db, userId, id);
+  if (!conv) return c.json({ error: "conversation not found" }, 404);
+
+  const sets: string[] = [];
+  const args: (string | number)[] = [];
+  if (typeof body.title === "string") {
+    sets.push("title = ?");
+    args.push(body.title.trim().slice(0, 100));
+  }
+  if (typeof body.archived === "boolean") {
+    sets.push("archived = ?");
+    args.push(body.archived ? 1 : 0);
+  }
+  if (sets.length === 0) return c.json({ ok: true, noop: true });
+
+  sets.push("updatedAt = datetime('now')");
+  args.push(id);
+  db.prepare(`UPDATE ai_chat_conversations SET ${sets.join(", ")} WHERE id = ?`).run(...args);
+
+  return c.json({ ok: true });
+});
+
+// DELETE /api/ai/conversations/:id
+// 连带删除会话下的所有消息（SQLite ALTER 加列拿不到 FK CASCADE，这里显式删）
+ai.delete("/conversations/:id", (c) => {
+  const db = getDb();
+  const userId = c.req.header("X-User-Id") || "demo";
+  const id = c.req.param("id");
+
+  const conv = getConversation(db, userId, id);
+  if (!conv) return c.json({ error: "conversation not found" }, 404);
+
+  const tx = db.transaction(() => {
+    db.prepare("DELETE FROM ai_chat_messages WHERE conversationId = ? AND userId = ?").run(id, userId);
+    db.prepare("DELETE FROM ai_chat_conversations WHERE id = ? AND userId = ?").run(id, userId);
+  });
+  tx();
+
+  return c.json({ ok: true });
+});
+
+// GET /api/ai/chat-history?conversationId=xxx&limit=100
+// conversationId 可选：
+//   - 传了：返回该会话的消息（校验归属）
+//   - 未传：返回"最近活跃会话"的消息（兼容旧前端）；若该用户没任何消息/会话则返回 []
 ai.get("/chat-history", (c) => {
   const db = getDb();
   const userId = c.req.header("X-User-Id") || "demo";
   const limitParam = Number(c.req.query("limit") || "100");
-  // 保护：限制 1~500
   const limit = Math.min(500, Math.max(1, Number.isFinite(limitParam) ? limitParam : 100));
+  const convIdParam = c.req.query("conversationId") || "";
+
+  let convId = "";
+  if (convIdParam) {
+    const conv = getConversation(db, userId, convIdParam);
+    if (!conv) return c.json({ error: "conversation not found" }, 404);
+    convId = conv.id;
+  } else {
+    // 未传：挑最近活跃会话；没任何会话就直接返回空（不创建，避免 GET 产生副作用）
+    const row = db.prepare(`
+      SELECT id FROM ai_chat_conversations
+      WHERE userId = ? AND archived = 0
+      ORDER BY updatedAt DESC, createdAt DESC
+      LIMIT 1
+    `).get(userId) as { id: string } | undefined;
+    if (!row) return c.json({ messages: [], conversationId: null });
+    convId = row.id;
+  }
 
   // 按时间倒序取最近 N 条，再在内存里反转成升序；SQL 里直接 ORDER BY ASC LIMIT 无法拿"最近 N 条"
   const rows = db.prepare(`
     SELECT id, role, content, referencesJson, createdAt
     FROM ai_chat_messages
-    WHERE userId = ?
+    WHERE userId = ? AND conversationId = ?
     ORDER BY createdAt DESC, id DESC
     LIMIT ?
-  `).all(userId, limit) as {
+  `).all(userId, convId, limit) as {
     id: string;
     role: string;
     content: string;
@@ -1336,7 +1527,7 @@ ai.get("/chat-history", (c) => {
     createdAt: r.createdAt,
   }));
 
-  return c.json({ messages });
+  return c.json({ messages, conversationId: convId });
 });
 
 function safeParseRefs(s: string): { id: string; title: string }[] | undefined {
@@ -1348,14 +1539,15 @@ function safeParseRefs(s: string): { id: string; title: string }[] | undefined {
 }
 
 // POST /api/ai/chat-history
-// body: { id?, role: 'user'|'assistant', content: string, references?: [{id,title}] }
-// 返回：入库的 { id, createdAt }
+// body: { id?, conversationId?, role: 'user'|'assistant', content: string, references?: [{id,title}] }
+// 返回：入库的 { id, createdAt, conversationId }
 ai.post("/chat-history", async (c) => {
   const db = getDb();
   const userId = c.req.header("X-User-Id") || "demo";
 
   let body: {
     id?: string;
+    conversationId?: string;
     role?: string;
     content?: string;
     references?: { id: string; title: string }[];
@@ -1376,6 +1568,19 @@ ai.post("/chat-history", async (c) => {
     return c.json({ ok: true, skipped: true });
   }
 
+  // 解析 conversationId：
+  //   - 传了且校验通过：挂到它上面
+  //   - 传了但不存在/跨用户：400，避免静默落到"默认会话"掩盖 bug
+  //   - 未传：回退到"最近活跃会话"；无则现场建一条（兼容旧前端）
+  let conversationId: string;
+  if (body.conversationId) {
+    const conv = getConversation(db, userId, body.conversationId);
+    if (!conv) return c.json({ error: "conversation not found" }, 404);
+    conversationId = conv.id;
+  } else {
+    conversationId = ensureDefaultConversation(db, userId);
+  }
+
   // id：优先用前端传入（前端在渲染时已生成；保持一致便于幂等），否则后端生成
   const id = body.id && typeof body.id === "string"
     ? body.id
@@ -1387,42 +1592,66 @@ ai.post("/chat-history", async (c) => {
 
   // INSERT OR REPLACE：若前端重试用相同 id 再发一次，覆盖而不是重复
   db.prepare(`
-    INSERT OR REPLACE INTO ai_chat_messages (id, userId, role, content, referencesJson, createdAt)
-    VALUES (?, ?, ?, ?, ?, datetime('now'))
-  `).run(id, userId, role, content, referencesJson);
+    INSERT OR REPLACE INTO ai_chat_messages (id, userId, conversationId, role, content, referencesJson, createdAt)
+    VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
+  `).run(id, userId, conversationId, role, content, referencesJson);
 
-  // 超过上限时裁掉最老的（按 createdAt 升序删除多余部分）
+  // 顺手把会话的 updatedAt 推到最新——会话列表就能按"最近活动"排序
+  db.prepare(`
+    UPDATE ai_chat_conversations SET updatedAt = datetime('now') WHERE id = ?
+  `).run(conversationId);
+
+  // 会话内消息上限：超过时裁掉本会话最老的（按 createdAt 升序删除多余部分）
   const count = (db.prepare(
-    "SELECT COUNT(*) as c FROM ai_chat_messages WHERE userId = ?"
-  ).get(userId) as { c: number }).c;
+    "SELECT COUNT(*) as c FROM ai_chat_messages WHERE conversationId = ?"
+  ).get(conversationId) as { c: number }).c;
   if (count > CHAT_HISTORY_KEEP) {
     const excess = count - CHAT_HISTORY_KEEP;
     db.prepare(`
       DELETE FROM ai_chat_messages
       WHERE id IN (
         SELECT id FROM ai_chat_messages
-        WHERE userId = ?
+        WHERE conversationId = ?
         ORDER BY createdAt ASC, id ASC
         LIMIT ?
       )
-    `).run(userId, excess);
+    `).run(conversationId, excess);
   }
 
   const row = db.prepare(
     "SELECT createdAt FROM ai_chat_messages WHERE id = ?"
   ).get(id) as { createdAt: string } | undefined;
 
-  return c.json({ ok: true, id, createdAt: row?.createdAt });
+  return c.json({ ok: true, id, createdAt: row?.createdAt, conversationId });
 });
 
-// DELETE /api/ai/chat-history
-// 清空当前用户的全部 AI 对话记录
+// DELETE /api/ai/chat-history?conversationId=xxx
+// - 传 conversationId：只清该会话的消息（会话本身保留，便于保留标题和创建时间）
+// - 未传：兜底行为——清空"最近活跃会话"的消息（兼容旧前端的"清空聊天"按钮）
 ai.delete("/chat-history", (c) => {
   const db = getDb();
   const userId = c.req.header("X-User-Id") || "demo";
+  const convIdParam = c.req.query("conversationId") || "";
+
+  let convId = "";
+  if (convIdParam) {
+    const conv = getConversation(db, userId, convIdParam);
+    if (!conv) return c.json({ error: "conversation not found" }, 404);
+    convId = conv.id;
+  } else {
+    const row = db.prepare(`
+      SELECT id FROM ai_chat_conversations
+      WHERE userId = ? AND archived = 0
+      ORDER BY updatedAt DESC, createdAt DESC
+      LIMIT 1
+    `).get(userId) as { id: string } | undefined;
+    if (!row) return c.json({ ok: true, deleted: 0 });
+    convId = row.id;
+  }
+
   const info = db.prepare(
-    "DELETE FROM ai_chat_messages WHERE userId = ?"
-  ).run(userId);
+    "DELETE FROM ai_chat_messages WHERE userId = ? AND conversationId = ?"
+  ).run(userId, convId);
   return c.json({ ok: true, deleted: info.changes });
 });
 

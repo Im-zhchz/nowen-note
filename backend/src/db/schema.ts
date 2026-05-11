@@ -697,18 +697,36 @@ function initSchema(db: Database.Database) {
   // AI 知识问答聊天记录（跨会话持久化）
   // ==============================================================
   //
+  // v10 起支持"多会话"：每条消息挂到 ai_chat_conversations 的一条会话下。
+  // 新装库这里就建带 conversationId 列的最终形态；老库由 migrations v10 补列 + 回填。
+  //
   // 每条消息一行：user 的提问和 assistant 的回复各存一条，按 createdAt 升序即为对话时间线。
   //   id              消息 ID（前端生成的也可以，只要全局唯一；本端路由直接用时间戳+随机串）
   //   userId          所属用户；ON DELETE CASCADE 使账号删除时连带清理
+  //   conversationId  所属会话；NULL 仅出现在 v10 迁移中途的极短窗口，业务层一律按会话维度读写
   //   role            'user' | 'assistant'
   //   content         纯文本消息内容（Markdown 原文）
   //   referencesJson  可选，仅 assistant 消息使用，存 [{id,title},...] 的 JSON 字符串；
   //                   笔记后续可能被删，恢复时前端点击跳转自行容错即可
   //   createdAt       创建时间，用于排序和按时间窗口裁剪
   db.exec(`
+    CREATE TABLE IF NOT EXISTS ai_chat_conversations (
+      id TEXT PRIMARY KEY,
+      userId TEXT NOT NULL,
+      title TEXT NOT NULL DEFAULT '',
+      archived INTEGER NOT NULL DEFAULT 0,
+      createdAt TEXT NOT NULL DEFAULT (datetime('now')),
+      updatedAt TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (userId) REFERENCES users(id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_ai_chat_conv_user
+      ON ai_chat_conversations(userId, archived, updatedAt DESC);
+
     CREATE TABLE IF NOT EXISTS ai_chat_messages (
       id TEXT PRIMARY KEY,
       userId TEXT NOT NULL,
+      conversationId TEXT,
       role TEXT NOT NULL,
       content TEXT NOT NULL DEFAULT '',
       referencesJson TEXT,
@@ -717,6 +735,7 @@ function initSchema(db: Database.Database) {
     );
 
     CREATE INDEX IF NOT EXISTS idx_ai_chat_user_created ON ai_chat_messages(userId, createdAt);
+    CREATE INDEX IF NOT EXISTS idx_ai_chat_msg_conv ON ai_chat_messages(conversationId, createdAt);
   `);
 
   // ==============================================================

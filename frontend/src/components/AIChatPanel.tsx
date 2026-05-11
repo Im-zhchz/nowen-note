@@ -3,7 +3,7 @@ import {
   Bot, Send, Trash2, X, Loader2, FileText, Sparkles, User,
   BookOpen, Database, MessageCircleQuestion, ArrowRight,
   Upload, FileUp, Wand2, FolderUp, Check, Copy, ChevronDown, ChevronUp,
-  Paperclip
+  Paperclip, Plus, MessageSquare, Menu, Pencil
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import ReactMarkdown from "react-markdown";
@@ -42,8 +42,25 @@ interface KnowledgeStats {
 
 // 对话记录持久化：改为后端持久化（见 /api/ai/chat-history），
 // 优势：多端同步、不受浏览器 storage 限制、账号隔离。
-// 本组件仅负责拉取、追加、清空三个动作。
+// v10 起支持多会话（ai_chat_conversations）：左侧是会话列表，右侧是当前会话消息。
+// 本组件职责：拉取会话列表、切换会话、增删改会话、拉/追加/清空会话消息。
 const HISTORY_LIMIT = 100;
+
+// 会话列表条目（对应 /api/ai/conversations 返回的单条 conversation）
+interface ConversationSummary {
+  id: string;
+  title: string;
+  archived: boolean;
+  createdAt: string;
+  updatedAt: string;
+  messageCount: number;
+  lastMessage: string | null;
+  lastRole: string | null;
+}
+
+// 根据首条消息内容生成会话标题（截断 + 去多余空白）。
+// 没标题时前端展示 i18n 的"新对话"，这里是用户发出第一个问题后用问题前 20 字自动命名。
+const deriveTitleFromQuestion = (q: string) => q.trim().replace(/\s+/g, " ").slice(0, 20);
 
 export default function AIChatPanel({ onClose, onNavigateToNote }: {
   onClose: () => void;
@@ -56,6 +73,17 @@ export default function AIChatPanel({ onClose, onNavigateToNote }: {
   const [stats, setStats] = useState<KnowledgeStats | null>(null);
   // 历史加载中：避免首次渲染闪一下"空状态"然后再跳到历史
   const [historyLoading, setHistoryLoading] = useState(true);
+
+  // ===== 多会话相关 state =====
+  // conversations: 会话列表；currentConvId: 当前激活的会话 id；
+  // sidebarOpen: 侧栏展开（移动/窄屏默认收起，点按钮展开）；
+  // renamingId / renameDraft: 行内重命名状态。
+  const [conversations, setConversations] = useState<ConversationSummary[]>([]);
+  const [currentConvId, setCurrentConvId] = useState<string | null>(null);
+  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [renamingId, setRenamingId] = useState<string | null>(null);
+  const [renameDraft, setRenameDraft] = useState("");
+
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
 
@@ -73,13 +101,38 @@ export default function AIChatPanel({ onClose, onNavigateToNote }: {
     };
   }, []);
 
-  // 打开面板时从后端拉取上次的聊天记录。
-  // 失败时（未登录 / 网络问题）退回空列表，不影响正常聊天。
+  // 拉会话列表。失败（未登录 / 老后端未部署）退回空列表，不阻塞聊天。
+  const reloadConversations = useCallback(async (): Promise<ConversationSummary[]> => {
+    try {
+      const res = await api.aiConversations.list();
+      setConversations(res.conversations);
+      return res.conversations;
+    } catch {
+      setConversations([]);
+      return [];
+    }
+  }, []);
+
+  // 初始化：拉会话列表 → 选最近一条 → 拉它的消息。
+  // 如果用户还没有任何会话（新用户或迁移前），消息列表保持空、currentConvId 为 null；
+  // 首次发送时会通过 POST /chat-history 自动创建"默认会话"（后端兜底）。
   useEffect(() => {
     let cancelled = false;
     (async () => {
+      const list = await reloadConversations();
+      if (cancelled) return;
+
+      // 选择激活会话：优先 list[0]（updatedAt 最新），否则保持 null 等待首次发送
+      const targetId = list.length > 0 ? list[0].id : null;
+      setCurrentConvId(targetId);
+
+      if (!targetId) {
+        setHistoryLoading(false);
+        return;
+      }
+
       try {
-        const res = await api.getAiChatHistory(HISTORY_LIMIT);
+        const res = await api.getAiChatHistory(HISTORY_LIMIT, targetId);
         if (cancelled) return;
         setMessages(res.messages.map(m => ({
           id: m.id,
@@ -88,13 +141,13 @@ export default function AIChatPanel({ onClose, onNavigateToNote }: {
           references: m.references,
         })));
       } catch {
-        /* ignore: 首次使用或离线状态 */
+        /* ignore：首次使用或离线状态 */
       } finally {
         if (!cancelled) setHistoryLoading(false);
       }
     })();
     return () => { cancelled = true; };
-  }, []);
+  }, [reloadConversations]);
 
   const scrollToBottom = useCallback(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -104,9 +157,108 @@ export default function AIChatPanel({ onClose, onNavigateToNote }: {
     scrollToBottom();
   }, [messages, scrollToBottom]);
 
+  // 切换会话：拉目标会话的消息。
+  // 流式中不允许切换（会把 assistant 的增量写到错误会话）；上层按钮 disabled 阻挡。
+  const handleSelectConversation = useCallback(async (convId: string) => {
+    if (isLoading || convId === currentConvId) return;
+    setCurrentConvId(convId);
+    setMessages([]);
+    setHistoryLoading(true);
+    try {
+      const res = await api.getAiChatHistory(HISTORY_LIMIT, convId);
+      setMessages(res.messages.map(m => ({
+        id: m.id,
+        role: m.role,
+        content: m.content,
+        references: m.references,
+      })));
+    } catch {
+      /* ignore */
+    } finally {
+      setHistoryLoading(false);
+    }
+  }, [isLoading, currentConvId]);
+
+  // 新建会话：成功后立即切到它。若创建失败，降级为"清空当前消息"的本地效果，
+  // 至少不阻断使用——用户下一次发送时后端会兜底创建。
+  const handleNewConversation = useCallback(async () => {
+    if (isLoading) return;
+    try {
+      const res = await api.aiConversations.create();
+      const created = res.conversation;
+      setConversations(prev => [created, ...prev]);
+      setCurrentConvId(created.id);
+      setMessages([]);
+    } catch {
+      // 后端未部署 / 离线：前端先给空会话体验，后续 append 会自动建
+      setCurrentConvId(null);
+      setMessages([]);
+    }
+  }, [isLoading]);
+
+  // 行内重命名：进入/取消/提交三个动作
+  const handleStartRename = (conv: ConversationSummary) => {
+    setRenamingId(conv.id);
+    setRenameDraft(conv.title || "");
+  };
+  const handleCancelRename = () => {
+    setRenamingId(null);
+    setRenameDraft("");
+  };
+  const handleSubmitRename = useCallback(async () => {
+    if (!renamingId) return;
+    const title = renameDraft.trim().slice(0, 100);
+    try {
+      await api.aiConversations.update(renamingId, { title });
+      setConversations(prev => prev.map(c => c.id === renamingId ? { ...c, title } : c));
+    } catch {
+      /* ignore；保留原名 */
+    } finally {
+      setRenamingId(null);
+      setRenameDraft("");
+    }
+  }, [renamingId, renameDraft]);
+
+  const handleDeleteConversation = useCallback(async (convId: string) => {
+    if (isLoading) return;
+    // 用浏览器 confirm 保持与 AIWritingAssistant 删除指令的 UX 一致
+    if (!window.confirm(t("aiChat.deleteConversationConfirm"))) return;
+    try {
+      await api.aiConversations.remove(convId);
+    } catch {
+      /* 即便后端失败也按本地成功处理，避免 UI 卡住；下次打开会自动对齐 */
+    }
+    // 本地移除并选下一个可用会话
+    const rest = conversations.filter(c => c.id !== convId);
+    setConversations(rest);
+    if (convId === currentConvId) {
+      if (rest.length > 0) {
+        await handleSelectConversation(rest[0].id);
+      } else {
+        setCurrentConvId(null);
+        setMessages([]);
+      }
+    }
+  }, [conversations, currentConvId, handleSelectConversation, isLoading, t]);
+
   const handleSend = useCallback(async (override?: string) => {
     const question = (override ?? input).trim();
     if (!question || isLoading) return;
+
+    // 若当前没有激活会话（新用户首发 / 之前创建失败），先显式建一条新会话。
+    // 现场建会话能保证前端立刻拿到 id，并让侧栏在第一条消息发送前就出现条目。
+    let convId = currentConvId;
+    if (!convId) {
+      try {
+        const res = await api.aiConversations.create();
+        convId = res.conversation.id;
+        setConversations(prev => [res.conversation, ...prev]);
+        setCurrentConvId(convId);
+      } catch {
+        // 后端暂时不可用时降级：convId 仍为 null，后端 POST /chat-history 不传
+        // conversationId 会兜底落到"最近活跃会话"，功能不中断。
+      }
+    }
 
     const userMsg: ChatMessage = {
       id: `u-${Date.now()}`,
@@ -128,9 +280,23 @@ export default function AIChatPanel({ onClose, onNavigateToNote }: {
     // 立即把用户消息持久化到后端，避免流式中途断开时这条提问丢失
     api.appendAiChatHistory({
       id: userMsg.id,
+      conversationId: convId || undefined,
       role: "user",
       content: userMsg.content,
     }).catch(() => { /* 持久化失败不影响对话 */ });
+
+    // 若当前会话还没有标题（新建会话的占位 ""），用问题前 20 字自动命名。
+    // 只在第一次发送时改；后续用户可以手动重命名覆盖。
+    if (convId) {
+      const conv = conversations.find(c => c.id === convId);
+      if (conv && !conv.title) {
+        const autoTitle = deriveTitleFromQuestion(question);
+        if (autoTitle) {
+          api.aiConversations.update(convId, { title: autoTitle }).catch(() => {});
+          setConversations(prev => prev.map(c => c.id === convId ? { ...c, title: autoTitle } : c));
+        }
+      }
+    }
 
     // Build history from previous messages
     const history = messages
@@ -182,13 +348,18 @@ export default function AIChatPanel({ onClose, onNavigateToNote }: {
       if (finalContent.trim().length > 0) {
         api.appendAiChatHistory({
           id: assistantMsg.id,
+          conversationId: convId || undefined,
           role: "assistant",
           content: finalContent,
           references: finalRefs,
         }).catch(() => { /* 持久化失败不影响对话 */ });
       }
+
+      // 流式结束后刷新会话列表：更新 updatedAt / lastMessage / messageCount，
+      // 失败不处理——列表里的"最近活动时间"与"预览"是次要 UX。
+      reloadConversations().catch(() => {});
     }
-  }, [input, isLoading, messages, t]);
+  }, [input, isLoading, messages, t, currentConvId, conversations, reloadConversations]);
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === "Enter" && !e.shiftKey) {
@@ -199,8 +370,17 @@ export default function AIChatPanel({ onClose, onNavigateToNote }: {
 
   const clearChat = () => {
     setMessages([]);
-    // 同步清空后端持久化记录，否则下次打开又会把历史恢复回来
-    api.clearAiChatHistory().catch(() => { /* ignore */ });
+    // 同步清空后端持久化记录（仅清当前会话的消息；会话本身保留便于保留标题）
+    if (currentConvId) {
+      api.clearAiChatHistory(currentConvId).catch(() => { /* ignore */ });
+      // 本地更新会话列表的 messageCount / lastMessage
+      setConversations(prev => prev.map(c =>
+        c.id === currentConvId ? { ...c, messageCount: 0, lastMessage: null, lastRole: null } : c
+      ));
+    } else {
+      // 兜底：没有 convId 时老后端会清"最近活跃会话"，等效于本地清空
+      api.clearAiChatHistory().catch(() => { /* ignore */ });
+    }
   };
 
   // ===== ③ 文档解析状态 =====
@@ -380,10 +560,104 @@ export default function AIChatPanel({ onClose, onNavigateToNote }: {
   };
 
   return (
-    <div className="flex flex-col h-full bg-app-bg">
+    <div className="flex h-full bg-app-bg">
+      {/* ===== 左侧：会话列表 ===== */}
+      {/* 收起时宽度为 0；展开时占 208px。用 overflow-hidden 让内容动画收纳。 */}
+      <aside
+        className={cn(
+          "flex flex-col border-r border-app-border bg-app-surface/30 transition-[width] duration-150 overflow-hidden shrink-0",
+          sidebarOpen ? "w-52" : "w-0"
+        )}
+      >
+        <div className="flex items-center justify-between px-3 py-2.5 border-b border-app-border">
+          <span className="text-xs font-semibold text-tx-secondary">{t("aiChat.conversations")}</span>
+          <button
+            onClick={handleNewConversation}
+            disabled={isLoading}
+            title={t("aiChat.newConversation")}
+            className="p-1 rounded-md text-tx-tertiary hover:text-accent-primary hover:bg-app-hover transition-colors disabled:opacity-50"
+          >
+            <Plus size={14} />
+          </button>
+        </div>
+        <ScrollArea className="flex-1">
+          <div className="px-2 py-2 space-y-0.5">
+            {conversations.length === 0 && (
+              <div className="text-[11px] text-tx-tertiary px-2 py-4 text-center">
+                {t("aiChat.noConversations")}
+              </div>
+            )}
+            {conversations.map((c) => {
+              const active = c.id === currentConvId;
+              const displayTitle = c.title || t("aiChat.untitledConversation");
+              const isRenaming = renamingId === c.id;
+              return (
+                <div
+                  key={c.id}
+                  className={cn(
+                    "group flex items-center gap-1 px-2 py-1.5 rounded-md cursor-pointer text-xs transition-colors",
+                    active
+                      ? "bg-accent-primary/10 text-accent-primary"
+                      : "text-tx-secondary hover:bg-app-hover"
+                  )}
+                  onClick={() => !isRenaming && handleSelectConversation(c.id)}
+                >
+                  <MessageSquare size={12} className="shrink-0" />
+                  {isRenaming ? (
+                    <input
+                      autoFocus
+                      value={renameDraft}
+                      onChange={(e) => setRenameDraft(e.target.value)}
+                      onBlur={handleSubmitRename}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") { e.preventDefault(); handleSubmitRename(); }
+                        else if (e.key === "Escape") { e.preventDefault(); handleCancelRename(); }
+                      }}
+                      onClick={(e) => e.stopPropagation()}
+                      className="flex-1 min-w-0 px-1 py-0.5 bg-app-bg border border-accent-primary/40 rounded text-xs text-tx-primary outline-none"
+                    />
+                  ) : (
+                    <span className="flex-1 min-w-0 truncate" title={displayTitle}>
+                      {displayTitle}
+                    </span>
+                  )}
+                  {!isRenaming && (
+                    <div className="hidden group-hover:flex items-center gap-0.5">
+                      <button
+                        onClick={(e) => { e.stopPropagation(); handleStartRename(c); }}
+                        title={t("aiChat.renameConversation")}
+                        className="p-0.5 rounded text-tx-tertiary hover:text-tx-primary hover:bg-app-hover"
+                      >
+                        <Pencil size={10} />
+                      </button>
+                      <button
+                        onClick={(e) => { e.stopPropagation(); void handleDeleteConversation(c.id); }}
+                        title={t("aiChat.deleteConversation")}
+                        className="p-0.5 rounded text-tx-tertiary hover:text-red-500 hover:bg-app-hover"
+                      >
+                        <Trash2 size={10} />
+                      </button>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </ScrollArea>
+      </aside>
+
+      {/* ===== 右侧：消息主区 ===== */}
+      <div className="flex flex-col flex-1 min-w-0">
       {/* Header */}
       <div className="flex items-center justify-between px-4 py-3 border-b border-app-border bg-app-surface/50">
         <div className="flex items-center gap-2">
+          <button
+            onClick={() => setSidebarOpen(v => !v)}
+            title={sidebarOpen ? t("aiChat.collapseSidebar") : t("aiChat.expandSidebar")}
+            className="p-1.5 rounded-md text-tx-tertiary hover:text-tx-secondary hover:bg-app-hover transition-colors"
+          >
+            <Menu size={14} />
+          </button>
           <div className="w-7 h-7 rounded-lg bg-gradient-to-br from-violet-500 to-indigo-500 flex items-center justify-center">
             <Bot size={14} className="text-white" />
           </div>
@@ -397,6 +671,14 @@ export default function AIChatPanel({ onClose, onNavigateToNote }: {
           </div>
         </div>
         <div className="flex items-center gap-1">
+          <button
+            onClick={handleNewConversation}
+            disabled={isLoading}
+            title={t("aiChat.newConversation")}
+            className="p-1.5 rounded-md text-tx-tertiary hover:text-accent-primary hover:bg-app-hover transition-colors disabled:opacity-50"
+          >
+            <Plus size={14} />
+          </button>
           {messages.length > 0 && (
             <button
               onClick={clearChat}
@@ -756,6 +1038,7 @@ export default function AIChatPanel({ onClose, onNavigateToNote }: {
             {isLoading ? <Loader2 size={16} className="animate-spin" /> : <Send size={16} />}
           </button>
         </div>
+      </div>
       </div>
     </div>
   );
