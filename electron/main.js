@@ -699,7 +699,7 @@ async function switchToFull() {
       type: "info",
       buttons: ["知道了"],
       title: "轻量端不支持切换",
-      message: "当前是"轻量发行版"，不包含本地后端。",
+      message: "当前是\"轻量发行版\"，不包含本地后端。",
       detail: "如需使用本地后端，请下载完整版安装包。",
     });
     return;
