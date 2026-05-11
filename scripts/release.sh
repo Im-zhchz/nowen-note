@@ -1945,12 +1945,17 @@ if [ "$HAS_FPK" = "1" ]; then
     fi
 
     # 收集 dist-fpk/ 下产物
+    # 注意：dist-fpk/ 目录只增不清，里面会堆积历次发布的 .fpk（例如
+    # nowen-note-1.0.29.fpk ... nowen-note-1.0.34.fpk）。收集时**必须只**
+    # 抓本次版本号对应的文件，否则会把一堆旧版本一起传到新 Release。
+    # 用 "*${VERSION}.fpk" 是因为 build-fpk.mjs 产物名固定为
+    # nowen-note-${VERSION}.fpk / nowen-note-${VERSION}-<arch>.fpk 等形态。
     FPK_OUT="${REPO_ROOT}/dist-fpk"
     if [ "$DRY_RUN" != "1" ] && [ -d "$FPK_OUT" ]; then
         while IFS= read -r f; do
             FPK_ARTIFACTS+=( "$f" )
-        done < <(find "$FPK_OUT" -maxdepth 1 -type f -name "*.fpk" 2>/dev/null | sort)
-        info "fpk 产物目录: $FPK_OUT"
+        done < <(find "$FPK_OUT" -maxdepth 1 -type f -name "*${VERSION}*.fpk" 2>/dev/null | sort)
+        info "fpk 产物目录: $FPK_OUT（仅收集版本 ${VERSION} 的 .fpk）"
         for f in "${FPK_ARTIFACTS[@]}"; do
             echo "    - $(basename "$f")"
         done
