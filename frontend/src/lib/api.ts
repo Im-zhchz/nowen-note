@@ -1594,7 +1594,15 @@ export const api = {
     question: string,
     history?: { role: string; content: string }[],
     onChunk?: (chunk: string) => void,
-    onReferences?: (refs: { id: string; title: string }[]) => void
+    onReferences?: (refs: {
+      id: string;
+      title: string;
+      // v8：附件命中时后端会把 kind='attachment' + attachmentId/filename 一起发。
+      // 老后端没有这些字段，这里标为可选保持前后向兼容。
+      kind?: "note" | "attachment";
+      attachmentId?: string;
+      attachmentFilename?: string;
+    }[]) => void
   ): Promise<string> => {
     const token = getToken();
     // v7 RAG 隔离：把当前 scope 透传给后端
@@ -1693,7 +1701,13 @@ export const api = {
       id: string;
       role: "user" | "assistant";
       content: string;
-      references?: { id: string; title: string }[];
+      references?: {
+        id: string;
+        title: string;
+        kind?: "note" | "attachment";
+        attachmentId?: string;
+        attachmentFilename?: string;
+      }[];
       createdAt: string;
     }[];
   }> => {
@@ -1711,7 +1725,13 @@ export const api = {
     id?: string;
     role: "user" | "assistant";
     content: string;
-    references?: { id: string; title: string }[];
+    references?: {
+      id: string;
+      title: string;
+      kind?: "note" | "attachment";
+      attachmentId?: string;
+      attachmentFilename?: string;
+    }[];
   }): Promise<{ ok: boolean; id?: string; createdAt?: string; skipped?: boolean }> => {
     const token = getToken();
     const res = await fetch(`${getBaseUrl()}/ai/chat-history`, {

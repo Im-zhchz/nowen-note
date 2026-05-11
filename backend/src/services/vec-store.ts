@@ -238,12 +238,19 @@ export function clearAllVectors(): void {
 export interface VecHit {
   rowid: number;     // = note_embeddings.id
   distance: number;  // 越小越相似（cosine/L2 视 sqlite-vec 默认而定，当前为 L2）
+  // v8 扩展：区分 note / attachment
+  //   - entityType='note'       → noteId 是笔记 id，attachmentId = null
+  //   - entityType='attachment' → noteId 是附件所属笔记 id（便于引用回跳），
+  //                               attachmentId 是附件 id，filename 是附件原始文件名
+  entityType: "note" | "attachment";
   noteId: string;
   userId: string;
   workspaceId: string | null;
   chunkText: string;
   chunkIndex: number;
-  title: string;
+  title: string;              // note: 笔记标题；attachment: 附件所属笔记标题
+  attachmentId?: string | null;
+  attachmentFilename?: string | null;
 }
 
 /**
@@ -296,20 +303,25 @@ export function knnSearch(
   if (vecRows.length === 0) return [];
 
   // 反查 note_embeddings + notes（一次 IN 查询）
+  // v8：也带上 entityType / attachmentId，并 LEFT JOIN attachments 拿附件文件名
   const ids = vecRows.map((r) => r.rowid);
   const placeholders = ids.map(() => "?").join(",");
   const meta = db.prepare(`
     SELECT
-      e.id      AS rowid,
-      e.noteId  AS noteId,
-      e.userId  AS userId,
+      e.id         AS rowid,
+      e.noteId     AS noteId,
+      e.userId     AS userId,
       e.workspaceId AS workspaceId,
-      e.chunkText AS chunkText,
+      e.chunkText  AS chunkText,
       e.chunkIndex AS chunkIndex,
-      n.title   AS title,
-      n.isTrashed AS isTrashed
+      e.entityType AS entityType,
+      e.attachmentId AS attachmentId,
+      n.title      AS title,
+      n.isTrashed  AS isTrashed,
+      a.filename   AS attachmentFilename
     FROM note_embeddings e
     JOIN notes n ON n.id = e.noteId
+    LEFT JOIN attachments a ON a.id = e.attachmentId
     WHERE e.id IN (${placeholders})
   `).all(...ids) as {
     rowid: number;
@@ -318,8 +330,11 @@ export function knnSearch(
     workspaceId: string | null;
     chunkText: string;
     chunkIndex: number;
+    entityType: string;
+    attachmentId: string | null;
     title: string;
     isTrashed: number;
+    attachmentFilename: string | null;
   }[];
 
   const metaMap = new Map(meta.map((m) => [m.rowid, m]));
@@ -328,7 +343,7 @@ export function knnSearch(
   // 这里再加一道防御。
   const wantWs: string | null = workspaceId || null;
 
-  // 按 vecRows 顺序（已按 distance asc）merge + 过滤 scope/trash + 按 noteId 去重
+  // 按 vecRows 顺序（已按 distance asc）merge + 过滤 scope/trash + 按实体去重
   //
   // 隔离规则：
   //   - 个人空间 (wantWs === null)：仅命中 userId === 当前用户 且
@@ -338,7 +353,15 @@ export function knnSearch(
   //     不再按 userId 过滤——同一个工作区的成员应该能互相搜索到彼此的笔记，
   //     这是协作场景的核心需求。访问权限由调用方（路由层）通过 workspace
   //     成员校验保证：能拿到 wantWs 的人都已经具备该工作区读权限。
-  const seen = new Set<string>();
+  //
+  // 去重：
+  //   - note：按 noteId 去重（同笔记多 chunk 只留最相似的一个，保证 hits 里
+  //           每篇笔记最多一行，避免 /ask 上下文里同一篇笔记被列两次）
+  //   - attachment：按 attachmentId 去重（同附件多 chunk 同理）
+  //   note 与 attachment 不去重——同一篇笔记命中 note 行 + 它的附件命中
+  //   attachment 行，两者都应该出现（承载的是不同信息）。
+  const seenNotes = new Set<string>();
+  const seenAttachments = new Set<string>();
   const hits: VecHit[] = [];
   for (const v of vecRows) {
     const m = metaMap.get(v.rowid);
@@ -353,17 +376,31 @@ export function knnSearch(
       if (mWs !== wantWs) continue;
     }
     if (m.isTrashed) continue;
-    if (seen.has(m.noteId)) continue;
-    seen.add(m.noteId);
+
+    const entityType = (m.entityType === "attachment" ? "attachment" : "note") as
+      | "note"
+      | "attachment";
+    if (entityType === "attachment") {
+      const aid = m.attachmentId || "";
+      if (!aid || seenAttachments.has(aid)) continue;
+      seenAttachments.add(aid);
+    } else {
+      if (seenNotes.has(m.noteId)) continue;
+      seenNotes.add(m.noteId);
+    }
+
     hits.push({
       rowid: v.rowid,
       distance: v.distance,
+      entityType,
       noteId: m.noteId,
       userId: m.userId,
       workspaceId: mWs,
       chunkText: m.chunkText,
       chunkIndex: m.chunkIndex,
       title: m.title,
+      attachmentId: m.attachmentId,
+      attachmentFilename: m.attachmentFilename,
     });
     if (hits.length >= maxNotes) break;
   }

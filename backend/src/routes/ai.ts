@@ -494,7 +494,19 @@ ai.post("/ask", async (c) => {
   const wsClause = workspaceId === null ? "workspaceId IS NULL" : "workspaceId = ?";
   const wsParams: any[] = workspaceId === null ? [] : [workspaceId];
 
-  let relatedNotes: { id: string; title: string; snippet: string }[] = [];
+  // relatedNotes 的 kind：
+  //   - 'note'       普通笔记命中
+  //   - 'attachment' 附件内容命中（v8 RAG Phase 3）
+  // 前端"引用列表"会根据 kind 渲染不同图标；后端拼 prompt 时会用 `📎` 前缀
+  // 让 LLM 明确这段内容来自附件，便于回答时区分"笔记原文"与"附件内容"。
+  let relatedNotes: {
+    id: string;
+    title: string;
+    snippet: string;
+    kind?: "note" | "attachment";
+    attachmentId?: string | null;
+    attachmentFilename?: string | null;
+  }[] = [];
   let retrieval: "vector" | "fts" | "like" | "recent" | "none" = "none";
 
   // ---- 路径 A：向量召回 ----
@@ -502,13 +514,20 @@ ai.post("/ask", async (c) => {
     try {
       const qvec = await embedQuery(question);
       if (qvec) {
-        const hits = knnSearch(qvec, userId, workspaceId, 20, 5);
+        // maxNotes 从 5 提到 8：附件 + 笔记混排时，让两类各自都能出现
+        const hits = knnSearch(qvec, userId, workspaceId, 30, 8);
         if (hits.length > 0) {
           relatedNotes = hits.map((h) => ({
             id: h.noteId,
-            title: h.title,
-            // 命中的 chunk 已经是最相关片段；直接拿来当 snippet 比 contentText.slice(0,500) 信息密度高
+            // 附件命中：title 展示为"笔记名 › 附件名"，便于用户定位
+            title:
+              h.entityType === "attachment" && h.attachmentFilename
+                ? `${h.title || "(未命名笔记)"} › ${h.attachmentFilename}`
+                : h.title,
             snippet: (h.chunkText || "").slice(0, 600),
+            kind: h.entityType,
+            attachmentId: h.attachmentId || null,
+            attachmentFilename: h.attachmentFilename || null,
           }));
           retrieval = "vector";
         }
@@ -619,11 +638,17 @@ ai.post("/ask", async (c) => {
   }
 
   // 2. 构建 RAG prompt
+  //
+  // 附件命中会带 kind='attachment'，给 LLM 看的 contextBlock 用 📎 前缀标注
+  // 来源类型，这样它回答时能自然说出"根据你上传的 XXX.pdf..."而不是把附件
+  // 误当成笔记正文。
   let contextBlock = "";
   if (relatedNotes.length > 0) {
-    contextBlock = relatedNotes.map((n, i) =>
-      `【笔记 ${i + 1}】标题: ${n.title}\n${n.snippet}`
-    ).join("\n\n---\n\n");
+    contextBlock = relatedNotes.map((n, i) => {
+      const tag =
+        n.kind === "attachment" ? `【附件 ${i + 1}】📎 ` : `【笔记 ${i + 1}】`;
+      return `${tag}${n.title}\n${n.snippet}`;
+    }).join("\n\n---\n\n");
   }
 
   const systemPrompt = relatedNotes.length > 0
@@ -670,9 +695,17 @@ ai.post("/ask", async (c) => {
     // SSE streaming with references
     return streamSSE(c, async (stream) => {
       // 先发送参考笔记信息
+      // v8：附件命中时带上 kind='attachment' + attachmentId/Filename，
+      // 前端 AIChatPanel 据此给"引用"列表渲染 📎 图标并点击时跳转到附件下载。
       if (relatedNotes.length > 0) {
         await stream.writeSSE({
-          data: JSON.stringify(relatedNotes.map(n => ({ id: n.id, title: n.title }))),
+          data: JSON.stringify(relatedNotes.map(n => ({
+            id: n.id,
+            title: n.title,
+            kind: n.kind || "note",
+            attachmentId: n.attachmentId || undefined,
+            attachmentFilename: n.attachmentFilename || undefined,
+          }))),
           event: "references",
         });
         // 单独事件传 retrieval mode（前端可选监听；老前端会自动忽略未知 event 类型）

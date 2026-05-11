@@ -549,6 +549,135 @@ export const MIGRATIONS: Migration[] = [
       `).run();
     },
   },
+
+  // ==========================================================================
+  // v8：AI 知识库扩展到"附件内容"索引
+  // --------------------------------------------------------------------------
+  // 背景：
+  //   v7 之前知识问答仅能检索 notes.title + notes.contentText，用户粘贴进笔记
+  //   的 PDF / 纯文本附件完全不参与召回。用户反馈希望附件内容也能命中。
+  //
+  // 方案：复用现有 note_embeddings + vec_note_chunks 基础设施，不新建向量表：
+  //   - 给 note_embeddings 加两列：
+  //       entityType TEXT NOT NULL DEFAULT 'note'    -- 'note' | 'attachment'
+  //       attachmentId TEXT                           -- attachment 任务的附件 id；note 任务为 NULL
+  //     note 行语义不变；attachment 行的 noteId 仍填附件所属笔记，便于在
+  //     AI 回答里点回源笔记。
+  //   - 新建 attachment_embedding_queue（主键 attachmentId）。不复用
+  //     embedding_queue 是因为它主键是 noteId，attachment 会与 note 冲突，
+  //     语义也更清楚。
+  //   - 新建 attachment_chunks：与 note 的 chunk 切分策略对齐，存原文文本
+  //     以便召回后拼 prompt。不复用 note_embeddings.chunkText 的唯一原因
+  //     是希望保留"note_embeddings 每行都是实际写到 vec 表的真相源"的单一
+  //     语义：attachment 索引失败 / 重建时可以独立地操作 attachment_chunks，
+  //     不影响 note 行。
+  //
+  //   - CASCADE：attachment_chunks → attachments(id)，attachment 被删时
+  //     chunk/queue 全清；note_embeddings 里对应的 attachment 行额外用
+  //     触发器清理（attachments 表没有 embedding 外键）。
+  //
+  // workspaceId 继承：attachments 表已经有 workspaceId（v5 backfill 完成），
+  //   索引时直接 copy；KNN 检索走同一套 scope 过滤逻辑。
+  //
+  // 零回填风险：v7 已把 note_embeddings.workspaceId 全部回填；这里只是加列，
+  //   存量 note 行的 entityType 自动为默认值 'note'，行为与之前完全一致。
+  //
+  // 回滚：回到 v7 时新列仍在但不被读（老代码 SELECT * 不会爆，
+  //   INSERT 不带这些列也 OK——entityType 有 DEFAULT）。
+  {
+    version: 8,
+    name: "attachment-content-embeddings",
+    up: (db) => {
+      const addColumnIfMissing = (
+        table: string,
+        column: string,
+        definition: string,
+      ) => {
+        const cols = db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
+        if (cols.length === 0) return;
+        if (cols.some((c) => c.name === column)) return;
+        db.prepare(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`).run();
+      };
+
+      // ---- 1. note_embeddings：加 entityType + attachmentId ----
+      // entityType DEFAULT 'note' 让存量行自然归为 note 类型；插入 attachment 行
+      // 时显式传 'attachment'。attachmentId 允许 NULL（note 行填 NULL）。
+      addColumnIfMissing(
+        "note_embeddings",
+        "entityType",
+        "TEXT NOT NULL DEFAULT 'note'",
+      );
+      addColumnIfMissing("note_embeddings", "attachmentId", "TEXT");
+
+      // 索引：按 (entityType, attachmentId) 查找——重建 / 删除某个附件的
+      // 所有 chunk 行时走这个索引。
+      db.exec(
+        "CREATE INDEX IF NOT EXISTS idx_note_embeddings_attachment ON note_embeddings(attachmentId);",
+      );
+
+      // ---- 2. attachment_chunks：切分文本存储 ----
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS attachment_chunks (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          attachmentId TEXT NOT NULL,
+          chunkIndex INTEGER NOT NULL DEFAULT 0,
+          chunkText TEXT NOT NULL DEFAULT '',
+          createdAt TEXT NOT NULL DEFAULT (datetime('now')),
+          FOREIGN KEY (attachmentId) REFERENCES attachments(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_attachment_chunks_attachment ON attachment_chunks(attachmentId);
+      `);
+
+      // ---- 3. attachment_embedding_queue：附件任务队列 ----
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS attachment_embedding_queue (
+          attachmentId TEXT PRIMARY KEY,
+          userId TEXT NOT NULL,
+          workspaceId TEXT,
+          noteId TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'pending',
+          retries INTEGER NOT NULL DEFAULT 0,
+          lastError TEXT,
+          enqueuedAt TEXT NOT NULL DEFAULT (datetime('now')),
+          updatedAt TEXT NOT NULL DEFAULT (datetime('now')),
+          FOREIGN KEY (attachmentId) REFERENCES attachments(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_attachment_queue_status ON attachment_embedding_queue(status, enqueuedAt);
+        CREATE INDEX IF NOT EXISTS idx_attachment_queue_user_ws ON attachment_embedding_queue(userId, workspaceId);
+      `);
+
+      // ---- 4. 清理悬挂向量的触发器 ----
+      // 附件删除时，note_embeddings 里 attachmentId = old.id 的 attachment 行
+      // 要一并清掉（否则 KNN 还会命中；SELECT 反查 attachments 会失败）。
+      // vec_note_chunks 的悬挂 rowid 由运维侧 /api/ai/embeddings/reindex-vec
+      // 兜底——attachment 删除属于低频事件，不值得在触发器里调外部代码。
+      db.exec(`
+        DROP TRIGGER IF EXISTS attachments_embed_ad;
+        CREATE TRIGGER attachments_embed_ad AFTER DELETE ON attachments
+        BEGIN
+          DELETE FROM note_embeddings
+           WHERE entityType = 'attachment' AND attachmentId = old.id;
+        END;
+      `);
+
+      // ---- 5. 存量附件一次性入队（可选；若没配 embedding 模型 worker 会跳过）----
+      // 仅入队"尚未被索引过 + 所在笔记未回收"的附件。与 schema.ts 里 note 的
+      // 存量回填同款策略：用户没配 embedding 的话不会发任何 API 调用。
+      db.prepare(`
+        INSERT INTO attachment_embedding_queue
+          (attachmentId, userId, workspaceId, noteId, status, retries, enqueuedAt, updatedAt)
+        SELECT a.id, a.userId, a.workspaceId, a.noteId, 'pending', 0, datetime('now'), datetime('now')
+        FROM attachments a
+        JOIN notes n ON n.id = a.noteId
+        WHERE n.isTrashed = 0
+          AND NOT EXISTS (
+            SELECT 1 FROM note_embeddings e
+             WHERE e.entityType = 'attachment' AND e.attachmentId = a.id
+          )
+        ON CONFLICT(attachmentId) DO NOTHING
+      `).run();
+    },
+  },
 ];
 
 /** 当前代码已知的最高 schema 版本（== MIGRATIONS 里 max(version)）。 */

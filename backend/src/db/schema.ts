@@ -746,6 +746,8 @@ function initSchema(db: Database.Database) {
       chunkIndex INTEGER NOT NULL DEFAULT 0,
       chunkText TEXT NOT NULL DEFAULT '',
       vectorJson TEXT NOT NULL DEFAULT '[]',
+      entityType TEXT NOT NULL DEFAULT 'note',
+      attachmentId TEXT,
       createdAt TEXT NOT NULL DEFAULT (datetime('now')),
       FOREIGN KEY (noteId) REFERENCES notes(id) ON DELETE CASCADE,
       FOREIGN KEY (userId) REFERENCES users(id) ON DELETE CASCADE
@@ -756,6 +758,7 @@ function initSchema(db: Database.Database) {
     CREATE INDEX IF NOT EXISTS idx_note_embeddings_user_ws ON note_embeddings(userId, workspaceId);
     CREATE INDEX IF NOT EXISTS idx_note_embeddings_ws ON note_embeddings(workspaceId);
     CREATE INDEX IF NOT EXISTS idx_note_embeddings_model ON note_embeddings(model);
+    CREATE INDEX IF NOT EXISTS idx_note_embeddings_attachment ON note_embeddings(attachmentId);
 
     CREATE TABLE IF NOT EXISTS embedding_queue (
       noteId TEXT PRIMARY KEY,
@@ -806,6 +809,45 @@ function initSchema(db: Database.Database) {
         retries = 0,
         lastError = NULL,
         updatedAt = datetime('now');
+    END;
+
+    -- ==============================================================
+    -- 附件内容索引（与 note 索引共用 vec_note_chunks 虚表，靠 entityType 分辨）
+    -- ==============================================================
+    --
+    -- attachment_chunks：附件分块原文（召回后拼 prompt 用）
+    -- attachment_embedding_queue：附件任务队列（主键 attachmentId，与 note 队列分离）
+    -- attachments_embed_ad：附件删除时级联清理 note_embeddings 里对应的 attachment 行
+    CREATE TABLE IF NOT EXISTS attachment_chunks (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      attachmentId TEXT NOT NULL,
+      chunkIndex INTEGER NOT NULL DEFAULT 0,
+      chunkText TEXT NOT NULL DEFAULT '',
+      createdAt TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (attachmentId) REFERENCES attachments(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_attachment_chunks_attachment ON attachment_chunks(attachmentId);
+
+    CREATE TABLE IF NOT EXISTS attachment_embedding_queue (
+      attachmentId TEXT PRIMARY KEY,
+      userId TEXT NOT NULL,
+      workspaceId TEXT,
+      noteId TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      retries INTEGER NOT NULL DEFAULT 0,
+      lastError TEXT,
+      enqueuedAt TEXT NOT NULL DEFAULT (datetime('now')),
+      updatedAt TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (attachmentId) REFERENCES attachments(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_attachment_queue_status ON attachment_embedding_queue(status, enqueuedAt);
+    CREATE INDEX IF NOT EXISTS idx_attachment_queue_user_ws ON attachment_embedding_queue(userId, workspaceId);
+
+    DROP TRIGGER IF EXISTS attachments_embed_ad;
+    CREATE TRIGGER attachments_embed_ad AFTER DELETE ON attachments
+    BEGIN
+      DELETE FROM note_embeddings
+       WHERE entityType = 'attachment' AND attachmentId = old.id;
     END;
   `);
 

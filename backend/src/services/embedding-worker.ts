@@ -32,6 +32,7 @@ import {
   getVecDim,
   clearAllVectors,
 } from "./vec-store";
+import { extractAttachmentText, chunkAttachmentText } from "./attachment-indexer";
 
 // ====== 调参 ======
 const POLL_INTERVAL_MS = 5_000;          // 轮询间隔（无任务时）
@@ -276,6 +277,160 @@ async function processOne(
 }
 
 // ============================================================
+// 附件任务处理
+// ============================================================
+//
+// 与 processOne（笔记）对称：从 attachment_embedding_queue 取一条任务，
+// 读 attachments 行，从磁盘提取文本，切段，调 embedding，写 note_embeddings
+// （entityType='attachment'）+ attachment_chunks + vec_note_chunks。
+//
+// 为什么复用 note_embeddings 而不是单开一张 attachment_embeddings？
+//   - vec_note_chunks 虚表只有一张（维度必须一致），复用其 rowid 空间最省事；
+//   - KNN 召回时只做一次查询，按 entityType 分流；
+//   - /ask 拼 prompt 的代码也只需要处理一张"命中结果"表。
+//
+// 失败策略：
+//   - 附件不存在 / 格式不支持 / 过大 / 空：标 done + lastError='skipped:...'，
+//     不算失败（重试也救不了），等下次重建或 MIME 变了手动再试；
+//   - 解析器抛错 / embedding HTTP 失败：计入 retries，超过 MAX_RETRIES 标 failed。
+async function processAttachmentOne(
+  db: Database.Database,
+  cfg: EmbeddingConfig,
+  task: { attachmentId: string; retries: number },
+): Promise<void> {
+  const att = db
+    .prepare(
+      `SELECT a.id, a.noteId, a.userId, a.workspaceId, a.filename, a.mimeType, a.size, a.path,
+              n.isTrashed AS noteTrashed
+         FROM attachments a
+         JOIN notes n ON n.id = a.noteId
+        WHERE a.id = ?`,
+    )
+    .get(task.attachmentId) as
+    | {
+        id: string;
+        noteId: string;
+        userId: string;
+        workspaceId: string | null;
+        filename: string;
+        mimeType: string;
+        size: number;
+        path: string;
+        noteTrashed: number;
+      }
+    | undefined;
+
+  if (!att || att.noteTrashed) {
+    db.prepare(
+      "DELETE FROM attachment_embedding_queue WHERE attachmentId = ?",
+    ).run(task.attachmentId);
+    return;
+  }
+
+  // 1. 提取文本
+  const extracted = await extractAttachmentText({
+    id: att.id,
+    path: att.path,
+    mimeType: att.mimeType,
+    filename: att.filename,
+    size: att.size,
+  });
+
+  if (extracted.skipReason) {
+    // 跳过：标 done 但带原因，前端"诊断"时能看见
+    db.prepare(
+      `UPDATE attachment_embedding_queue
+          SET status = 'done', updatedAt = datetime('now'),
+              lastError = ?
+        WHERE attachmentId = ?`,
+    ).run(`skipped: ${extracted.skipReason}`, task.attachmentId);
+    return;
+  }
+
+  const chunks = chunkAttachmentText(att.filename, extracted.text);
+  const valid = chunks.filter((c) => c.text.length >= 2);
+  if (valid.length === 0) {
+    db.prepare(
+      `UPDATE attachment_embedding_queue
+          SET status = 'done', updatedAt = datetime('now'),
+              lastError = 'skipped: empty after chunking'
+        WHERE attachmentId = ?`,
+    ).run(task.attachmentId);
+    return;
+  }
+
+  // 2. 调 embedding（可能抛错 → 外层 catch 按 retries 处理）
+  const vectors = await callEmbeddings(cfg, valid.map((c) => c.text));
+  const dim = vectors[0]?.length || DEFAULT_DIM;
+
+  // 3. 事务写入：删旧 → 插新 note_embeddings + attachment_chunks
+  const newRowIds: number[] = [];
+  const tx = db.transaction(() => {
+    // 旧 note_embeddings rowid（attachment 行）收集用于事务外清 vec 表
+    const oldRows = db
+      .prepare(
+        "SELECT id FROM note_embeddings WHERE entityType = 'attachment' AND attachmentId = ?",
+      )
+      .all(att.id) as { id: number }[];
+    if (oldRows.length > 0) {
+      try { deleteVectorsByRowids(oldRows.map((r) => r.id)); } catch { /* ignore */ }
+    }
+    db.prepare(
+      "DELETE FROM note_embeddings WHERE entityType = 'attachment' AND attachmentId = ?",
+    ).run(att.id);
+    db.prepare(
+      "DELETE FROM attachment_chunks WHERE attachmentId = ?",
+    ).run(att.id);
+
+    const insE = db.prepare(`
+      INSERT INTO note_embeddings
+        (noteId, userId, workspaceId, model, dim, chunkIndex, chunkText, vectorJson,
+         entityType, attachmentId, createdAt)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'attachment', ?, datetime('now'))
+    `);
+    const insC = db.prepare(
+      "INSERT INTO attachment_chunks (attachmentId, chunkIndex, chunkText, createdAt) VALUES (?, ?, ?, datetime('now'))",
+    );
+
+    for (let i = 0; i < valid.length; i++) {
+      const info = insE.run(
+        att.noteId,
+        att.userId,
+        att.workspaceId,
+        cfg.model,
+        dim,
+        valid[i].idx,
+        valid[i].text,
+        JSON.stringify(vectors[i]),
+        att.id,
+      );
+      newRowIds.push(Number(info.lastInsertRowid));
+      insC.run(att.id, valid[i].idx, valid[i].text);
+    }
+
+    db.prepare(
+      `UPDATE attachment_embedding_queue
+          SET status = 'done', lastError = NULL, updatedAt = datetime('now')
+        WHERE attachmentId = ?`,
+    ).run(att.id);
+  });
+  tx();
+
+  // 4. 灌 vec0 表（事务外）
+  if (isVecAvailable() || getVecDim() === null) {
+    try {
+      const vecDim = getVecDim();
+      if (vecDim !== null && vecDim !== dim) {
+        resetVecTable(dim);
+      }
+      upsertVectors(newRowIds.map((rowid, i) => ({ rowid, vector: vectors[i] })));
+    } catch (e) {
+      console.warn("[embedding-worker] attachment vec upsert failed:", e);
+    }
+  }
+}
+
+// ============================================================
 // 主循环
 // ============================================================
 async function tick(): Promise<void> {
@@ -333,6 +488,57 @@ async function tick(): Promise<void> {
     console.warn("[embedding-worker] tick error:", e);
   } finally {
     running = false;
+  }
+
+  // ---- 附件任务：与笔记任务同一个 tick，共享 BATCH_SIZE 的"大轮询"节奏 ----
+  // 放在 finally 之外的独立 try/catch：笔记分支出错不影响附件分支，反之亦然。
+  await tickAttachments();
+}
+
+async function tickAttachments(): Promise<void> {
+  if (stopped) return;
+  try {
+    const db = getDb();
+    const cfg = readEmbeddingConfig(db);
+    if (!cfg) return;
+
+    const tasks = db
+      .prepare(
+        `SELECT attachmentId, retries
+           FROM attachment_embedding_queue
+          WHERE status = 'pending' AND retries < ?
+          ORDER BY enqueuedAt ASC
+          LIMIT ?`,
+      )
+      .all(MAX_RETRIES, BATCH_SIZE) as {
+      attachmentId: string;
+      retries: number;
+    }[];
+
+    if (tasks.length === 0) return;
+
+    const markProcessing = db.prepare(
+      "UPDATE attachment_embedding_queue SET status = 'processing', updatedAt = datetime('now') WHERE attachmentId = ?",
+    );
+    for (const t of tasks) markProcessing.run(t.attachmentId);
+
+    for (const task of tasks) {
+      try {
+        await processAttachmentOne(db, cfg, task);
+      } catch (e: any) {
+        const msg = (e?.message || String(e)).slice(0, 500);
+        const newRetries = task.retries + 1;
+        const newStatus = newRetries >= MAX_RETRIES ? "failed" : "pending";
+        db.prepare(
+          `UPDATE attachment_embedding_queue
+              SET status = ?, retries = ?, lastError = ?, updatedAt = datetime('now')
+            WHERE attachmentId = ?`,
+        ).run(newStatus, newRetries, msg, task.attachmentId);
+        await sleep(500);
+      }
+    }
+  } catch (e) {
+    console.warn("[embedding-worker] tickAttachments error:", e);
   }
 }
 
@@ -465,7 +671,89 @@ export function rebuildAllEmbeddings(opts: {
   const enqueued = (db
     .prepare(`SELECT COUNT(*) as c FROM embedding_queue WHERE ${countWhere}`)
     .get(...params) as { c: number }).c;
-  return { enqueued };
+
+  // ---- 附件索引：同 scope 下的附件也一起重建 ----
+  // 与笔记索引同步：切换 embedding 模型或点"重建索引"时，附件向量也需要
+  // 重算——否则两种向量维度不一致会在 vec0 表里打架。attachment_embedding_queue
+  // 按 (userId, workspaceId) 维护自己的 scope 列（v8 迁移创建时已冗余），
+  // 条件 WHERE 复用 conds。
+  let attEnqueued = 0;
+  try {
+    attEnqueued = rebuildAttachmentEmbeddingsInternal(db, conds, params, clearExisting);
+  } catch (e) {
+    console.warn("[embedding-worker] attachment rebuild failed:", e);
+  }
+
+  return { enqueued: enqueued + attEnqueued };
+}
+
+/**
+ * 附件重建内部实现：与 note 走同一套 scope。
+ * 不导出：外部一律走 rebuildAllEmbeddings 触发；需要单独重建的场景也可
+ * 加 scope=... 的 opts，worker 会自动处理两类队列。
+ */
+function rebuildAttachmentEmbeddingsInternal(
+  db: Database.Database,
+  conds: string[],
+  params: any[],
+  clearExisting?: boolean,
+): number {
+  // scope 过滤 SQL：conds 是 "userId = ?" / "workspaceId IS NULL" / "workspaceId = ?"
+  // 之类的片段，attachments 表同样有这些列，直接复用。
+  const rowidWhere = conds.length > 0 ? `WHERE ${conds.join(" AND ")}` : "";
+
+  let oldRowids: number[] = [];
+  const tx = db.transaction(() => {
+    if (clearExisting) {
+      const oldIds = db
+        .prepare(
+          `SELECT id FROM note_embeddings WHERE entityType = 'attachment'${
+            conds.length > 0 ? " AND " + conds.join(" AND ") : ""
+          }`,
+        )
+        .all(...params) as { id: number }[];
+      db.prepare(
+        `DELETE FROM note_embeddings WHERE entityType = 'attachment'${
+          conds.length > 0 ? " AND " + conds.join(" AND ") : ""
+        }`,
+      ).run(...params);
+      // attachment_chunks 同步清理：按 attachmentId IN (scope 内的附件 id)
+      db.prepare(
+        `DELETE FROM attachment_chunks WHERE attachmentId IN (SELECT id FROM attachments ${rowidWhere})`,
+      ).run(...params);
+      oldRowids = oldIds.map((r) => r.id);
+    }
+
+    // 入队：只入"所属笔记未回收"的附件
+    const attachWhere = conds.length > 0 ? conds.join(" AND ") + " AND " : "";
+    db.prepare(
+      `INSERT INTO attachment_embedding_queue
+         (attachmentId, userId, workspaceId, noteId, status, retries, enqueuedAt, updatedAt)
+       SELECT a.id, a.userId, a.workspaceId, a.noteId, 'pending', 0, datetime('now'), datetime('now')
+         FROM attachments a
+         JOIN notes n ON n.id = a.noteId
+        WHERE ${attachWhere}n.isTrashed = 0
+       ON CONFLICT(attachmentId) DO UPDATE SET
+         workspaceId = excluded.workspaceId,
+         status = 'pending',
+         retries = 0,
+         lastError = NULL,
+         updatedAt = datetime('now')`,
+    ).run(...params);
+  });
+  tx();
+
+  if (clearExisting && oldRowids.length > 0) {
+    try { deleteVectorsByRowids(oldRowids); } catch { /* ignore */ }
+  }
+
+  const countWhere = ["status = 'pending'", ...conds].join(" AND ");
+  const row = db
+    .prepare(
+      `SELECT COUNT(*) as c FROM attachment_embedding_queue WHERE ${countWhere}`,
+    )
+    .get(...params) as { c: number };
+  return row.c;
 }
 
 /**
@@ -485,6 +773,12 @@ export function getEmbeddingStats(opts?: {
   pending: number;
   processing: number;
   failed: number;
+  // 附件维度（v8）
+  totalAttachments: number;
+  indexedAttachments: number;
+  attachmentPending: number;
+  attachmentProcessing: number;
+  attachmentFailed: number;
   configured: boolean;
   model: string | null;
   vecAvailable: boolean;
@@ -514,8 +808,12 @@ export function getEmbeddingStats(opts?: {
     .prepare(`SELECT COUNT(*) as c FROM notes WHERE isTrashed = 0${whereTail}`)
     .get(...params) as { c: number }).c;
 
+  // 只统计 note 类实体；attachment 行在 v8 后混入 note_embeddings，
+  // 统计 note 已索引数量必须加 entityType='note' 过滤，否则会把附件计进来。
   const indexedNotes = (db
-    .prepare(`SELECT COUNT(DISTINCT noteId) as c FROM note_embeddings${whereOnly}`)
+    .prepare(
+      `SELECT COUNT(DISTINCT noteId) as c FROM note_embeddings WHERE entityType = 'note'${whereTail}`,
+    )
     .get(...params) as { c: number }).c;
 
   const queueRows = db
@@ -524,12 +822,57 @@ export function getEmbeddingStats(opts?: {
   const counts: Record<string, number> = {};
   for (const r of queueRows) counts[r.status] = r.c;
 
+  // ---- 附件统计（与 note 同 scope）----
+  // attachments 表需要 JOIN notes 过滤 isTrashed；scope 列本身在 attachments
+  // 上已经有（v5 backfill 已完成）。
+  const attachConds: string[] = [];
+  const attachParams: any[] = [];
+  if (opts?.userId !== undefined) {
+    attachConds.push(`a.userId = ?`);
+    attachParams.push(opts.userId);
+  }
+  if (opts?.workspaceId !== undefined) {
+    if (opts.workspaceId === null || opts.workspaceId === "") {
+      attachConds.push(`a.workspaceId IS NULL`);
+    } else {
+      attachConds.push(`a.workspaceId = ?`);
+      attachParams.push(opts.workspaceId);
+    }
+  }
+  const attachWhere = attachConds.length > 0 ? ` AND ${attachConds.join(" AND ")}` : "";
+  const totalAttachments = (db
+    .prepare(
+      `SELECT COUNT(*) as c FROM attachments a JOIN notes n ON n.id = a.noteId
+        WHERE n.isTrashed = 0${attachWhere}`,
+    )
+    .get(...attachParams) as { c: number }).c;
+
+  const indexedAttachments = (db
+    .prepare(
+      `SELECT COUNT(DISTINCT attachmentId) as c FROM note_embeddings
+        WHERE entityType = 'attachment'${whereTail}`,
+    )
+    .get(...params) as { c: number }).c;
+
+  const attachQueueRows = db
+    .prepare(
+      `SELECT status, COUNT(*) as c FROM attachment_embedding_queue${whereOnly} GROUP BY status`,
+    )
+    .all(...params) as { status: string; c: number }[];
+  const attachCounts: Record<string, number> = {};
+  for (const r of attachQueueRows) attachCounts[r.status] = r.c;
+
   return {
     totalNotes,
     indexedNotes,
     pending: counts.pending || 0,
     processing: counts.processing || 0,
     failed: counts.failed || 0,
+    totalAttachments,
+    indexedAttachments,
+    attachmentPending: attachCounts.pending || 0,
+    attachmentProcessing: attachCounts.processing || 0,
+    attachmentFailed: attachCounts.failed || 0,
     configured: !!cfg,
     model: cfg?.model || null,
     vecAvailable: isVecAvailable(),
@@ -545,6 +888,41 @@ export function getEmbeddingStats(opts?: {
 // - 复用 readEmbeddingConfig：保证查询和入库用同一个 model/url，维度一致
 // - 配置缺失返回 null，调用方降级走 BM25
 // - 失败也返回 null（吞错）：用户已经在等回复，不能因为 embedding 接口抖动导致 /ask 整个挂掉
+
+/**
+ * 附件上传成功后由 routes/attachments.ts 调用：立即入队一次 embedding 任务。
+ *
+ * 幂等：对同一 attachmentId 二次调用会通过 ON CONFLICT 覆盖为 pending，
+ * 重置 retries/lastError，worker 下一轮处理。
+ *
+ * 不抛错：任何 DB 错误都被吞掉 + 打 warn——上传本身已经成功，索引失败不该
+ * 把上传接口的 201 响应也带错成 500。
+ */
+export function enqueueAttachment(att: {
+  attachmentId: string;
+  userId: string;
+  workspaceId: string | null;
+  noteId: string;
+}): void {
+  try {
+    const db = getDb();
+    db.prepare(
+      `INSERT INTO attachment_embedding_queue
+         (attachmentId, userId, workspaceId, noteId, status, retries, enqueuedAt, updatedAt)
+       VALUES (?, ?, ?, ?, 'pending', 0, datetime('now'), datetime('now'))
+       ON CONFLICT(attachmentId) DO UPDATE SET
+         userId = excluded.userId,
+         workspaceId = excluded.workspaceId,
+         noteId = excluded.noteId,
+         status = 'pending',
+         retries = 0,
+         lastError = NULL,
+         updatedAt = datetime('now')`,
+    ).run(att.attachmentId, att.userId, att.workspaceId, att.noteId);
+  } catch (e) {
+    console.warn("[embedding-worker] enqueueAttachment failed:", e);
+  }
+}
 
 export async function embedQuery(text: string): Promise<number[] | null> {
   const t = (text || "").trim();

@@ -2,7 +2,8 @@ import React, { useState, useRef, useEffect, useCallback } from "react";
 import {
   Bot, Send, Trash2, X, Loader2, FileText, Sparkles, User,
   BookOpen, Database, MessageCircleQuestion, ArrowRight,
-  Upload, FileUp, Wand2, FolderUp, Check, Copy, ChevronDown, ChevronUp
+  Upload, FileUp, Wand2, FolderUp, Check, Copy, ChevronDown, ChevronUp,
+  Paperclip
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import ReactMarkdown from "react-markdown";
@@ -11,11 +12,22 @@ import { api } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { ScrollArea } from "@/components/ui/scroll-area";
 
+// AI 知识库引用。v8 起区分 note / attachment：
+//   - note：点击跳转到笔记（onNavigateToNote）
+//   - attachment：点击下载附件（/api/attachments/:id?download=1）
+interface ChatReference {
+  id: string;
+  title: string;
+  kind?: "note" | "attachment";
+  attachmentId?: string;
+  attachmentFilename?: string;
+}
+
 interface ChatMessage {
   id: string;
   role: "user" | "assistant";
   content: string;
-  references?: { id: string; title: string }[];
+  references?: ChatReference[];
   isStreaming?: boolean;
 }
 
@@ -127,7 +139,7 @@ export default function AIChatPanel({ onClose, onNavigateToNote }: {
 
     // 收集流式期间累积的最终内容和 references，结束后一次性落库
     let finalContent = "";
-    let finalRefs: { id: string; title: string }[] | undefined;
+    let finalRefs: ChatReference[] | undefined;
 
     try {
       await api.aiAsk(
@@ -663,23 +675,46 @@ export default function AIChatPanel({ onClose, onNavigateToNote }: {
                       {t("aiChat.references")}
                     </p>
                     <div className="flex flex-wrap gap-1">
-                      {msg.references.map((ref) => (
-                        <button
-                          key={ref.id}
-                          onClick={() => onNavigateToNote?.(ref.id)}
-                          className={cn(
-                            "inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] transition-colors",
-                            onNavigateToNote
-                              ? "bg-violet-50 dark:bg-violet-500/10 text-violet-600 dark:text-violet-400 hover:bg-violet-100 dark:hover:bg-violet-500/20 cursor-pointer"
-                              : "bg-violet-50 dark:bg-violet-500/10 text-violet-600 dark:text-violet-400"
-                          )}
-                          title={onNavigateToNote ? t("aiChat.openNote") : undefined}
-                        >
-                          <FileText size={9} />
-                          {ref.title}
-                          {onNavigateToNote && <ArrowRight size={8} className="ml-0.5" />}
-                        </button>
-                      ))}
+                      {msg.references.map((ref) => {
+                        const isAtt = ref.kind === "attachment" && ref.attachmentId;
+                        const clickable = isAtt || !!onNavigateToNote;
+                        // 附件点击：新 tab 下载；笔记点击：跳转到笔记
+                        const handleClick = () => {
+                          if (isAtt && ref.attachmentId) {
+                            window.open(
+                              `/api/attachments/${ref.attachmentId}?download=1`,
+                              "_blank",
+                            );
+                          } else if (onNavigateToNote) {
+                            onNavigateToNote(ref.id);
+                          }
+                        };
+                        return (
+                          <button
+                            key={`${ref.kind || "note"}-${ref.attachmentId || ref.id}`}
+                            onClick={handleClick}
+                            className={cn(
+                              "inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] transition-colors",
+                              isAtt
+                                ? clickable
+                                  ? "bg-amber-50 dark:bg-amber-500/10 text-amber-700 dark:text-amber-400 hover:bg-amber-100 dark:hover:bg-amber-500/20 cursor-pointer"
+                                  : "bg-amber-50 dark:bg-amber-500/10 text-amber-700 dark:text-amber-400"
+                                : clickable
+                                  ? "bg-violet-50 dark:bg-violet-500/10 text-violet-600 dark:text-violet-400 hover:bg-violet-100 dark:hover:bg-violet-500/20 cursor-pointer"
+                                  : "bg-violet-50 dark:bg-violet-500/10 text-violet-600 dark:text-violet-400"
+                            )}
+                            title={
+                              isAtt
+                                ? (ref.attachmentFilename || ref.title)
+                                : (onNavigateToNote ? t("aiChat.openNote") : undefined)
+                            }
+                          >
+                            {isAtt ? <Paperclip size={9} /> : <FileText size={9} />}
+                            {ref.title}
+                            {clickable && <ArrowRight size={8} className="ml-0.5" />}
+                          </button>
+                        );
+                      })}
                     </div>
                   </div>
                 )}

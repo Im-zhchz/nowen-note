@@ -47,6 +47,7 @@ import { v4 as uuid } from "uuid";
 import fs from "fs";
 import path from "path";
 import { resolveNotePermission, hasPermission } from "../middleware/acl";
+import { enqueueAttachment } from "../services/embedding-worker";
 
 const ATTACHMENTS_DIR = path.join(
   process.env.ELECTRON_USER_DATA || path.join(process.cwd(), "data"),
@@ -318,6 +319,15 @@ app.post("/", async (c) => {
     try { fs.unlinkSync(savePath); } catch { /* ignore */ }
     return c.json({ error: `写入数据库失败: ${err?.message || err}` }, 500);
   }
+
+  // v8：上传成功后立即把附件入队做内容索引。enqueueAttachment 内部吞错，
+  // 即使队列表异常也不影响上传成功响应。
+  enqueueAttachment({
+    attachmentId: id,
+    userId,
+    workspaceId: noteWorkspaceId,
+    noteId,
+  });
 
   return c.json(
     {
