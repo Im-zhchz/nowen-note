@@ -283,7 +283,15 @@ backupsRouter.post("/auto", async (c) => {
   const denied = requireBackupSudo(c);
   if (denied) return denied;
 
-  const body = (await c.req.json().catch(() => ({}))) as { enabled?: boolean; intervalHours?: number };
+  const body = (await c.req.json().catch(() => ({}))) as {
+    enabled?: boolean;
+    intervalHours?: number;
+    mode?: "interval" | "daily";
+    dailyAt?: string;
+    keepCount?: number;
+    emailOnSuccess?: boolean;
+    emailTo?: string;
+  };
   const manager = getBackupManager();
 
   // 间隔范围校验：1h ~ 720h(30 天)。低于 1h 会让备份吞 IO；高于 30 天等于没开。
@@ -291,17 +299,57 @@ backupsRouter.post("/auto", async (c) => {
   if (!Number.isFinite(interval) || interval < 1) interval = 1;
   if (interval > 720) interval = 720;
 
+  // mode 校验：默认 interval；daily 必须带合法 HH:mm
+  const mode: "interval" | "daily" = body.mode === "daily" ? "daily" : "interval";
+  let dailyAt = typeof body.dailyAt === "string" ? body.dailyAt : "03:00";
+  if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(dailyAt)) {
+    if (mode === "daily") {
+      return c.json({ error: "dailyAt 必须是 HH:mm 24h 格式" }, 400);
+    }
+    dailyAt = "03:00";
+  }
+
+  // keepCount 范围 1~100，缺省 15。前端通常会传 15；旧客户端不传时也走 15。
+  let keepCount = Number(body.keepCount);
+  if (!Number.isFinite(keepCount)) keepCount = 15;
+  keepCount = Math.max(1, Math.min(100, Math.round(keepCount)));
+
+  const emailOnSuccess = body.emailOnSuccess === true;
+  const emailTo = (body.emailTo || "").trim();
+  if (emailOnSuccess && (!emailTo || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(emailTo))) {
+    return c.json({ error: "启用自动发邮件时收件人邮箱格式必须合法" }, 400);
+  }
+
   if (body.enabled === false) {
     manager.stopAutoBackup({ persist: true, intervalHours: interval });
     return c.json({ success: true, message: "自动备份已停止", enabled: false, intervalHours: interval });
   }
 
-  manager.startAutoBackup(interval, { persist: true });
+  manager.startAutoBackup(
+    {
+      enabled: true,
+      intervalHours: interval,
+      mode,
+      dailyAt,
+      keepCount,
+      emailOnSuccess,
+      emailTo,
+    },
+    { persist: true },
+  );
   return c.json({
     success: true,
-    message: `自动备份已启动，间隔 ${interval} 小时`,
+    message:
+      mode === "daily"
+        ? `自动备份已启动，每天 ${dailyAt} 触发`
+        : `自动备份已启动，每 ${interval} 小时触发`,
     enabled: true,
     intervalHours: interval,
+    mode,
+    dailyAt,
+    keepCount,
+    emailOnSuccess,
+    emailTo,
   });
 });
 

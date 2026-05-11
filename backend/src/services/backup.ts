@@ -84,9 +84,50 @@ const BACKUP_DIR_KV_KEY = "backup:dir";
  */
 const FAILURE_DEGRADE_THRESHOLD = 3;
 
+/**
+ * 自动备份配置。
+ *
+ * 兼容性：
+ *   - 旧版（v1）只有 enabled + intervalHours。新增字段都给了默认值，
+ *     loadAutoConfigFromDb() 会把 v1 行平滑升级为 v2，不会因缺字段
+ *     导致 enabled 被误判为 false。
+ *
+ * 字段语义：
+ *   - mode="interval"：从启动那一刻起每 intervalHours 小时跑一次（旧行为）。
+ *   - mode="daily"   ：每天到达 dailyAt（"HH:mm"，服务器本地时区）跑一次；
+ *                       服务启动时若今日时间点还没到 → 调度到今日；已过 → 明日。
+ *                       重启不会立即触发（避免运维半夜重启抖一次备份）。
+ *
+ *   - keepCount：自动清理保留的 db-only 备份数量。范围 1~100，默认 15。
+ *                只清理 db-only（filename 含 "db-only"），full 不动；
+ *                由"自动备份完成"和"手动备份完成"两条路径共同触发，
+ *                避免旧版本"只在 tick 里清理"导致手动产物无限堆积。
+ *
+ *   - emailOnSuccess + emailTo：自动备份成功后自动发邮件（SMTP 需启用且
+ *                就绪，否则静默跳过，不阻塞备份）。
+ */
 interface AutoBackupConfig {
   enabled: boolean;
   intervalHours: number;
+  mode?: "interval" | "daily";
+  /** "HH:mm" 24 小时制（服务器本地时区）；mode="daily" 时使用 */
+  dailyAt?: string;
+  /** 自动清理保留的 db-only 备份数；默认 15 */
+  keepCount?: number;
+  /** 自动备份成功后是否自动发邮件 */
+  emailOnSuccess?: boolean;
+  /** 自动发邮件的收件人地址（emailOnSuccess=true 时必填） */
+  emailTo?: string;
+}
+
+/** keepCount 上下限（与路由校验保持一致） */
+const KEEP_COUNT_MIN = 1;
+const KEEP_COUNT_MAX = 100;
+const KEEP_COUNT_DEFAULT = 15;
+
+/** "HH:mm" 24h 校验 */
+function isValidHHmm(s: string | undefined): s is string {
+  return typeof s === "string" && /^([01]\d|2[0-3]):[0-5]\d$/.test(s);
 }
 
 /**
@@ -155,6 +196,18 @@ export interface BackupHealth {
   autoBackupRunning: boolean;
   /** 自动备份间隔（小时） */
   autoBackupIntervalHours: number;
+  /** 自动备份调度模式 */
+  autoBackupMode?: "interval" | "daily";
+  /** mode="daily" 时的每日触发时间 "HH:mm" */
+  autoBackupDailyAt?: string;
+  /** 自动清理保留的 db-only 备份数 */
+  autoBackupKeepCount?: number;
+  /** 是否启用"备份成功后自动发邮件" */
+  autoBackupEmailOnSuccess?: boolean;
+  /** 自动发送邮件的收件人（已存在则原样返回，方便前端回填） */
+  autoBackupEmailTo?: string;
+  /** 下一次预计触发时间（ISO，仅展示） */
+  autoBackupNextRunAt?: string | null;
   /** 距上次成功备份的小时数 */
   hoursSinceLastSuccess: number | null;
   /** 备份目录 */
@@ -294,6 +347,20 @@ export class BackupManager {
   private dataDir: string;
   private autoBackupTimer: NodeJS.Timeout | null = null;
   private autoBackupIntervalHours = 24;
+  /** 当前生效的完整自动备份配置，tick 时按它工作；运行期变更必须先 stop 再 start。 */
+  private autoBackupConfig: AutoBackupConfig = {
+    enabled: false,
+    intervalHours: 24,
+    mode: "interval",
+    dailyAt: "03:00",
+    keepCount: KEEP_COUNT_DEFAULT,
+    emailOnSuccess: false,
+    emailTo: "",
+  };
+  /** 调度模式：interval 用周期 setInterval；daily 用链式 setTimeout（每次执行后重排） */
+  private autoBackupMode: "interval" | "daily" = "interval";
+  /** 下一次预计触发时间（ms 时间戳，仅用于 /status 展示） */
+  private autoBackupNextRunAt: number | null = null;
   /**
    * 内存里缓存一份健康状态以避免每次 /status 请求都打 DB。
    * 真实 source-of-truth 是 system_settings 表里的 HEALTH_KV_KEY，
@@ -497,7 +564,16 @@ export class BackupManager {
       let intervalHours = Number(parsed.intervalHours);
       if (!Number.isFinite(intervalHours) || intervalHours < 1) intervalHours = 24;
       if (intervalHours > 720) intervalHours = 720;
-      return { enabled, intervalHours };
+      // 兼容旧行：mode/dailyAt/keepCount 缺失时按默认值补齐——
+      // 关键：不能因为旧行没这些字段就把 enabled 推翻成 false。
+      const mode: "interval" | "daily" = parsed.mode === "daily" ? "daily" : "interval";
+      const dailyAt = isValidHHmm(parsed.dailyAt) ? parsed.dailyAt : "03:00";
+      let keepCount = Number(parsed.keepCount);
+      if (!Number.isFinite(keepCount)) keepCount = KEEP_COUNT_DEFAULT;
+      keepCount = Math.max(KEEP_COUNT_MIN, Math.min(KEEP_COUNT_MAX, Math.round(keepCount)));
+      const emailOnSuccess = parsed.emailOnSuccess === true;
+      const emailTo = typeof parsed.emailTo === "string" ? parsed.emailTo.trim() : "";
+      return { enabled, intervalHours, mode, dailyAt, keepCount, emailOnSuccess, emailTo };
     } catch {
       return null;
     }
@@ -538,7 +614,15 @@ export class BackupManager {
     let envInterval = Number(process.env.BACKUP_AUTO_INTERVAL_HOURS);
     if (!Number.isFinite(envInterval) || envInterval < 1) envInterval = 24;
     if (envInterval > 720) envInterval = 720;
-    return { enabled: envEnabled, intervalHours: envInterval };
+    return {
+      enabled: envEnabled,
+      intervalHours: envInterval,
+      mode: "interval",
+      dailyAt: "03:00",
+      keepCount: KEEP_COUNT_DEFAULT,
+      emailOnSuccess: false,
+      emailTo: "",
+    };
   }
 
   /** 从 system_settings 加载历史健康指标到内存。 */
@@ -630,6 +714,10 @@ export class BackupManager {
       this.health.lastFailureReason = null;
       this.health.consecutiveFailures = 0;
       this.persistHealth();
+      // 手动备份完成后也清理多余的 db-only——避免旧版"只有 tick 触发清理"
+      // 导致管理员频繁手动备份后列表无限堆积。
+      // 容错：若 prune 内部抛错也不能让 createBackup 整体失败。
+      try { this.pruneDbOnly(); } catch { /* ignore */ }
       return info;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -1313,36 +1401,191 @@ export class BackupManager {
   }
 
   /**
-   * 启动自动备份（默认 24h 一次，保留最近 10 个 db-only）
+   * 启动自动备份。
    *
-   * @param intervalHours 间隔小时数（路由层已校验范围 1~720）
-   * @param opts.persist  是否把 {enabled:true, intervalHours} 写到 system_settings；
-   *                      路由触发时传 true，启动时按落库值恢复时传 false（避免无意义写）
+   * 兼容两种调度模式：
+   *   - mode="interval"：以固定毫秒周期 setInterval 触发（旧行为）。
+   *   - mode="daily"   ：使用链式 setTimeout，每次触发完计算下一次"今天/明天的 HH:mm"再排。
+   *                     这样能精确落在管理员指定的低峰时段，而不会被进程重启踢出节奏。
+   *
+   * @param cfg  完整配置；intervalHours 范围由路由层做了 1~720 校验
+   * @param opts.persist  路由触发为 true，启动期按落库值恢复为 false
    */
-  startAutoBackup(intervalHours: number = 24, opts: { persist?: boolean } = {}): void {
+  startAutoBackup(cfg: AutoBackupConfig, opts: { persist?: boolean } = {}): void;
+  /** @deprecated 旧签名，仅保留以兼容历史调用 —— 仅 enabled+intervalHours，mode 强制 interval */
+  startAutoBackup(intervalHours: number, opts?: { persist?: boolean }): void;
+  startAutoBackup(
+    cfgOrInterval: AutoBackupConfig | number,
+    opts: { persist?: boolean } = {},
+  ): void {
     this.stopAutoBackup();
-    this.autoBackupIntervalHours = intervalHours;
-    const ms = intervalHours * 3600 * 1000;
-    this.autoBackupTimer = setInterval(async () => {
-      try {
-        const info = await this.createBackup({ type: "db-only", description: "自动备份" });
-        console.log(`[Backup] 自动备份完成: ${info.filename}`);
-        const all = this.listBackups();
-        const auto = all.filter((b) => b.filename.includes("db-only"));
-        if (auto.length > 10) {
-          for (const old of auto.slice(10)) {
-            this.deleteBackup(old.filename);
-          }
+
+    // 归一化为完整 AutoBackupConfig
+    const cfg: AutoBackupConfig = typeof cfgOrInterval === "number"
+      ? {
+          enabled: true,
+          intervalHours: cfgOrInterval,
+          mode: "interval",
+          dailyAt: "03:00",
+          keepCount: KEEP_COUNT_DEFAULT,
+          emailOnSuccess: false,
+          emailTo: "",
         }
-      } catch (err) {
-        // 健康字段已经在 createBackup 内部更新
-        console.error("[Backup] 自动备份失败:", err instanceof Error ? err.message : err);
-      }
-    }, ms);
-    if (opts.persist) {
-      this.persistAutoConfig({ enabled: true, intervalHours });
+      : cfgOrInterval;
+
+    this.autoBackupConfig = { ...cfg, enabled: true };
+    this.autoBackupIntervalHours = cfg.intervalHours;
+    this.autoBackupMode = cfg.mode === "daily" ? "daily" : "interval";
+
+    if (this.autoBackupMode === "interval") {
+      const ms = cfg.intervalHours * 3600 * 1000;
+      this.autoBackupNextRunAt = Date.now() + ms;
+      this.autoBackupTimer = setInterval(() => {
+        this.autoBackupNextRunAt = Date.now() + ms;
+        void this.runAutoTick();
+      }, ms);
+      console.log(`[Backup] 自动备份已启动（间隔模式，每 ${cfg.intervalHours} 小时）`);
+    } else {
+      this.scheduleNextDaily(cfg.dailyAt || "03:00");
+      console.log(`[Backup] 自动备份已启动（每日 ${cfg.dailyAt} 模式）`);
     }
-    console.log(`[Backup] 自动备份已启动，间隔 ${intervalHours} 小时`);
+
+    if (opts.persist) {
+      this.persistAutoConfig(this.autoBackupConfig);
+    }
+  }
+
+  /**
+   * 排定下一次 daily 触发。
+   * 当前时间 < 今日 HH:mm → 排到今日；否则 → 排到明日同一时刻。
+   * 触发完后递归调用自己重排下一日，形成稳定的"每天一次"链。
+   */
+  private scheduleNextDaily(hhmm: string): void {
+    const [hh, mm] = hhmm.split(":").map((n) => Number(n));
+    const now = new Date();
+    const next = new Date(now);
+    next.setHours(hh, mm, 0, 0);
+    if (next.getTime() <= now.getTime()) {
+      next.setDate(next.getDate() + 1);
+    }
+    const delay = next.getTime() - now.getTime();
+    this.autoBackupNextRunAt = next.getTime();
+    this.autoBackupTimer = setTimeout(async () => {
+      try {
+        await this.runAutoTick();
+      } finally {
+        // 即便 tick 失败也继续排明天的——避免"一次失败永久哑火"
+        if (this.autoBackupConfig.enabled && this.autoBackupMode === "daily") {
+          this.scheduleNextDaily(this.autoBackupConfig.dailyAt || "03:00");
+        }
+      }
+    }, delay);
+  }
+
+  /**
+   * 一次自动备份的实际执行体。两种调度模式共用。
+   *   1. 产 db-only 备份；
+   *   2. 按 keepCount 清理多余 db-only；
+   *   3. emailOnSuccess && SMTP ready → 发邮件（失败仅记日志，不影响备份成功）。
+   */
+  private async runAutoTick(): Promise<void> {
+    try {
+      const info = await this.createBackup({ type: "db-only", description: "自动备份" });
+      console.log(`[Backup] 自动备份完成: ${info.filename}`);
+
+      // 保留策略：手动备份也会调用 pruneDbOnly()，这里再触发一次属正常冗余
+      this.pruneDbOnly();
+
+      // 自动发邮件：动态 import 避免循环依赖，且 SMTP 没启用直接 skip
+      const cfg = this.autoBackupConfig;
+      if (cfg.emailOnSuccess && cfg.emailTo) {
+        await this.sendAutoBackupEmail(info.filename, cfg.emailTo).catch((err) => {
+          console.warn("[Backup] 自动备份邮件发送失败:", err instanceof Error ? err.message : err);
+        });
+      }
+    } catch (err) {
+      console.error("[Backup] 自动备份失败:", err instanceof Error ? err.message : err);
+    }
+  }
+
+  /**
+   * 清理多余的 db-only 备份。
+   *
+   * 由两条路径触发：
+   *   - 自动 tick 完成后
+   *   - 手动 createBackup() 完成后（在 createBackup 末尾调用，避免手动产物无限堆积）
+   *
+   * 仅清理 db-only；full 类型由管理员手动管理，避免误删大体积归档。
+   */
+  pruneDbOnly(): void {
+    try {
+      const keep = this.autoBackupConfig.keepCount ?? KEEP_COUNT_DEFAULT;
+      const all = this.listBackups();
+      const dbOnly = all.filter((b) => b.filename.includes("db-only"));
+      if (dbOnly.length > keep) {
+        for (const old of dbOnly.slice(keep)) {
+          this.deleteBackup(old.filename);
+        }
+      }
+    } catch (e) {
+      console.warn("[Backup] pruneDbOnly failed:", e instanceof Error ? e.message : e);
+    }
+  }
+
+  /**
+   * 发送"自动备份完成邮件"。
+   *   - 仅当 SMTP 启用且就绪时才发；否则静默跳过（不应阻塞或失败化备份本身）。
+   *   - 附件大小若超过 EMAIL_ATTACHMENT_LIMIT 则只发文字摘要，附件位置注明"请手动下载"。
+   *     避免把 50MB 的备份硬塞给会拒收的邮箱服务商。
+   */
+  private async sendAutoBackupEmail(filename: string, to: string): Promise<void> {
+    const { readSmtpConfig, sendMail, EMAIL_ATTACHMENT_LIMIT } = await import("./email");
+    const smtp = readSmtpConfig();
+    if (!smtp.enabled || !smtp.host || !smtp.username || !smtp.password) {
+      console.log("[Backup] 跳过自动备份邮件：SMTP 未启用或未就绪");
+      return;
+    }
+
+    const filePath = this.getBackupPath(filename);
+    if (!filePath || !fs.existsSync(filePath)) return;
+
+    const stat = fs.statSync(filePath);
+    const sizeMB = (stat.size / 1024 / 1024).toFixed(2);
+    const tooLarge = stat.size > EMAIL_ATTACHMENT_LIMIT;
+
+    const lines = [
+      `这是一封由 nowen-note 自动发送的备份完成通知。`,
+      ``,
+      `备份文件：${filename}`,
+      `大小：${sizeMB} MB`,
+      `时间：${new Date().toLocaleString()}`,
+    ];
+    if (tooLarge) {
+      lines.push(
+        ``,
+        `⚠️ 附件超过邮件 25MB 上限，本邮件未包含附件，请登录系统手动下载备份。`,
+      );
+    }
+
+    const attachments = tooLarge
+      ? []
+      : [{
+          filename,
+          content: fs.readFileSync(filePath),
+          contentType: filename.endsWith(".zip") ? "application/zip" : "application/octet-stream",
+        }];
+
+    const result = await sendMail({
+      to,
+      subject: `[nowen-note] 自动备份 ${filename}`,
+      text: lines.join("\n"),
+      attachments,
+    });
+    if (!result.success) {
+      console.warn(`[Backup] 自动备份邮件发送失败: ${result.error}`);
+    } else {
+      console.log(`[Backup] 自动备份邮件已发送至 ${to}`);
+    }
   }
 
   /**
@@ -1353,14 +1596,22 @@ export class BackupManager {
    */
   stopAutoBackup(opts: { persist?: boolean; intervalHours?: number } = {}): void {
     if (this.autoBackupTimer) {
-      clearInterval(this.autoBackupTimer);
+      // 同时兼容 setInterval 和 setTimeout 两种 timer：clearTimeout 在 Node 内部
+      // 等价于 clearInterval（都是 clear unref 的句柄），但显式两次更稳。
+      clearInterval(this.autoBackupTimer as NodeJS.Timeout);
+      clearTimeout(this.autoBackupTimer as NodeJS.Timeout);
       this.autoBackupTimer = null;
     }
+    this.autoBackupNextRunAt = null;
     if (opts.persist) {
-      this.persistAutoConfig({
+      // 复用上次完整配置，只把 enabled 翻为 false——这样下次"启用"时
+      // 用户的 mode/dailyAt/keepCount/邮件设置都还在。
+      this.autoBackupConfig = {
+        ...this.autoBackupConfig,
         enabled: false,
-        intervalHours: opts.intervalHours ?? this.autoBackupIntervalHours,
-      });
+        intervalHours: opts.intervalHours ?? this.autoBackupConfig.intervalHours ?? this.autoBackupIntervalHours,
+      };
+      this.persistAutoConfig(this.autoBackupConfig);
     }
   }
 
@@ -1393,6 +1644,14 @@ export class BackupManager {
       degraded,
       autoBackupRunning: this.autoBackupTimer !== null,
       autoBackupIntervalHours: this.autoBackupIntervalHours,
+      autoBackupMode: this.autoBackupMode,
+      autoBackupDailyAt: this.autoBackupConfig.dailyAt,
+      autoBackupKeepCount: this.autoBackupConfig.keepCount ?? KEEP_COUNT_DEFAULT,
+      autoBackupEmailOnSuccess: this.autoBackupConfig.emailOnSuccess === true,
+      autoBackupEmailTo: this.autoBackupConfig.emailTo ?? "",
+      autoBackupNextRunAt: this.autoBackupNextRunAt
+        ? new Date(this.autoBackupNextRunAt).toISOString()
+        : null,
       hoursSinceLastSuccess: hoursSince,
       backupDir: this.backupDir,
       dataDir: this.dataDir,
