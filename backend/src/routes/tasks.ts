@@ -73,11 +73,11 @@ tasks.get("/", requireWorkspaceFeature("tasks"), (c) => {
   }
 
   if (filter === "today") {
-    sql += ` AND dueDate IS NOT NULL AND date(dueDate) = date('now')`;
+    sql += ` AND dueDate IS NOT NULL AND date(dueDate) = date('now', 'localtime')`;
   } else if (filter === "week") {
-    sql += ` AND dueDate IS NOT NULL AND date(dueDate) BETWEEN date('now') AND date('now', '+7 days')`;
+    sql += ` AND dueDate IS NOT NULL AND date(dueDate) BETWEEN date('now', 'localtime') AND date('now', 'localtime', '+7 days')`;
   } else if (filter === "overdue") {
-    sql += ` AND isCompleted = 0 AND dueDate IS NOT NULL AND date(dueDate) < date('now')`;
+    sql += ` AND isCompleted = 0 AND dueDate IS NOT NULL AND date(dueDate) < date('now', 'localtime')`;
   } else if (filter === "completed") {
     sql += ` AND isCompleted = 1`;
   }
@@ -108,11 +108,12 @@ tasks.get("/stats/summary", requireWorkspaceFeature("tasks"), (c) => {
       COUNT(*)                                                                          AS total,
       SUM(CASE WHEN isCompleted = 1 THEN 1 ELSE 0 END)                                 AS completed,
       SUM(CASE WHEN isCompleted = 0 AND dueDate IS NOT NULL
-               AND date(dueDate) = date('now') THEN 1 ELSE 0 END)                      AS today,
+               AND date(dueDate) = date('now', 'localtime') THEN 1 ELSE 0 END)         AS today,
       SUM(CASE WHEN isCompleted = 0 AND dueDate IS NOT NULL
-               AND date(dueDate) < date('now') THEN 1 ELSE 0 END)                      AS overdue,
+               AND date(dueDate) < date('now', 'localtime') THEN 1 ELSE 0 END)         AS overdue,
       SUM(CASE WHEN isCompleted = 0 AND dueDate IS NOT NULL
-               AND date(dueDate) BETWEEN date('now') AND date('now', '+7 days')
+               AND date(dueDate) BETWEEN date('now', 'localtime')
+                                     AND date('now', 'localtime', '+7 days')
                THEN 1 ELSE 0 END)                                                      AS week
     FROM tasks
     WHERE ${whereSql}

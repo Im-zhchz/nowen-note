@@ -6,7 +6,7 @@ import {
   Trash2, ImagePlus, Link as LinkIcon, ExternalLink, Loader2,
   User as UserIcon
 } from "lucide-react";
-import { format, isToday, isPast, isTomorrow, isThisWeek, parseISO } from "date-fns";
+import { format, isToday, isPast, isTomorrow, isThisWeek, parseISO, parse } from "date-fns";
 import { zhCN, enUS } from "date-fns/locale";
 import { useTranslation } from "react-i18next";
 import { api, getCurrentWorkspace } from "@/lib/api";
@@ -157,12 +157,32 @@ function TitleView({
   );
 }
 
-/* ===== 日期显示 ===== */
+/* ===== 日期显示 =====
+ *
+ * dueDate 在数据库里以 'YYYY-MM-DD' 字符串存储（前端 <input type="date">
+ * 直出，无时间分量、无时区）。
+ *
+ * 注意：date-fns 的 parseISO('YYYY-MM-DD') 会按 ISO-8601 规范当 UTC 0 点解析，
+ * 而 isToday/isTomorrow/isThisWeek/isPast 全部按 **本地时区** 比较——这会
+ * 导致东八区"今日新增"的待办在 UI 上显示成"逾期/明天/未到期"等错位现象。
+ *
+ * 因此对 'YYYY-MM-DD' 必须显式按本地时区构造（parse 三参数版本），让 Date
+ * 落在本地 00:00:00；其它形态（含时间/Z 后缀的 ISO）继续走 parseISO。
+ */
+function toLocalDate(dateStr: string): Date {
+  // 形如 '2024-05-01' 的纯日期字符串：按本地时区 00:00 构造
+  if (/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
+    return parse(dateStr, "yyyy-MM-dd", new Date());
+  }
+  // 其它形态按 ISO 解析（含时间分量 / 已带时区信息）
+  return parseISO(dateStr);
+}
+
 function DateBadge({ dateStr }: { dateStr: string | null }) {
   const { t, i18n } = useTranslation();
   const dateLocale = i18n.language === "zh-CN" ? zhCN : enUS;
   if (!dateStr) return null;
-  const date = parseISO(dateStr);
+  const date = toLocalDate(dateStr);
   let className = "text-tx-tertiary";
   let text = format(date, "MM/dd", { locale: dateLocale });
 
@@ -175,7 +195,7 @@ function DateBadge({ dateStr }: { dateStr: string | null }) {
   } else if (isPast(date)) {
     className = "text-red-500";
     text = t('tasks.overdue') + " " + format(date, "MM/dd");
-  } else if (isThisWeek(date)) {
+  } else if (isThisWeek(date, { weekStartsOn: 1 })) {
     text = format(date, "EEEE", { locale: dateLocale });
   }
 
