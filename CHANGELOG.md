@@ -12,6 +12,14 @@
 
 <!-- ADD_NEW_HERE -->
 
+## v1.0.35 - 2026-05-11
+
+### 🐛 修复
+
+- **db**: 修复老库启动崩溃 SqliteError: no such column: workspaceId (d445c10)
+- **release**: .fpk 产物只收集当前版本，避免 dist-fpk 历史堆积误传 (4e3bf3b)
+
+
 ## v1.0.34 - 2026-05-11
 
 ### 🐛 修复

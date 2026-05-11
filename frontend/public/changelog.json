@@ -1,6 +1,11 @@
 {
-  "generatedAt": "2026-05-11T09:09:22.844Z",
+  "generatedAt": "2026-05-11T09:30:53.247Z",
   "entries": [
+    {
+      "version": "1.0.35",
+      "date": "2026-05-11",
+      "body": "### 🐛 修复\n\n- **db**: 修复老库启动崩溃 SqliteError: no such column: workspaceId (d445c10)\n- **release**: .fpk 产物只收集当前版本，避免 dist-fpk 历史堆积误传 (4e3bf3b)"
+    },
     {
       "version": "1.0.34",
       "date": "2026-05-11",
