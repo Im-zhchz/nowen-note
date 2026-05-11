@@ -240,6 +240,7 @@ export interface VecHit {
   distance: number;  // 越小越相似（cosine/L2 视 sqlite-vec 默认而定，当前为 L2）
   noteId: string;
   userId: string;
+  workspaceId: string | null;
   chunkText: string;
   chunkIndex: number;
   title: string;
@@ -251,13 +252,21 @@ export interface VecHit {
  *
  * 参数：
  *   queryVec    查询向量（必须维度匹配；不匹配返回 []）
- *   userId      只在该用户下检索
+ *   userId      调用方用户 id（个人空间下作为额外的 owner 过滤；工作区下用于
+ *               业务层之外的兜底审计——本函数本身不替代权限校验）
+ *   workspaceId 当前 scope：null = 个人空间（仅命中 userId 自己 + workspaceId IS NULL
+ *               的笔记），string = 指定工作区（命中所有 workspaceId 匹配的笔记，
+ *               不再以"作者"过滤，让同一个工作区成员能搜到彼此的笔记）
  *   k           取多少个 chunk（去重前；建议 20，去重后通常剩 5~10 篇）
  *   maxNotes    去重后最多返回多少篇
+ *
+ * 注意：调用方必须在路由层先校验"当前用户对该 workspaceId 有读权限"，本函数
+ *      只负责把检索范围严格收敛到给定的 (userId, workspaceId) scope。
  */
 export function knnSearch(
   queryVec: number[],
   userId: string,
+  workspaceId: string | null,
   k = 20,
   maxNotes = 5,
 ): VecHit[] {
@@ -269,7 +278,7 @@ export function knnSearch(
 
   // sqlite-vec KNN 语法：MATCH 给查询向量，k=? 控制返回数
   // 注意：vec0 的 MATCH 只支持单一查询向量；不支持 WHERE 复合条件
-  // 所以我们多取一些（k 个），再在外层用 note_embeddings.userId 过滤
+  // 所以我们多取一些（k 个），再在外层用 note_embeddings.userId/workspaceId 过滤
   let vecRows: { rowid: number; distance: number }[] = [];
   try {
     vecRows = db.prepare(`
@@ -294,6 +303,7 @@ export function knnSearch(
       e.id      AS rowid,
       e.noteId  AS noteId,
       e.userId  AS userId,
+      e.workspaceId AS workspaceId,
       e.chunkText AS chunkText,
       e.chunkIndex AS chunkIndex,
       n.title   AS title,
@@ -305,6 +315,7 @@ export function knnSearch(
     rowid: number;
     noteId: string;
     userId: string;
+    workspaceId: string | null;
     chunkText: string;
     chunkIndex: number;
     title: string;
@@ -313,13 +324,34 @@ export function knnSearch(
 
   const metaMap = new Map(meta.map((m) => [m.rowid, m]));
 
-  // 按 vecRows 顺序（已按 distance asc）merge + 过滤 user/trash + 按 noteId 去重
+  // scope 归一：'' 也按 null 处理；后端 query 解析层已经在传入前做过转换，
+  // 这里再加一道防御。
+  const wantWs: string | null = workspaceId || null;
+
+  // 按 vecRows 顺序（已按 distance asc）merge + 过滤 scope/trash + 按 noteId 去重
+  //
+  // 隔离规则：
+  //   - 个人空间 (wantWs === null)：仅命中 userId === 当前用户 且
+  //     workspaceId IS NULL 的向量。这同时阻止了"工作区笔记泄漏到个人空间"
+  //     和"别人的个人空间笔记泄漏给我"两种情况。
+  //   - 工作区 (wantWs !== null)：仅命中 workspaceId === wantWs 的向量；
+  //     不再按 userId 过滤——同一个工作区的成员应该能互相搜索到彼此的笔记，
+  //     这是协作场景的核心需求。访问权限由调用方（路由层）通过 workspace
+  //     成员校验保证：能拿到 wantWs 的人都已经具备该工作区读权限。
   const seen = new Set<string>();
   const hits: VecHit[] = [];
   for (const v of vecRows) {
     const m = metaMap.get(v.rowid);
     if (!m) continue;             // 元数据缺失：可能 note 已删但 vec 没及时清；跳过
-    if (m.userId !== userId) continue;
+    const mWs: string | null = m.workspaceId || null;
+    if (wantWs === null) {
+      // 个人空间：必须 owner 是自己 + 笔记本身在个人空间
+      if (m.userId !== userId) continue;
+      if (mWs !== null) continue;
+    } else {
+      // 工作区：仅按 workspaceId 匹配，不限 owner
+      if (mWs !== wantWs) continue;
+    }
     if (m.isTrashed) continue;
     if (seen.has(m.noteId)) continue;
     seen.add(m.noteId);
@@ -328,6 +360,7 @@ export function knnSearch(
       distance: v.distance,
       noteId: m.noteId,
       userId: m.userId,
+      workspaceId: mWs,
       chunkText: m.chunkText,
       chunkIndex: m.chunkIndex,
       title: m.title,

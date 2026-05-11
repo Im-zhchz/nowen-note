@@ -11,8 +11,47 @@ import {
   knnSearch,
   reindexAllVectors,
 } from "../services/vec-store";
+import { getUserWorkspaceRole } from "../middleware/acl";
 
 const ai = new Hono();
+
+// ============================================================
+// scope 解析：把 ?workspaceId=xxx 归一成 (userId, workspaceId|null)
+// ------------------------------------------------------------
+//
+// 全栈约定（与 notes/notebooks/tags/attachments 路由一致）：
+//   query 缺省 / 'personal' / '' / 'null' / null  →  个人空间（DB 里 workspaceId IS NULL）
+//   query = <uuid>                                  →  指定工作区
+//
+// 安全要点（v7 RAG 隔离修复）：
+//   - 工作区 scope 必须校验"当前用户是该工作区成员"。否则只要前端构造一个
+//     workspaceId query 就能通过 KNN 偷看别人工作区的笔记；
+//   - 个人空间 scope 不需要额外校验——knnSearch 自身会按 m.userId === userId
+//     过滤，永远只命中自己的个人笔记。
+//
+// 失败时抛 403（仅在工作区 scope 校验失败），调用方直接 return 该响应。
+function resolveScope(
+  c: any,
+): { userId: string; workspaceId: string | null } | { error: Response } {
+  const userId = c.req.header("X-User-Id") || "demo";
+  const raw = (c.req.query("workspaceId") || "").trim();
+  const ws = !raw || raw === "personal" || raw === "null" ? null : raw;
+
+  if (ws !== null) {
+    // 严格校验工作区成员身份；不存在 / 非成员 → 403
+    const role = getUserWorkspaceRole(ws, userId);
+    if (!role) {
+      return {
+        error: c.json(
+          { error: "您不是该工作区的成员，无法访问其知识库" },
+          403,
+        ) as Response,
+      };
+    }
+  }
+
+  return { userId, workspaceId: ws };
+}
 
 // ===== AI 设置管理 =====
 
@@ -439,8 +478,21 @@ ai.post("/ask", async (c) => {
   //   - 命中阈值：只要 vec 拿到 ≥1 个 hit 就直接用，不再触发后面的关键词路径
   //     （语义命中 1 篇通常远优于 FTS 命中 N 篇但都偏题）
   //   - 拿不到/失败时静默降级，与 Phase 1 行为完全一致
+  //
+  // 空间隔离（v7）：
+  //   /ask 严格按 scope = (userId, workspaceId|null) 收敛检索范围：
+  //     - 个人空间：仅命中当前用户在 workspaceId IS NULL 下的笔记
+  //     - 工作区  ：仅命中该工作区下的笔记（不限作者，工作区成员共享）
+  //   未通过 resolveScope 的成员校验直接 403，杜绝"用 query 偷看其他工作区"。
   const db = getDb();
-  const userId = c.req.header("X-User-Id") || "demo";
+  const scope = resolveScope(c);
+  if ("error" in scope) return scope.error;
+  const { userId, workspaceId } = scope;
+
+  // 共享的 scope SQL 片段：notes 表与 ai 路由用相同列名
+  // workspaceId 为 null 时用 IS NULL（不能用 = ?），所以分两套
+  const wsClause = workspaceId === null ? "workspaceId IS NULL" : "workspaceId = ?";
+  const wsParams: any[] = workspaceId === null ? [] : [workspaceId];
 
   let relatedNotes: { id: string; title: string; snippet: string }[] = [];
   let retrieval: "vector" | "fts" | "like" | "recent" | "none" = "none";
@@ -450,7 +502,7 @@ ai.post("/ask", async (c) => {
     try {
       const qvec = await embedQuery(question);
       if (qvec) {
-        const hits = knnSearch(qvec, userId, 20, 5);
+        const hits = knnSearch(qvec, userId, workspaceId, 20, 5);
         if (hits.length > 0) {
           relatedNotes = hits.map((h) => ({
             id: h.noteId,
@@ -469,6 +521,11 @@ ai.post("/ask", async (c) => {
   const keywords = extractKeywords(question);
 
   // ---- 路径 B：FTS5（仅当 vec 未命中时走）----
+  //
+  // 隔离规则：
+  //   - 个人空间：notes_fts 路径 + WHERE userId = ? AND workspaceId IS NULL
+  //   - 工作区  ：WHERE workspaceId = ?  （不限 userId，工作区共享）
+  // notes_fts 没有 workspaceId 列，所以隔离在外层 notes JOIN 时做。
   if (relatedNotes.length === 0 && keywords.length > 0) {
     // FTS5 查询：每个关键词加前缀通配符 *，用 OR 连接，提高命中率
     // 例如：「"前端"* OR "性能"* OR "优化"*」
@@ -481,14 +538,16 @@ ai.post("/ask", async (c) => {
       `).all(ftsQuery) as { rowid: number }[];
 
       if (ftsResults.length > 0) {
-        const rowids = ftsResults.map(r => r.rowid).slice(0, 10);
+        const rowids = ftsResults.map(r => r.rowid).slice(0, 30);
         const placeholders = rowids.map(() => "?").join(",");
+        const userClause = workspaceId === null ? "userId = ? AND " : "";
+        const userParams = workspaceId === null ? [userId] : [];
         const notes = db.prepare(`
           SELECT id, title, contentText FROM notes
-          WHERE rowid IN (${placeholders}) AND userId = ? AND isTrashed = 0
+          WHERE rowid IN (${placeholders}) AND ${userClause}${wsClause} AND isTrashed = 0
           ORDER BY updatedAt DESC
           LIMIT 5
-        `).all(...rowids, userId) as { id: string; title: string; contentText: string }[];
+        `).all(...rowids, ...userParams, ...wsParams) as { id: string; title: string; contentText: string }[];
 
         relatedNotes = notes.map(n => ({
           id: n.id,
@@ -513,12 +572,14 @@ ai.post("/ask", async (c) => {
       for (const k of topKeywords) {
         likeParams.push(`%${k}%`, `%${k}%`);
       }
+      const userClause = workspaceId === null ? "userId = ? AND " : "";
+      const userParams = workspaceId === null ? [userId] : [];
       const notes = db.prepare(`
         SELECT id, title, contentText FROM notes
-        WHERE userId = ? AND isTrashed = 0 AND (${likeClauses})
+        WHERE ${userClause}${wsClause} AND isTrashed = 0 AND (${likeClauses})
         ORDER BY updatedAt DESC
         LIMIT 5
-      `).all(userId, ...likeParams) as { id: string; title: string; contentText: string }[];
+      `).all(...userParams, ...wsParams, ...likeParams) as { id: string; title: string; contentText: string }[];
 
       relatedNotes = notes.map(n => ({
         id: n.id,
@@ -537,12 +598,14 @@ ai.post("/ask", async (c) => {
   // 笔记"的错觉。
   if (relatedNotes.length === 0) {
     try {
+      const userClause = workspaceId === null ? "userId = ? AND " : "";
+      const userParams = workspaceId === null ? [userId] : [];
       const notes = db.prepare(`
         SELECT id, title, contentText FROM notes
-        WHERE userId = ? AND isTrashed = 0
+        WHERE ${userClause}${wsClause} AND isTrashed = 0
         ORDER BY updatedAt DESC
         LIMIT 5
-      `).all(userId) as { id: string; title: string; contentText: string }[];
+      `).all(...userParams, ...wsParams) as { id: string; title: string; contentText: string }[];
 
       relatedNotes = notes.map(n => ({
         id: n.id,
@@ -1073,29 +1136,47 @@ ai.post("/import-to-knowledge", async (c) => {
 });
 
 // ===== 知识库统计 =====
+//
+// 按当前 scope（个人空间 / 工作区）返回笔记/笔记本/标签数。注意：
+//   - notes_fts 是全库共享的虚表，没有 userId/workspaceId 列；这里改为
+//     "scope 内已有 contentText 非空的笔记数" 替代旧的 ftsCount，更贴近
+//     用户感知（"有多少笔记被 FTS 索引过"在多用户共享 fts 表的语义下意义不大）。
 ai.get("/knowledge-stats", (c) => {
   const db = getDb();
-  const userId = c.req.header("X-User-Id") || "demo";
+  const scope = resolveScope(c);
+  if ("error" in scope) return scope.error;
+  const { userId, workspaceId } = scope;
+
+  // 个人空间需要叠加 userId 过滤；工作区只用 workspaceId（不限作者）
+  const userClause = workspaceId === null ? "userId = ? AND " : "";
+  const userParams: any[] = workspaceId === null ? [userId] : [];
+  const wsClause = workspaceId === null ? "workspaceId IS NULL" : "workspaceId = ?";
+  const wsParams: any[] = workspaceId === null ? [] : [workspaceId];
 
   const noteCount = (db.prepare(
-    "SELECT COUNT(*) as count FROM notes WHERE userId = ? AND isTrashed = 0"
-  ).get(userId) as { count: number }).count;
+    `SELECT COUNT(*) as count FROM notes WHERE ${userClause}${wsClause} AND isTrashed = 0`,
+  ).get(...userParams, ...wsParams) as { count: number }).count;
 
+  // "已被 FTS 索引"在共享 fts 表语境下没有 scope 维度，改为 "scope 内有正文的笔记数"
   const ftsCount = (db.prepare(
-    "SELECT COUNT(*) as count FROM notes_fts"
-  ).get() as { count: number }).count;
+    `SELECT COUNT(*) as count FROM notes
+       WHERE ${userClause}${wsClause} AND isTrashed = 0
+         AND contentText IS NOT NULL AND contentText != ''`,
+  ).get(...userParams, ...wsParams) as { count: number }).count;
 
   const notebookCount = (db.prepare(
-    "SELECT COUNT(*) as count FROM notebooks WHERE userId = ?"
-  ).get(userId) as { count: number }).count;
+    `SELECT COUNT(*) as count FROM notebooks WHERE ${userClause}${wsClause}`,
+  ).get(...userParams, ...wsParams) as { count: number }).count;
 
   const tagCount = (db.prepare(
-    "SELECT COUNT(*) as count FROM tags WHERE userId = ?"
-  ).get(userId) as { count: number }).count;
+    `SELECT COUNT(*) as count FROM tags WHERE ${userClause}${wsClause}`,
+  ).get(...userParams, ...wsParams) as { count: number }).count;
 
   const recentNotes = db.prepare(
-    "SELECT title FROM notes WHERE userId = ? AND isTrashed = 0 ORDER BY updatedAt DESC LIMIT 5"
-  ).all(userId) as { title: string }[];
+    `SELECT title FROM notes
+       WHERE ${userClause}${wsClause} AND isTrashed = 0
+       ORDER BY updatedAt DESC LIMIT 5`,
+  ).all(...userParams, ...wsParams) as { title: string }[];
 
   return c.json({
     noteCount,
@@ -1121,21 +1202,40 @@ ai.get("/knowledge-stats", (c) => {
 // 没有删除单条向量的端点：当笔记被删/移入回收站时，FK CASCADE + worker 自身的
 // "笔记已删则 DELETE 队列项"逻辑已经能自洽清理。
 
-// GET /api/ai/embeddings/stats
+// GET /api/ai/embeddings/stats?workspaceId=xxx
+//
+// scope 解析见 resolveScope。统计仅展示当前 scope 下的进度，避免"在工作区
+// 视图里看到自己个人笔记的 indexed 数"造成误解。
 ai.get("/embeddings/stats", (c) => {
-  const userId = c.req.header("X-User-Id") || "demo";
-  const stats = getEmbeddingStats(userId);
+  const scope = resolveScope(c);
+  if ("error" in scope) return scope.error;
+  const { userId, workspaceId } = scope;
+  const stats = getEmbeddingStats({
+    userId: workspaceId === null ? userId : undefined,
+    workspaceId,
+  });
   return c.json(stats);
 });
 
-// POST /api/ai/embeddings/rebuild
+// POST /api/ai/embeddings/rebuild?workspaceId=xxx
 // body: { clearExisting?: boolean }  默认 true（切模型场景下老向量必须清，否则
 // note_embeddings 里会同时存在多种维度的向量，后续检索会乱）
+//
+// scope 与 stats 同：
+//   - 个人空间：仅清/重建当前用户在 workspaceId IS NULL 下的索引
+//   - 工作区  ：仅清/重建该工作区的索引（不限作者，工作区共享）
 ai.post("/embeddings/rebuild", async (c) => {
   let body: { clearExisting?: boolean } = {};
   try { body = await c.req.json(); } catch { /* 允许空 body */ }
   const clearExisting = body.clearExisting !== false; // 默认 true
-  const result = rebuildAllEmbeddings({ clearExisting });
+  const scope = resolveScope(c);
+  if ("error" in scope) return scope.error;
+  const { userId, workspaceId } = scope;
+  const result = rebuildAllEmbeddings({
+    clearExisting,
+    userId: workspaceId === null ? userId : undefined,
+    workspaceId,
+  });
   return c.json({ ok: true, ...result, clearedExisting: clearExisting });
 });
 

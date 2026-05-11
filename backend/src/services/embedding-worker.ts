@@ -174,13 +174,20 @@ async function processOne(
   cfg: EmbeddingConfig,
   task: { noteId: string; userId: string; retries: number },
 ): Promise<void> {
-  // 取笔记内容
+  // 取笔记内容（含 workspaceId，写入 note_embeddings 时同步落表）
   const note = db
     .prepare(
-      "SELECT id, userId, title, contentText, isTrashed FROM notes WHERE id = ?",
+      "SELECT id, userId, workspaceId, title, contentText, isTrashed FROM notes WHERE id = ?",
     )
     .get(task.noteId) as
-    | { id: string; userId: string; title: string; contentText: string; isTrashed: number }
+    | {
+        id: string;
+        userId: string;
+        workspaceId: string | null;
+        title: string;
+        contentText: string;
+        isTrashed: number;
+      }
     | undefined;
 
   if (!note || note.isTrashed) {
@@ -218,14 +225,19 @@ async function processOne(
     }
     db.prepare("DELETE FROM note_embeddings WHERE noteId = ?").run(task.noteId);
 
+    // workspaceId 直接从 notes 行取——这是唯一真相源；笔记跨空间移动时
+    // notes_embed_au 触发器会让本笔记重新入队，processOne 这里读到的就是
+    // 最新的 workspaceId，旧的 embedding 行已经被本事务前面的 DELETE 清掉，
+    // 不会留下"旧空间残影"。
     const ins = db.prepare(`
-      INSERT INTO note_embeddings (noteId, userId, model, dim, chunkIndex, chunkText, vectorJson, createdAt)
-      VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
+      INSERT INTO note_embeddings (noteId, userId, workspaceId, model, dim, chunkIndex, chunkText, vectorJson, createdAt)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
     `);
     for (let i = 0; i < valid.length; i++) {
       const info = ins.run(
         note.id,
         note.userId,
+        note.workspaceId, // null = 个人空间
         cfg.model,
         dim,
         valid[i].idx,
@@ -354,44 +366,120 @@ export function stopEmbeddingWorker(): void {
 }
 
 /**
- * 把所有"未被回收"的笔记重新入队。
+ * 把"未被回收"的笔记重新入队。
  * 用途：
  *   - 用户切换 embedding 模型后，老向量需要全部重算
  *   - 用户手动点"重建索引"
- * 同时会清空 note_embeddings（因为模型变了，老向量无意义）。
+ *
+ * scope 控制：
+ *   - 不传 userId / workspaceId 即"全库重建"（仅运维场景使用，不应暴露给前端）
+ *   - 传 userId（不传 workspaceId）：把该用户名下"个人空间 + 所有他作为成员
+ *     的工作区里他自己写的笔记"全部重建。这是个人空间页面"重建索引"的语义。
+ *   - 传 workspaceId（不传 userId）：把该工作区里**所有成员的**笔记全部重建。
+ *     这是工作区视图"重建索引"的语义——工作区的成员应共享一份完整索引。
+ *   - userId + workspaceId 同传：仅当前用户在该工作区里的笔记。一般不用。
+ *
+ * clearExisting：
+ *   true 时**只清 scope 内**的 note_embeddings 行，不会动其它 scope 的索引；
+ *   false 时不清理（仅追加入队，可能与已有 done 状态共存——靠 ON CONFLICT 覆盖）。
+ *
+ * vec 表：vec_note_chunks 是按 rowid 关联 note_embeddings 的副本；scope 局部清理
+ *   时，对应 rowid 通过 deleteVectorsByRowids 同步从 vec 表删除——避免出现
+ *   "note_embeddings 已经空了但 vec 表还有旧 rowid"的悬挂索引。
  */
-export function rebuildAllEmbeddings(opts: { clearExisting?: boolean } = {}): {
+export function rebuildAllEmbeddings(opts: {
+  clearExisting?: boolean;
+  userId?: string;
+  workspaceId?: string | null;
+} = {}): {
   enqueued: number;
 } {
   const db = getDb();
-  const tx = db.transaction(() => {
-    if (opts.clearExisting) {
-      db.prepare("DELETE FROM note_embeddings").run();
+  const { clearExisting, userId, workspaceId } = opts;
+  // workspaceId 归一：undefined = 不限制；'' / null 视为"个人空间"
+  const wsRaw = workspaceId === undefined ? undefined
+    : (workspaceId === null || workspaceId === "" ? null : workspaceId);
+
+  // 把 scope 拼成 WHERE 子句 + 参数（同时用于 note_embeddings 删除 与 notes 入队）
+  // 设计：notes 表与 note_embeddings 表的 scope 列同名（userId / workspaceId），
+  //      因此可以共享同一段 WHERE。
+  const conds: string[] = [];
+  const params: any[] = [];
+  if (userId !== undefined) {
+    conds.push(`userId = ?`);
+    params.push(userId);
+  }
+  if (wsRaw !== undefined) {
+    if (wsRaw === null) {
+      conds.push(`workspaceId IS NULL`);
+    } else {
+      conds.push(`workspaceId = ?`);
+      params.push(wsRaw);
     }
+  }
+
+  // 待清理的 vec rowid（事务内收集，事务外清；vec0 抛错不能让主表事务回滚）
+  let oldRowids: number[] = [];
+
+  const tx = db.transaction(() => {
+    if (clearExisting) {
+      // 1) 找出 scope 内现有的 rowid，事务后从 vec 表删干净
+      const rowidWhere = conds.length > 0 ? `WHERE ${conds.join(" AND ")}` : "";
+      const oldIds = db
+        .prepare(`SELECT id FROM note_embeddings ${rowidWhere}`)
+        .all(...params) as { id: number }[];
+      // 2) DELETE note_embeddings
+      db.prepare(`DELETE FROM note_embeddings ${rowidWhere}`).run(...params);
+      // 3) 收集到闭包，事务外清 vec 表
+      oldRowids = oldIds.map((r) => r.id);
+    }
+
+    // 入队：用 notes 表的 scope 选择需要重建的笔记
+    const notesWhere = ["isTrashed = 0", ...conds].join(" AND ");
     db.prepare(
-      `INSERT INTO embedding_queue (noteId, userId, status, retries, enqueuedAt, updatedAt)
-       SELECT id, userId, 'pending', 0, datetime('now'), datetime('now')
-       FROM notes WHERE isTrashed = 0
+      `INSERT INTO embedding_queue (noteId, userId, workspaceId, status, retries, enqueuedAt, updatedAt)
+       SELECT id, userId, workspaceId, 'pending', 0, datetime('now'), datetime('now')
+       FROM notes WHERE ${notesWhere}
        ON CONFLICT(noteId) DO UPDATE SET
+         workspaceId = excluded.workspaceId,
          status = 'pending',
          retries = 0,
          lastError = NULL,
          updatedAt = datetime('now')`,
-    ).run();
+    ).run(...params);
   });
   tx();
+
   // 同步清 vec 表（事务外做：vec0 是虚表，与主表事务回滚保护无关）
-  if (opts.clearExisting) {
-    try { clearAllVectors(); } catch { /* vec 不可用时忽略 */ }
+  if (clearExisting) {
+    if (oldRowids.length > 0) {
+      try { deleteVectorsByRowids(oldRowids); } catch { /* vec 不可用时忽略 */ }
+    } else if (userId === undefined && wsRaw === undefined) {
+      // 全库 + clearExisting 的兜底：直接清空 vec 表（保留与历史行为一致）
+      try { clearAllVectors(); } catch { /* 忽略 */ }
+    }
   }
+
+  // 返回 scope 内当前 pending 数（不是全局，避免 UI 上"清了别的 scope 但显示 0"）
+  const countWhere = ["status = 'pending'", ...conds].join(" AND ");
   const enqueued = (db
-    .prepare("SELECT COUNT(*) as c FROM embedding_queue WHERE status = 'pending'")
-    .get() as { c: number }).c;
+    .prepare(`SELECT COUNT(*) as c FROM embedding_queue WHERE ${countWhere}`)
+    .get(...params) as { c: number }).c;
   return { enqueued };
 }
 
-/** 给前端展示用的统计信息 */
-export function getEmbeddingStats(userId?: string): {
+/**
+ * 给前端展示用的统计信息。
+ *
+ * scope 语义同 rebuildAllEmbeddings：
+ *   - userId + workspaceId === null   →  个人空间（仅该用户的 NULL 工作区笔记）
+ *   - workspaceId === string (uuid)   →  指定工作区（不限作者，全工作区成员共享）
+ *   - 都不传                            →  全库（运维 / 管理员视角）
+ */
+export function getEmbeddingStats(opts?: {
+  userId?: string;
+  workspaceId?: string | null;
+}): {
   totalNotes: number;
   indexedNotes: number;
   pending: number;
@@ -405,27 +493,34 @@ export function getEmbeddingStats(userId?: string): {
   const db = getDb();
   const cfg = readEmbeddingConfig(db);
 
-  const userFilter = userId ? "WHERE userId = ? AND isTrashed = 0" : "WHERE isTrashed = 0";
-  const userParams = userId ? [userId] : [];
+  const conds: string[] = [];
+  const params: any[] = [];
+  if (opts?.userId !== undefined) {
+    conds.push(`userId = ?`);
+    params.push(opts.userId);
+  }
+  if (opts?.workspaceId !== undefined) {
+    if (opts.workspaceId === null || opts.workspaceId === "") {
+      conds.push(`workspaceId IS NULL`);
+    } else {
+      conds.push(`workspaceId = ?`);
+      params.push(opts.workspaceId);
+    }
+  }
+  const whereTail = conds.length > 0 ? ` AND ${conds.join(" AND ")}` : "";
+  const whereOnly = conds.length > 0 ? ` WHERE ${conds.join(" AND ")}` : "";
 
   const totalNotes = (db
-    .prepare(`SELECT COUNT(*) as c FROM notes ${userFilter}`)
-    .get(...userParams) as { c: number }).c;
+    .prepare(`SELECT COUNT(*) as c FROM notes WHERE isTrashed = 0${whereTail}`)
+    .get(...params) as { c: number }).c;
 
-  const indexedSql = userId
-    ? "SELECT COUNT(DISTINCT noteId) as c FROM note_embeddings WHERE userId = ?"
-    : "SELECT COUNT(DISTINCT noteId) as c FROM note_embeddings";
   const indexedNotes = (db
-    .prepare(indexedSql)
-    .get(...userParams) as { c: number }).c;
+    .prepare(`SELECT COUNT(DISTINCT noteId) as c FROM note_embeddings${whereOnly}`)
+    .get(...params) as { c: number }).c;
 
-  const queueSql = userId
-    ? "SELECT status, COUNT(*) as c FROM embedding_queue WHERE userId = ? GROUP BY status"
-    : "SELECT status, COUNT(*) as c FROM embedding_queue GROUP BY status";
-  const queueRows = db.prepare(queueSql).all(...userParams) as {
-    status: string;
-    c: number;
-  }[];
+  const queueRows = db
+    .prepare(`SELECT status, COUNT(*) as c FROM embedding_queue${whereOnly} GROUP BY status`)
+    .all(...params) as { status: string; c: number }[];
   const counts: Record<string, number> = {};
   for (const r of queueRows) counts[r.status] = r.c;
 

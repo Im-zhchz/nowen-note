@@ -411,6 +411,144 @@ export const MIGRATIONS: Migration[] = [
       );
     },
   },
+
+  // ==========================================================================
+  // v7：AI 向量索引按"工作区/个人空间"维度隔离
+  // --------------------------------------------------------------------------
+  // 背景（安全 + 功能双重缺陷）：
+  //   v6 之前 `note_embeddings` / `embedding_queue` 仅有 `userId` 列，没有
+  //   `workspaceId`。`vec-store.knnSearch` 的反查也只按 `m.userId === userId`
+  //   过滤。这意味着：
+  //     - 跨空间污染：用户 A 在「个人空间」问问题时，命中结果会包含 A 自己在
+  //       工作区里写的笔记（只要 owner 是 A）；A 在工作区视图问问题时反过来
+  //       也会召回到个人空间笔记。空间边界完全没生效。
+  //     - 工作区 RAG 实际不工作：A 在工作区 W 视图下提问，B 在 W 写的笔记
+  //       `note_embeddings.userId = B ≠ A`，永远召不回，工作区共享知识库形同虚设。
+  //
+  // 方案：
+  //   把 `workspaceId TEXT NULL` 加到 `note_embeddings` 和 `embedding_queue`
+  //   两张表，并改造触发器把 `notes.workspaceId` 同步到队列；同时**一次性
+  //   backfill** 把存量 embedding/队列项按 `notes.workspaceId` 回填——保证
+  //   零数据丢失，已经算好的向量不需要重新调 embedding API。
+  //
+  //   语义：workspaceId IS NULL 表示"个人空间"，与 notes/notebooks/attachments
+  //   的全栈一致约定。检索时按 (userId, workspaceId) 二元组定位 scope：
+  //     - 个人空间：仅召回 workspaceId IS NULL 且 userId = 当前用户的向量
+  //     - 工作区：仅召回 workspaceId = <ws_id> 的向量（不再以"作者"过滤，
+  //       让同一个工作区的成员能互相搜索到彼此的笔记，符合协作语义）
+  //
+  // 触发器升级：
+  //   旧的 notes_embed_ai / notes_embed_au 只塞 `new.userId`；改成同时塞
+  //   `new.workspaceId`，这样新写入的笔记/编辑后入队都会带上正确空间归属。
+  //
+  // 幂等性：
+  //   - addColumnIfMissing 在列已存在时跳过；
+  //   - 触发器 DROP + CREATE，多次执行结果一致；
+  //   - backfill 用 `WHERE workspaceId IS NULL AND EXISTS(...)`，命中过的不会
+  //     重复改写；老库存量 NULL → 个人空间笔记保持 NULL（语义正确，无副作用）。
+  //
+  // 回滚：回到 v6 时新加的列依然存在但 v6 代码不读，行为退化为"仅按 userId
+  //   过滤"——比 v7 弱但和 v6 行为一致，不会破坏数据。
+  {
+    version: 7,
+    name: "embeddings-add-workspace-id-and-backfill",
+    up: (db) => {
+      const addColumnIfMissing = (
+        table: string,
+        column: string,
+        definition: string,
+      ) => {
+        const cols = db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
+        if (cols.length === 0) return;
+        if (cols.some((c) => c.name === column)) return;
+        db.prepare(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`).run();
+      };
+
+      // ---- 1. 向 note_embeddings / embedding_queue 加 workspaceId 列 ----
+      addColumnIfMissing("note_embeddings", "workspaceId", "TEXT");
+      addColumnIfMissing("embedding_queue", "workspaceId", "TEXT");
+
+      // ---- 2. 索引：按 (userId, workspaceId) 复合查找最常见 ----
+      db.exec(
+        "CREATE INDEX IF NOT EXISTS idx_note_embeddings_user_ws ON note_embeddings(userId, workspaceId);",
+      );
+      db.exec(
+        "CREATE INDEX IF NOT EXISTS idx_note_embeddings_ws ON note_embeddings(workspaceId);",
+      );
+      db.exec(
+        "CREATE INDEX IF NOT EXISTS idx_embedding_queue_user_ws ON embedding_queue(userId, workspaceId);",
+      );
+
+      // ---- 3. 重建触发器：同步 workspaceId ----
+      // schema.ts 里的 CREATE TRIGGER 在每次启动 db 时都会被 DROP + CREATE，
+      // 因此源头会保证新部署用新触发器。但已经在运行的库内可能有"旧 user-only
+      // 触发器"残留——这里再 DROP 一次，让运行中的库立刻切到新版本。
+      // schema.ts 里也会同步把这两个触发器替换成新版（见同 PR 改动）。
+      db.exec(`
+        DROP TRIGGER IF EXISTS notes_embed_ai;
+        CREATE TRIGGER notes_embed_ai AFTER INSERT ON notes
+        WHEN new.isTrashed = 0
+        BEGIN
+          INSERT INTO embedding_queue (noteId, userId, workspaceId, status, retries, enqueuedAt, updatedAt)
+          VALUES (new.id, new.userId, new.workspaceId, 'pending', 0, datetime('now'), datetime('now'))
+          ON CONFLICT(noteId) DO UPDATE SET
+            workspaceId = excluded.workspaceId,
+            status = 'pending',
+            retries = 0,
+            lastError = NULL,
+            updatedAt = datetime('now');
+        END;
+
+        DROP TRIGGER IF EXISTS notes_embed_au;
+        CREATE TRIGGER notes_embed_au AFTER UPDATE ON notes
+        WHEN (old.title IS NOT new.title OR old.contentText IS NOT new.contentText
+              OR old.workspaceId IS NOT new.workspaceId)
+             AND new.isTrashed = 0
+        BEGIN
+          INSERT INTO embedding_queue (noteId, userId, workspaceId, status, retries, enqueuedAt, updatedAt)
+          VALUES (new.id, new.userId, new.workspaceId, 'pending', 0, datetime('now'), datetime('now'))
+          ON CONFLICT(noteId) DO UPDATE SET
+            workspaceId = excluded.workspaceId,
+            status = 'pending',
+            retries = 0,
+            lastError = NULL,
+            updatedAt = datetime('now');
+        END;
+      `);
+
+      // ---- 4. backfill：把存量 embedding 和队列项按 notes.workspaceId 回填 ----
+      // 个人空间笔记 notes.workspaceId IS NULL → 这里维持 NULL（即默认值）
+      // 工作区笔记 → 把 notes.workspaceId 复制到 embedding 行
+      // 用 EXISTS 子查询确保只更新"对应的 note 当前是工作区笔记"的 embedding；
+      // 已被 trash 的笔记 (isTrashed=1) 也允许回填——后续 trash→delete 时 CASCADE
+      // 自然清理，无需特殊处理。
+      db.prepare(`
+        UPDATE note_embeddings
+           SET workspaceId = (
+             SELECT n.workspaceId FROM notes n WHERE n.id = note_embeddings.noteId
+           )
+         WHERE workspaceId IS NULL
+           AND EXISTS (
+             SELECT 1 FROM notes n
+              WHERE n.id = note_embeddings.noteId
+                AND n.workspaceId IS NOT NULL
+           )
+      `).run();
+
+      db.prepare(`
+        UPDATE embedding_queue
+           SET workspaceId = (
+             SELECT n.workspaceId FROM notes n WHERE n.id = embedding_queue.noteId
+           )
+         WHERE workspaceId IS NULL
+           AND EXISTS (
+             SELECT 1 FROM notes n
+              WHERE n.id = embedding_queue.noteId
+                AND n.workspaceId IS NOT NULL
+           )
+      `).run();
+    },
+  },
 ];
 
 /** 当前代码已知的最高 schema 版本（== MIGRATIONS 里 max(version)）。 */

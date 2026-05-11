@@ -48,8 +48,17 @@ export default function AIChatPanel({ onClose, onNavigateToNote }: {
   const inputRef = useRef<HTMLTextAreaElement>(null);
 
   // 加载知识库统计
+  // v7：切换工作区会换一份索引 scope，必须重拉；不重拉的话 UI 还显示
+  // 切换前的"个人空间笔记数 / 已索引"，给人"工作区里没东西"的错觉。
   useEffect(() => {
-    api.getKnowledgeStats().then(setStats).catch(() => {});
+    const reload = () => {
+      api.getKnowledgeStats().then(setStats).catch(() => {});
+    };
+    reload();
+    window.addEventListener("nowen:workspace-changed", reload);
+    return () => {
+      window.removeEventListener("nowen:workspace-changed", reload);
+    };
   }, []);
 
   // 打开面板时从后端拉取上次的聊天记录。

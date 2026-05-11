@@ -740,6 +740,7 @@ function initSchema(db: Database.Database) {
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       noteId TEXT NOT NULL,
       userId TEXT NOT NULL,
+      workspaceId TEXT,
       model TEXT NOT NULL,
       dim INTEGER NOT NULL,
       chunkIndex INTEGER NOT NULL DEFAULT 0,
@@ -752,11 +753,14 @@ function initSchema(db: Database.Database) {
 
     CREATE INDEX IF NOT EXISTS idx_note_embeddings_note ON note_embeddings(noteId);
     CREATE INDEX IF NOT EXISTS idx_note_embeddings_user ON note_embeddings(userId);
+    CREATE INDEX IF NOT EXISTS idx_note_embeddings_user_ws ON note_embeddings(userId, workspaceId);
+    CREATE INDEX IF NOT EXISTS idx_note_embeddings_ws ON note_embeddings(workspaceId);
     CREATE INDEX IF NOT EXISTS idx_note_embeddings_model ON note_embeddings(model);
 
     CREATE TABLE IF NOT EXISTS embedding_queue (
       noteId TEXT PRIMARY KEY,
       userId TEXT NOT NULL,
+      workspaceId TEXT,
       status TEXT NOT NULL DEFAULT 'pending',
       retries INTEGER NOT NULL DEFAULT 0,
       lastError TEXT,
@@ -766,31 +770,38 @@ function initSchema(db: Database.Database) {
     );
 
     CREATE INDEX IF NOT EXISTS idx_embedding_queue_status ON embedding_queue(status, enqueuedAt);
+    CREATE INDEX IF NOT EXISTS idx_embedding_queue_user_ws ON embedding_queue(userId, workspaceId);
 
     -- INSERT 触发：新笔记入队（contentText 可能为空，由 worker 决定是否真的算 embedding）
+    -- workspaceId 同步从 notes.workspaceId 取（NULL = 个人空间）
     DROP TRIGGER IF EXISTS notes_embed_ai;
     CREATE TRIGGER notes_embed_ai AFTER INSERT ON notes
     WHEN new.isTrashed = 0
     BEGIN
-      INSERT INTO embedding_queue (noteId, userId, status, retries, enqueuedAt, updatedAt)
-      VALUES (new.id, new.userId, 'pending', 0, datetime('now'), datetime('now'))
+      INSERT INTO embedding_queue (noteId, userId, workspaceId, status, retries, enqueuedAt, updatedAt)
+      VALUES (new.id, new.userId, new.workspaceId, 'pending', 0, datetime('now'), datetime('now'))
       ON CONFLICT(noteId) DO UPDATE SET
+        workspaceId = excluded.workspaceId,
         status = 'pending',
         retries = 0,
         lastError = NULL,
         updatedAt = datetime('now');
     END;
 
-    -- UPDATE 触发：仅当 title/contentText 真正变化时才重新入队
+    -- UPDATE 触发：title / contentText / workspaceId 任一变化都重新入队
+    -- （workspaceId 变化 = 笔记跨空间移动；旧的 embedding 仍指向旧 workspaceId，
+    --  worker 处理本笔记时会 DELETE+INSERT，新行带新 workspaceId，自动一致。）
     -- isTrashed: 0→1 进回收站时不重排（也可以选择删除，简单起见交给 worker 跳过）
     DROP TRIGGER IF EXISTS notes_embed_au;
     CREATE TRIGGER notes_embed_au AFTER UPDATE ON notes
-    WHEN (old.title IS NOT new.title OR old.contentText IS NOT new.contentText)
+    WHEN (old.title IS NOT new.title OR old.contentText IS NOT new.contentText
+          OR old.workspaceId IS NOT new.workspaceId)
          AND new.isTrashed = 0
     BEGIN
-      INSERT INTO embedding_queue (noteId, userId, status, retries, enqueuedAt, updatedAt)
-      VALUES (new.id, new.userId, 'pending', 0, datetime('now'), datetime('now'))
+      INSERT INTO embedding_queue (noteId, userId, workspaceId, status, retries, enqueuedAt, updatedAt)
+      VALUES (new.id, new.userId, new.workspaceId, 'pending', 0, datetime('now'), datetime('now'))
       ON CONFLICT(noteId) DO UPDATE SET
+        workspaceId = excluded.workspaceId,
         status = 'pending',
         retries = 0,
         lastError = NULL,
@@ -805,8 +816,8 @@ function initSchema(db: Database.Database) {
     const queued = db.prepare("SELECT COUNT(*) as c FROM embedding_queue").get() as { c: number };
     if (queued.c === 0) {
       db.prepare(`
-        INSERT INTO embedding_queue (noteId, userId, status, retries, enqueuedAt, updatedAt)
-        SELECT n.id, n.userId, 'pending', 0, datetime('now'), datetime('now')
+        INSERT INTO embedding_queue (noteId, userId, workspaceId, status, retries, enqueuedAt, updatedAt)
+        SELECT n.id, n.userId, n.workspaceId, 'pending', 0, datetime('now'), datetime('now')
         FROM notes n
         WHERE n.isTrashed = 0
           AND NOT EXISTS (SELECT 1 FROM note_embeddings e WHERE e.noteId = n.id)

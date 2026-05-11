@@ -1597,7 +1597,12 @@ export const api = {
     onReferences?: (refs: { id: string; title: string }[]) => void
   ): Promise<string> => {
     const token = getToken();
-    const res = await fetch(`${getBaseUrl()}/ai/ask`, {
+    // v7 RAG 隔离：把当前 scope 透传给后端
+    //   personal → 不带 ?workspaceId（后端按 workspaceId IS NULL 走个人空间）
+    //   <uuid>   → 带 ?workspaceId=<uuid>（后端校验成员身份后按工作区检索）
+    const ws = getCurrentWorkspace();
+    const qs = ws && ws !== "personal" ? `?workspaceId=${encodeURIComponent(ws)}` : "";
+    const res = await fetch(`${getBaseUrl()}/ai/ask${qs}`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -1669,7 +1674,10 @@ export const api = {
     indexed: boolean;
   }> => {
     const token = getToken();
-    const res = await fetch(`${getBaseUrl()}/ai/knowledge-stats`, {
+    // v7：按当前 scope 拉统计；个人空间不带 workspaceId
+    const ws = getCurrentWorkspace();
+    const qs = ws && ws !== "personal" ? `?workspaceId=${encodeURIComponent(ws)}` : "";
+    const res = await fetch(`${getBaseUrl()}/ai/knowledge-stats${qs}`, {
       headers: {
         ...(token ? { Authorization: `Bearer ${token}` } : {}),
       },
