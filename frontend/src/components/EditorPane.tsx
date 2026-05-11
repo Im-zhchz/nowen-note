@@ -926,6 +926,43 @@ export default function EditorPane() {
     }
   }, [activeNote, actions]);
 
+  // ---- P3：AI 自动归类建议 ----
+  // 点击"AI 建议归类"后发一次 /ai/classify，把 top-3 建议渲染在下拉面板内。
+  // 建议加载期间按钮 disabled；失败时用 toast 提示，不阻塞用户手选。
+  // 每次 activeNote 变化清空建议，避免看到上一条笔记的旧结果。
+  const [aiSuggestions, setAiSuggestions] = useState<{
+    notebookId: string;
+    notebookName: string;
+    path: string;
+    confidence: number;
+    reason: string;
+  }[] | null>(null);
+  const [aiClassifyLoading, setAiClassifyLoading] = useState(false);
+
+  useEffect(() => {
+    setAiSuggestions(null);
+  }, [activeNote?.id]);
+
+  const handleAiClassify = useCallback(async () => {
+    if (!activeNote || aiClassifyLoading) return;
+    setAiClassifyLoading(true);
+    try {
+      const res = await api.aiClassify({ noteId: activeNote.id });
+      // 过滤掉"就是当前笔记本"的建议——没有意义
+      const filtered = res.suggestions.filter(
+        (s) => s.notebookId !== activeNote.notebookId,
+      );
+      setAiSuggestions(filtered);
+      if (filtered.length === 0) {
+        toast.info(t("editor.aiClassifyNoSuggestion") || "AI 未给出更合适的归类建议");
+      }
+    } catch (e: any) {
+      toast.error(e?.message || t("editor.aiClassifyFailed") || "AI 归类请求失败");
+    } finally {
+      setAiClassifyLoading(false);
+    }
+  }, [activeNote, aiClassifyLoading, t]);
+
   // 构建与左侧侧边栏完全一致的笔记本树
   //
   // 但"移动到笔记本"的候选必须严格限制在**当前笔记所在的 workspace**：
@@ -1315,13 +1352,65 @@ export default function EditorPane() {
               <div className="fixed inset-0 z-40" onClick={() => setShowMoveDropdown(false)} />
               <div
                 ref={moveDropdownRef}
-                className="absolute top-full left-0 mt-1 w-64 bg-app-elevated border border-app-border rounded-lg shadow-xl z-50 py-1 max-h-80 overflow-auto"
+                className="absolute top-full left-0 mt-1 w-72 bg-app-elevated border border-app-border rounded-lg shadow-xl z-50 py-1 max-h-96 overflow-auto"
                 style={{ animation: "contextMenuIn 0.12s ease-out" }}
               >
-                <div className="px-3 py-1.5 text-[10px] font-medium text-tx-tertiary border-b border-app-border mb-1">
+                {/* ── P3：AI 建议归类 ──
+                    放在顶部显眼位置；点击后加载中 → 展示建议 → 点击即移动。
+                    建议不覆盖"全部笔记本"手选列表，用户两种动线共存。 */}
+                <div className="px-2 pt-1 pb-0.5">
+                  <button
+                    onClick={handleAiClassify}
+                    disabled={aiClassifyLoading}
+                    className="w-full flex items-center gap-2 px-2 py-1.5 text-xs rounded-md text-violet-600 dark:text-violet-400 hover:bg-violet-50 dark:hover:bg-violet-500/10 disabled:opacity-50 disabled:cursor-wait transition-colors"
+                    title={t('editor.aiClassifyTip') || "基于笔记内容推荐目标笔记本"}
+                  >
+                    {aiClassifyLoading ? (
+                      <Loader2 size={12} className="animate-spin" />
+                    ) : (
+                      <span className="text-[13px]">✨</span>
+                    )}
+                    <span className="flex-1 text-left">
+                      {aiClassifyLoading
+                        ? (t('editor.aiClassifyLoading') || "AI 正在分析…")
+                        : (t('editor.aiClassifyAction') || "AI 建议归类")}
+                    </span>
+                  </button>
+                  {aiSuggestions && aiSuggestions.length > 0 && (
+                    <div className="mt-1 pl-1 border-l-2 border-violet-200 dark:border-violet-500/30 ml-1.5 flex flex-col gap-0.5">
+                      {aiSuggestions.map((s) => (
+                        <button
+                          key={s.notebookId}
+                          onClick={() => handleMoveToNotebook(s.notebookId)}
+                          className="group w-full flex items-start gap-2 px-2 py-1.5 text-xs rounded-md hover:bg-violet-50 dark:hover:bg-violet-500/10 transition-colors text-left"
+                          title={s.reason || s.path}
+                        >
+                          <FolderInput size={11} className="mt-0.5 shrink-0 text-violet-500" />
+                          <div className="flex-1 min-w-0">
+                            <div className="flex items-center gap-1.5">
+                              <span className="truncate text-tx-primary group-hover:text-violet-600 dark:group-hover:text-violet-400">
+                                {s.path}
+                              </span>
+                              <span className="shrink-0 text-[10px] text-violet-500/80 font-mono">
+                                {Math.round(s.confidence * 100)}%
+                              </span>
+                            </div>
+                            {s.reason && (
+                              <div className="text-[10px] text-tx-tertiary truncate mt-0.5">
+                                {s.reason}
+                              </div>
+                            )}
+                          </div>
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                <div className="px-3 py-1.5 mt-1 text-[10px] font-medium text-tx-tertiary border-t border-b border-app-border">
                   {t('editor.moveToLabel')}
                 </div>
-                <div className="px-1 pb-1">
+                <div className="px-1 pb-1 pt-1">
                   {notebookTree.map((nb) => (
                     <MoveTreeItem
                       key={nb.id}

@@ -1810,6 +1810,34 @@ export const api = {
       }),
   },
 
+  // ========== AI 自动归类（P3）==========
+  // 让 AI 根据笔记内容推荐目标笔记本；返回最多 3 条建议按 confidence 降序。
+  // 前端拿到建议后可直接用 api.updateNote 移动，或让用户确认后再移动。
+  // workspaceId 自动从当前 scope 注入（个人空间不带，沿用其他 AI 端点约定）。
+  aiClassify: (params: { noteId?: string; title?: string; content?: string }) => {
+    const ws = getCurrentWorkspace();
+    const qs = ws && ws !== "personal" ? `?workspaceId=${encodeURIComponent(ws)}` : "";
+    return request<{
+      suggestions: {
+        notebookId: string;
+        notebookName: string;
+        path: string;
+        confidence: number;
+        reason: string;
+      }[];
+      currentNotebookId?: string | null;
+    }>(`/ai/classify${qs}`, {
+      method: "POST",
+      body: JSON.stringify({
+        noteId: params.noteId,
+        title: params.title,
+        content: params.content,
+      }),
+    });
+  },
+
+
+
   // ③ 文档智能解析
   parseDocument: async (
     file: File,

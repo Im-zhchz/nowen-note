@@ -1580,4 +1580,275 @@ ai.post("/prompts/:id/touch", (c) => {
   return c.json({ ok: true });
 });
 
+// ============================================================
+// AI 自动目录归类（P3）
+// ------------------------------------------------------------
+// 让 AI 根据笔记标题 + 内容片段，从 scope 内的候选笔记本里推荐最匹配的
+// 2-3 个归类目标。前端负责确认与执行移动（复用 updateNote({notebookId})）。
+//
+// 设计要点：
+//   - scope：沿用 resolveScope(c) — 个人空间时 workspaceId=null，工作区时
+//     强制成员校验；避免跨 scope 泄漏笔记本结构。
+//   - 候选集：同 scope 下所有 notebooks，按 parentId 构建完整 path（"父/子/孙"）
+//     塞进 prompt；笔记本数量超过 100 时只取 sortOrder 排序前 100 — 既保证
+//     LLM 上下文不爆，也覆盖常用笔记本。
+//   - LLM 输出：要求严格 JSON
+//       { "suggestions": [{ "notebookId": "...", "reason": "...", "confidence": 0.8 }, ...] }
+//     后端解析时加"JSON 提取"兜底（去掉 ``` 围栏、找 {…} 子串），LLM 偶尔
+//     不守规也不全挂；解析失败直接 502 返回原文。
+//   - confidence 容错：LLM 可能返回 0-1 小数或 0-100 整数；统一归一到 [0,1]。
+//   - 只读：本端点不修改笔记；前端点"移动到此"才走 /notes/:id PUT。
+// ============================================================
+
+interface NotebookRow {
+  id: string;
+  parentId: string | null;
+  name: string;
+  description: string | null;
+  sortOrder: number;
+}
+
+/** 把扁平 notebooks 列表构建成 "父/子/孙" 形态的路径文本，便于喂给 LLM */
+function buildNotebookPaths(rows: NotebookRow[]): Map<string, string> {
+  const byId = new Map(rows.map((r) => [r.id, r]));
+  const cache = new Map<string, string>();
+  const build = (id: string, visited = new Set<string>()): string => {
+    if (cache.has(id)) return cache.get(id)!;
+    if (visited.has(id)) return byId.get(id)?.name || id; // 防环（正常数据不该发生）
+    visited.add(id);
+    const node = byId.get(id);
+    if (!node) return id;
+    const path = node.parentId
+      ? `${build(node.parentId, visited)} / ${node.name}`
+      : node.name;
+    cache.set(id, path);
+    return path;
+  };
+  for (const r of rows) build(r.id);
+  return cache;
+}
+
+/** 提取 JSON：先按 markdown code fence 剥，再贪心找 {...} */
+function extractJsonObject(raw: string): any | null {
+  if (!raw) return null;
+  let t = raw.trim();
+  // ```json ... ``` 或 ``` ... ```
+  const fence = t.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+  if (fence) t = fence[1].trim();
+  try {
+    return JSON.parse(t);
+  } catch { /* fallthrough */ }
+  // 贪心取第一个 { 到最后一个 }
+  const first = t.indexOf("{");
+  const last = t.lastIndexOf("}");
+  if (first >= 0 && last > first) {
+    try {
+      return JSON.parse(t.slice(first, last + 1));
+    } catch { /* ignore */ }
+  }
+  return null;
+}
+
+// POST /api/ai/classify
+// 请求体：{ noteId?: string; title?: string; content?: string; workspaceId?: string }
+//   - 传 noteId → 后端读当前笔记的 title/contentText，安全起见校验归属
+//   - 传 title + content → 用于"新笔记建议归类"场景（无 noteId 时走此路径）
+// 响应：
+//   { suggestions: [{ notebookId, notebookName, path, confidence, reason }] }
+ai.post("/classify", async (c) => {
+  const scope = resolveScope(c);
+  if ("error" in scope) return scope.error;
+  const { userId, workspaceId } = scope;
+
+  const settings = getAISettings();
+  if (!settings.ai_api_url) {
+    return c.json({ error: "未配置 AI 服务" }, 400);
+  }
+  if (!NO_KEY_PROVIDERS.includes(settings.ai_provider) && !settings.ai_api_key) {
+    return c.json({ error: "未配置 API Key" }, 400);
+  }
+
+  const body = await c.req.json().catch(() => ({})) as {
+    noteId?: string;
+    title?: string;
+    content?: string;
+  };
+  const db = getDb();
+
+  // ---- 1. 取当前笔记内容 ----
+  let noteTitle = "";
+  let noteText = "";
+  let currentNotebookId: string | null = null;
+
+  if (body.noteId) {
+    const row = db.prepare(
+      `SELECT id, userId, notebookId, title, contentText
+         FROM notes
+        WHERE id = ?`,
+    ).get(body.noteId) as { id: string; userId: string; notebookId: string; title: string; contentText: string } | undefined;
+    if (!row) return c.json({ error: "笔记不存在" }, 404);
+    if (row.userId !== userId) return c.json({ error: "无权访问该笔记" }, 403);
+    noteTitle = row.title || "";
+    noteText = row.contentText || "";
+    currentNotebookId = row.notebookId;
+  } else {
+    noteTitle = (body.title || "").trim();
+    noteText = (body.content || "").trim();
+    if (!noteTitle && !noteText) {
+      return c.json({ error: "请提供 noteId 或 title/content" }, 400);
+    }
+  }
+
+  // ---- 2. 取候选 notebooks（同 scope 内）----
+  // workspaceId = null 代表个人空间；DB 层 notebooks 没有 workspaceId 列，
+  // 目前按 userId 隔离即是个人空间；工作区笔记本走 workspaces 体系（与笔记
+  // 的 notebookId 约束一致），这里用 notes 反推每个 notebook 所属 workspaceId：
+  //   - 个人 scope：notebook 下所有 note.workspaceId IS NULL 视作个人 notebook；
+  //     或者该 notebook 完全为空（从未被用过）时也归入个人候选；
+  //   - 工作区 scope：至少有一条 note 挂在该工作区 → 候选。
+  // 这样无需改 schema 就能复用现有隔离规则。若后续要把"空 notebook 归属"
+  // 精确化，可在 notebooks 表加 workspaceId 列。
+  let notebookRows: NotebookRow[];
+  if (workspaceId === null) {
+    notebookRows = db.prepare(`
+      SELECT nb.id, nb.parentId, nb.name, nb.description, nb.sortOrder
+        FROM notebooks nb
+       WHERE nb.userId = ?
+         AND NOT EXISTS (
+           SELECT 1 FROM notes n
+            WHERE n.notebookId = nb.id AND n.workspaceId IS NOT NULL
+         )
+       ORDER BY nb.sortOrder ASC, nb.name ASC
+       LIMIT 100
+    `).all(userId) as NotebookRow[];
+  } else {
+    notebookRows = db.prepare(`
+      SELECT DISTINCT nb.id, nb.parentId, nb.name, nb.description, nb.sortOrder
+        FROM notebooks nb
+        JOIN notes n ON n.notebookId = nb.id
+       WHERE nb.userId = ?
+         AND n.workspaceId = ?
+       ORDER BY nb.sortOrder ASC, nb.name ASC
+       LIMIT 100
+    `).all(userId, workspaceId) as NotebookRow[];
+  }
+
+  if (notebookRows.length === 0) {
+    return c.json({ suggestions: [] });
+  }
+
+  const pathMap = buildNotebookPaths(notebookRows);
+
+  // ---- 3. 构造 prompt ----
+  // notebookLines 形如：
+  //   [id_xxx] 技术 / 数据库 — MySQL/PG 相关的研究与调优记录
+  // LLM 只需要返回我们给的 id；description 可选但有助于判断。
+  const notebookLines = notebookRows.map((r) => {
+    const p = pathMap.get(r.id) || r.name;
+    const desc = r.description ? ` — ${r.description.slice(0, 80)}` : "";
+    return `[${r.id}] ${p}${desc}`;
+  }).join("\n");
+
+  // 正文截断 2000 字符足够 LLM 判断主题；大文本喂太多反而稀释信号。
+  const noteSnippet = noteText.slice(0, 2000);
+
+  const systemPrompt =
+    "你是一个专业的笔记归类助手。用户会提供一条笔记的标题与摘要，以及可选的目标笔记本列表。\n" +
+    "请你从笔记本列表中挑选 1-3 个最合适的笔记本作为归类建议。\n" +
+    "必须严格按下面的 JSON 格式返回，不要任何其他解释文字：\n" +
+    `{"suggestions":[{"notebookId":"<id>","confidence":0.0-1.0,"reason":"20字以内的原因"}]}\n` +
+    "要求：\n" +
+    "1) notebookId 必须来自给定列表，不可编造；\n" +
+    "2) confidence 是你对该归类的把握程度，0 到 1 之间的小数；\n" +
+    "3) 按 confidence 从高到低排序；\n" +
+    "4) 如果没有任何合适的笔记本，返回 {\"suggestions\":[]}。";
+
+  const userMessage =
+    `候选笔记本列表：\n${notebookLines}\n\n` +
+    `笔记标题：${noteTitle || "（无标题）"}\n` +
+    (currentNotebookId
+      ? `当前所在笔记本ID：${currentNotebookId}（仅供参考，可选同类或其他更合适的）\n`
+      : "") +
+    `笔记摘要：\n${noteSnippet || "（无内容）"}`;
+
+  const baseUrl = settings.ai_api_url.replace(/\/+$/, "");
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (settings.ai_api_key) {
+    headers["Authorization"] = `Bearer ${settings.ai_api_key}`;
+  }
+
+  try {
+    const res = await fetch(`${baseUrl}/chat/completions`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: settings.ai_model,
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: userMessage },
+        ],
+        stream: false,
+        temperature: 0.1,
+        max_tokens: 600,
+      }),
+      signal: AbortSignal.timeout(30000),
+    });
+
+    if (!res.ok) {
+      const errText = await res.text().catch(() => "");
+      return c.json({ error: `AI 服务返回错误：${res.status} ${errText.slice(0, 200)}` }, 502);
+    }
+
+    const data = await res.json() as {
+      choices?: { message?: { content?: string } }[];
+    };
+    const raw = data.choices?.[0]?.message?.content || "";
+
+    const parsed = extractJsonObject(raw);
+    if (!parsed || !Array.isArray(parsed.suggestions)) {
+      return c.json({
+        error: "AI 返回格式无法解析",
+        raw: raw.slice(0, 500),
+      }, 502);
+    }
+
+    // ---- 4. 校验 + 归一 ----
+    // 只保留 notebookId 存在于候选集的项；confidence 可能是 0-1 / 0-100 / 字符串。
+    const idSet = new Set(notebookRows.map((r) => r.id));
+    const clean = (parsed.suggestions as any[])
+      .map((s) => {
+        const id = typeof s?.notebookId === "string" ? s.notebookId : "";
+        if (!idSet.has(id)) return null;
+        const nb = notebookRows.find((r) => r.id === id)!;
+        let conf = Number(s?.confidence ?? 0);
+        if (!Number.isFinite(conf)) conf = 0;
+        if (conf > 1 && conf <= 100) conf = conf / 100;
+        conf = Math.max(0, Math.min(1, conf));
+        const reason = typeof s?.reason === "string" ? s.reason.slice(0, 100) : "";
+        return {
+          notebookId: id,
+          notebookName: nb.name,
+          path: pathMap.get(id) || nb.name,
+          confidence: Number(conf.toFixed(3)),
+          reason,
+        };
+      })
+      .filter((x): x is NonNullable<typeof x> => x !== null)
+      // LLM 排序可能不可靠，后端再排一遍
+      .sort((a, b) => b.confidence - a.confidence)
+      .slice(0, 3);
+
+    return c.json({
+      suggestions: clean,
+      currentNotebookId,
+    });
+  } catch (e: any) {
+    const msg = e?.message || String(e);
+    if (msg.includes("timeout") || msg.includes("Timeout")) {
+      return c.json({ error: "AI 请求超时，请稍后重试" }, 504);
+    }
+    return c.json({ error: `AI 请求失败：${msg.slice(0, 200)}` }, 502);
+  }
+});
+
 export default ai;
