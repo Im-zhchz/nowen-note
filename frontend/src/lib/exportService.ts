@@ -602,13 +602,22 @@ export async function exportAllNotes(
      * - true：保留图片 base64 内嵌（单文件自包含，但 md 巨大、长行）。
      */
     inlineImages?: boolean;
+    /**
+     * 显式指定导出范围。
+     * - undefined → 走 api 默认（即当前激活工作区）
+     * - "personal" → 仅个人空间
+     * - <workspaceId> → 仅该工作区
+     * 用于 DataManager 把"个人空间 / 工作区"拆成独立 Tab：每个 Tab 都
+     * 应该按它自己的 scope 导出，不依赖侧边栏当前选中的 workspace。
+     */
+    workspaceId?: string;
   }
 ): Promise<boolean> {
   const inlineImages = !!options?.inlineImages;
   try {
     // 1. 获取所有笔记
     onProgress?.({ phase: "fetching", current: 0, total: 0, message: i18n.t('export.fetchingData') });
-    const notes = await api.getExportNotes() as ExportNote[];
+    const notes = await api.getExportNotes(options?.workspaceId) as ExportNote[];
 
     if (!notes || notes.length === 0) {
       onProgress?.({ phase: "error", current: 0, total: 0, message: i18n.t('export.noNotesToExport') });

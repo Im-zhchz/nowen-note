@@ -608,6 +608,24 @@ export default function Sidebar() {
   // Y4: 当前工作区的功能开关。null = 个人空间（不受限），对象 = 工作区 normalized 配置。
   //     由 workspace-changed / workspace-features-changed 两个事件驱动刷新。
   const [features, setFeatures] = useState<WorkspaceFeatures | null>(null);
+  // 是否系统管理员 + 当前用户的 per-user 导出开关（v6 下沉后从 /api/me 读）。
+  //   - 管理员：导出菜单项始终可见（保证数据救援能力）
+  //   - 普通用户：受 me.personalExportEnabled 控制；老后端未返回字段时按 true 兜底
+  // 与 DataManager/SettingsModal 保持同一取值方式，避免引入全局 CurrentUser hook。
+  const [isAdmin, setIsAdmin] = useState(false);
+  const [personalExportAllowed, setPersonalExportAllowed] = useState(true);
+  useEffect(() => {
+    let cancelled = false;
+    api.getMe()
+      .then((u) => {
+        if (cancelled) return;
+        setIsAdmin((u as any)?.role === "admin");
+        const exp = (u as any)?.personalExportEnabled;
+        setPersonalExportAllowed(exp === undefined ? true : !!exp);
+      })
+      .catch(() => { if (!cancelled) setIsAdmin(false); });
+    return () => { cancelled = true; };
+  }, []);
   // 标签区域折叠状态 - 从 localStorage 恢复
   const [tagsExpanded, setTagsExpanded] = useState(() => {
     try {
@@ -666,18 +684,33 @@ export default function Sidebar() {
     });
   }, []);
 
-  const notebookMenuItems: ContextMenuItem[] = [
-    { id: "new_note", label: t('sidebar.newNote'), icon: <FilePlus size={14} /> },
-    { id: "new_sub", label: t('sidebar.newSubNotebook'), icon: <FolderPlus size={14} /> },
-    { id: "sep1", label: "", separator: true },
-    { id: "change_icon", label: t('sidebar.changeIcon'), icon: <Smile size={14} /> },
-    { id: "rename", label: t('common.rename'), icon: <Edit2 size={14} /> },
-    { id: "move", label: t('sidebar.moveNotebook'), icon: <FolderInput size={14} /> },
-    { id: "sep_export", label: "", separator: true },
-    { id: "export_md", label: t('sidebar.exportNotebookAsMarkdown'), icon: <Download size={14} /> },
-    { id: "sep2", label: "", separator: true },
-    { id: "delete", label: t('sidebar.deleteNotebook'), icon: <Trash2 size={14} />, danger: true },
-  ];
+  // 笔记本右键菜单项。
+  //
+  // "导出为 Markdown" 的可见性：
+  //   - 工作区下：保持原行为（始终可见）。工作区导出权限由后端的工作区成员资格控制。
+  //   - 个人空间下：受 per-user 开关 personalExportAllowed（来自当前登录用户的
+  //     users.personalExportEnabled，v6 起从 /api/me 下发）控制；管理员
+  //     （isAdmin）始终可见，确保管理员保留数据救援能力。
+  const notebookMenuItems: ContextMenuItem[] = useMemo(() => {
+    const ws = getCurrentWorkspace();
+    const isPersonal = !ws || ws === "personal";
+    const showExport = !isPersonal || isAdmin || personalExportAllowed;
+    const items: ContextMenuItem[] = [
+      { id: "new_note", label: t('sidebar.newNote'), icon: <FilePlus size={14} /> },
+      { id: "new_sub", label: t('sidebar.newSubNotebook'), icon: <FolderPlus size={14} /> },
+      { id: "sep1", label: "", separator: true },
+      { id: "change_icon", label: t('sidebar.changeIcon'), icon: <Smile size={14} /> },
+      { id: "rename", label: t('common.rename'), icon: <Edit2 size={14} /> },
+      { id: "move", label: t('sidebar.moveNotebook'), icon: <FolderInput size={14} /> },
+    ];
+    if (showExport) {
+      items.push({ id: "sep_export", label: "", separator: true });
+      items.push({ id: "export_md", label: t('sidebar.exportNotebookAsMarkdown'), icon: <Download size={14} /> });
+    }
+    items.push({ id: "sep2", label: "", separator: true });
+    items.push({ id: "delete", label: t('sidebar.deleteNotebook'), icon: <Trash2 size={14} />, danger: true });
+    return items;
+  }, [t, isAdmin, personalExportAllowed]);
 
   // 右键菜单（桌面）/ 长按菜单（移动端共用同一份 state）
   const { menu, menuRef, openMenu, openMenuAt, closeMenu } = useContextMenu();

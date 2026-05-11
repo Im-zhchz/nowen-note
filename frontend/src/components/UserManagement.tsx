@@ -18,6 +18,15 @@ interface EditState {
   email: string;
   displayName: string;
   role: "admin" | "user";
+  // 个人空间导入/导出开关（schema v6 起为 per-user 字段）。
+  // 这两个字段非高危：PATCH 不需 sudo、不会 bump tokenVersion 踢人下线。
+  // 字段在 User 上是 optional（旧版本服务端可能不返回），打开编辑弹窗时按 true 兜底，
+  // 这样：
+  //   - 后端旧版返回 undefined → 表现为"开"（向后兼容默认放行）
+  //   - 后端新版返回 false → 表现为"关"
+  // 用户主动 toggle 后，diff 与原值对比再决定是否写入 patch。
+  personalExportEnabled: boolean;
+  personalImportEnabled: boolean;
 }
 
 interface ResetPwdState {
@@ -231,6 +240,9 @@ export default function UserManagement({ currentUserId }: { currentUserId: strin
     setEditError("");
     setEditLoading(true);
     try {
+      // 原始 per-user 开关值，缺失按 true 兜底（向后兼容 / 默认放行）
+      const origExport = edit.user.personalExportEnabled !== false;
+      const origImport = edit.user.personalImportEnabled !== false;
       const patch = {
         username: edit.username.trim() !== edit.user.username ? edit.username.trim() : undefined,
         email: edit.email.trim() !== (edit.user.email || "") ? (edit.email.trim() || null) : undefined,
@@ -239,8 +251,13 @@ export default function UserManagement({ currentUserId }: { currentUserId: strin
             ? edit.displayName.trim() || null
             : undefined,
         role: edit.role !== edit.user.role ? edit.role : undefined,
+        personalExportEnabled:
+          edit.personalExportEnabled !== origExport ? edit.personalExportEnabled : undefined,
+        personalImportEnabled:
+          edit.personalImportEnabled !== origImport ? edit.personalImportEnabled : undefined,
       };
-      // 改 role 属于高危字段，需要 sudo；仅改 username/email/displayName 则无需
+      // 改 role 属于高危字段，需要 sudo；仅改 username/email/displayName/personalExport*Enabled 则无需。
+      // personalExport/Import 的开关明确不算高危（不会踢人下线、不影响身份），保持轻流程。
       const needsSudo = patch.role !== undefined;
       const result = needsSudo
         ? await runWithSudo(t("userManagement.sudoDesc"), (tk) =>
@@ -527,6 +544,9 @@ export default function UserManagement({ currentUserId }: { currentUserId: strin
                               email: u.email || "",
                               displayName: u.displayName || "",
                               role: (u.role as "admin" | "user") || "user",
+                              // 后端缺字段（旧版本）按 true 兜底；只要不是显式 false 就视为"开"
+                              personalExportEnabled: u.personalExportEnabled !== false,
+                              personalImportEnabled: u.personalImportEnabled !== false,
                             })
                           }
                           className="p-1.5 rounded-md text-zinc-500 hover:text-indigo-600 hover:bg-indigo-50 dark:hover:bg-indigo-500/10 transition-colors"
@@ -676,6 +696,31 @@ export default function UserManagement({ currentUserId }: { currentUserId: strin
                   <option value="admin">{t("userManagement.roleAdmin")}</option>
                 </select>
               </div>
+
+              {/*
+                个人空间功能开关（v6 起为 per-user）。
+                - 管理员账号本身不受这两个开关约束（后端 isSystemAdmin 直通），但仍然把
+                  开关展示出来便于"统一管理"——管理员看着这两个开关也是关的，但导出/导入功能依然可用。
+                - 这里用 inline checkbox 而不引入额外组件，与本文件其它 UI 风格保持一致。
+              */}
+              <div className="space-y-2 pt-1">
+                <label className="text-xs font-medium text-zinc-600 dark:text-zinc-400 block">
+                  {t("userManagement.fieldPersonalFeatures")}
+                </label>
+                <ToggleEditRow
+                  label={t("userManagement.fieldPersonalExportEnabled")}
+                  desc={t("userManagement.fieldPersonalExportEnabledDesc")}
+                  checked={edit.personalExportEnabled}
+                  onChange={(v) => setEdit((s) => (s ? { ...s, personalExportEnabled: v } : s))}
+                />
+                <ToggleEditRow
+                  label={t("userManagement.fieldPersonalImportEnabled")}
+                  desc={t("userManagement.fieldPersonalImportEnabledDesc")}
+                  checked={edit.personalImportEnabled}
+                  onChange={(v) => setEdit((s) => (s ? { ...s, personalImportEnabled: v } : s))}
+                />
+              </div>
+
               {editError && <p className="text-xs text-red-500">{editError}</p>}
               <div className="flex items-center justify-end gap-2 pt-2">
                 <button
@@ -967,6 +1012,56 @@ function SummaryRow({ label, value }: { label: string; value: number }) {
     <div className="flex items-center justify-between">
       <span className="text-zinc-500">{label}</span>
       <span className={value > 0 ? "font-medium tabular-nums" : "text-zinc-400 tabular-nums"}>{value}</span>
+    </div>
+  );
+}
+
+/**
+ * 编辑用户弹窗里的 toggle 行。
+ * 与 SettingsModal 里曾经的 ToggleRow 视觉一致，但因 UserManagement 自带 Modal 与 FieldInput
+ * 体系，刻意保留独立实现，不去 shared 化——避免跨文件耦合让以后改样式时牵动太广。
+ */
+function ToggleEditRow({
+  label,
+  desc,
+  checked,
+  onChange,
+  disabled,
+}: {
+  label: string;
+  desc: string;
+  checked: boolean;
+  onChange: (next: boolean) => void;
+  disabled?: boolean;
+}) {
+  return (
+    <div
+      className={`flex items-start justify-between gap-3 px-3 py-2.5 rounded-lg border border-zinc-200 dark:border-zinc-800 bg-zinc-50/50 dark:bg-zinc-800/30 ${
+        disabled ? "opacity-70" : ""
+      }`}
+    >
+      <div className="min-w-0">
+        <div className="text-xs font-medium text-zinc-700 dark:text-zinc-200">{label}</div>
+        <div className="mt-0.5 text-[11px] text-zinc-500 dark:text-zinc-400 leading-snug">
+          {desc}
+        </div>
+      </div>
+      <button
+        type="button"
+        role="switch"
+        aria-checked={checked}
+        disabled={disabled}
+        onClick={() => onChange(!checked)}
+        className={`relative shrink-0 mt-0.5 w-9 h-5 rounded-full transition-colors ${
+          checked ? "bg-indigo-600" : "bg-zinc-300 dark:bg-zinc-600"
+        } ${disabled ? "cursor-not-allowed" : "cursor-pointer"}`}
+      >
+        <span
+          className={`absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white shadow transition-transform ${
+            checked ? "translate-x-4" : ""
+          }`}
+        />
+      </button>
     </div>
   );
 }

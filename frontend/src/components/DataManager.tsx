@@ -1,4 +1,4 @@
-import React, { useState, useRef, useCallback, useEffect } from "react";
+import React, { useState, useRef, useCallback, useEffect, useMemo } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import {
   Download, Upload, CheckCircle, Loader2, FileText,
@@ -8,6 +8,7 @@ import {
   Lock, Eye, EyeOff, X,
   Mail, Send, Settings as SettingsIcon, ChevronDown, ChevronRight,
   BookOpen, ExternalLink,
+  User as UserIcon, Users, ServerCog,
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { exportAllNotes, ExportProgress } from "@/lib/exportService";
@@ -16,21 +17,131 @@ import {
   ImportFileInfo, ImportProgress
 } from "@/lib/importService";
 import { useApp, useAppActions } from "@/store/AppContext";
-import { api, withSudo } from "@/lib/api";
+import { api, withSudo, getCurrentWorkspace, setCurrentWorkspace } from "@/lib/api";
 import { confirm as confirmDialog } from "@/components/ui/confirm";
 import MiCloudImport from "@/components/MiCloudImport";
 import OppoCloudImport from "@/components/OppoCloudImport";
 import ICloudImport from "@/components/iCloudImport";
 import YoudaoImport from "@/components/YoudaoImport";
+import type { Workspace } from "@/types";
+
+// ============================================================================
+// 一级 Tab：scope —— 个人空间 / 工作区 / 系统
+// ----------------------------------------------------------------------------
+// 拆分动机：
+//   - 个人空间 / 工作区：导出/导入是真正"按数据范围隔离"的——后端 export 路由
+//     已支持 ?workspaceId= 过滤（personal=NULL）。两个 Tab 各自带自己的 scope，
+//     不依赖侧边栏当前选中的 workspace（避免在弹窗里改 currentWorkspace
+//     触发 App 顶层的"工作区切换重置流程"）。
+//   - 系统：数据库 / 备份 / 危险区在后端是 SQLite 文件级 / 全库范围操作，
+//     本质上和"哪个工作区"无关，单独一栏并显著标注"全库范围"，避免误导。
+//
+// 入口闸门：整个 DataManager 仅系统管理员（User.role === "admin"）可访问；
+//   外层 SettingsModal 已用 isAdmin 控制 tab 可见性，这里再加一层防御性闸门。
+// ============================================================================
+
+type Scope = "personal" | "workspace" | "system";
+type SubTab = "export" | "import" | "database" | "backup" | "danger";
+
+/** 各 scope 下允许的二级 Tab 集合（顺序即展示顺序） */
+const SUBTABS_BY_SCOPE: Record<Scope, ReadonlyArray<SubTab>> = {
+  personal: ["export", "import"],
+  workspace: ["export", "import"],
+  system: ["database", "backup", "danger"],
+};
 
 export default function DataManager() {
   const { t } = useTranslation();
   const { state } = useApp();
   const actions = useAppActions();
 
-  // 二级 Tab：把原本「一条长长的滚动页」拆成若干功能域，降低认知负担
-  type SubTab = "export" | "import" | "database" | "backup" | "danger";
+  // -----------------------------------------------------------------
+  // 入口闸门：拉一次 me 判断是否为系统管理员 + 读取 per-user 功能开关
+  //   - admin：展示完整三个 scope（personal / workspace / system）
+  //   - 普通用户：仅展示 personal，且 personal 的导出/导入再叠加一层由管理员
+  //     在「用户管理」里对该用户设置的开关（personalExport/Import Enabled）
+  //     进行禁用或隐藏。
+  //
+  // 注：v6 起这两个开关从站点级 system_settings 下沉为 users 表 per-user 字段，
+  // 这里直接从 /api/me 读最新值；老后端若不返回字段则按 true 兜底保持原行为。
+  // -----------------------------------------------------------------
+  const [isAdmin, setIsAdmin] = useState<boolean | null>(null);
+  const [personalExportAllowed, setPersonalExportAllowed] = useState(true);
+  const [personalImportAllowed, setPersonalImportAllowed] = useState(true);
+  useEffect(() => {
+    let cancelled = false;
+    api.getMe()
+      .then((u) => {
+        if (cancelled) return;
+        setIsAdmin((u as any)?.role === "admin");
+        // 老后端可能不返回这两个字段——按 true 兜底，保持原行为。
+        const exp = (u as any)?.personalExportEnabled;
+        const imp = (u as any)?.personalImportEnabled;
+        setPersonalExportAllowed(exp === undefined ? true : !!exp);
+        setPersonalImportAllowed(imp === undefined ? true : !!imp);
+      })
+      .catch(() => { if (!cancelled) setIsAdmin(false); });
+    return () => { cancelled = true; };
+  }, []);
+
+  // personal scope 导出/导入是否被管理员关闭。仅对非 admin 生效——管理员
+  // 始终不受开关约束（管理员保有数据救援能力）。
+  const personalExportLocked = isAdmin === false && !personalExportAllowed;
+  const personalImportLocked = isAdmin === false && !personalImportAllowed;
+
+  // -----------------------------------------------------------------
+  // 一级 / 二级 tab 状态
+  // -----------------------------------------------------------------
+  const [scope, setScope] = useState<Scope>("personal");
   const [activeSubTab, setActiveSubTab] = useState<SubTab>("export");
+
+  // 切换一级 tab 时，把二级 tab 自动重置到该 scope 下的首项，避免出现
+  // "工作区 Tab 但激活的是 database"这种非法组合。
+  useEffect(() => {
+    const allowed = SUBTABS_BY_SCOPE[scope];
+    if (!allowed.includes(activeSubTab)) {
+      setActiveSubTab(allowed[0]);
+    }
+  }, [scope, activeSubTab]);
+
+  // -----------------------------------------------------------------
+  // 工作区列表（仅在 scope=workspace 时使用，用于下拉选择目标工作区）
+  // -----------------------------------------------------------------
+  const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
+  const [selectedWorkspaceId, setSelectedWorkspaceId] = useState<string>("");
+  useEffect(() => {
+    if (scope !== "workspace") return;
+    let cancelled = false;
+    api.getWorkspaces()
+      .then((list) => {
+        if (cancelled) return;
+        setWorkspaces(list || []);
+        // 自动选中第一个工作区，避免空态
+        if ((list?.length ?? 0) > 0 && !selectedWorkspaceId) {
+          setSelectedWorkspaceId(list[0].id);
+        }
+      })
+      .catch(() => { if (!cancelled) setWorkspaces([]); });
+    return () => { cancelled = true; };
+    // selectedWorkspaceId 不依赖：仅首次拉列表时尝试默认选中
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scope]);
+
+  /** 当前 scope 实际要传给 export/import API 的 workspaceId 字符串：
+   *   - personal → "personal"
+   *   - workspace → 用户在下拉里选的工作区 id（未选时返回 "" 表示尚未就绪）
+   *   - system → 不参与
+   */
+  const effectiveWorkspaceId: string = useMemo(() => {
+    if (scope === "personal") return "personal";
+    if (scope === "workspace") return selectedWorkspaceId || "";
+    return "";
+  }, [scope, selectedWorkspaceId]);
+
+  const selectedWorkspaceName = useMemo(() => {
+    if (scope !== "workspace") return "";
+    return workspaces.find((w) => w.id === selectedWorkspaceId)?.name ?? "";
+  }, [scope, selectedWorkspaceId, workspaces]);
 
   // Export state
   const [exportProgress, setExportProgress] = useState<ExportProgress | null>(null);
@@ -40,6 +151,15 @@ export default function DataManager() {
   const [importFiles, setImportFiles] = useState<ImportFileInfo[]>([]);
   const [importProgress, setImportProgress] = useState<ImportProgress | null>(null);
   const [isImporting, setIsImporting] = useState(false);
+  // 记录"上一次导入实际落到的 workspaceId"和导入数量。
+  //   - 当目标 ≠ 当前侧边栏 workspace 时，用于渲染"切到该工作区查看"的提示，
+  //     避免出现"点完导入说成功、但侧边栏里看不到笔记"的体感（实际写入了别的空间）。
+  //   - workspaceId 取值：'personal' 或 <uuid>，与 effectiveWorkspaceId 同语义。
+  const [lastImportTarget, setLastImportTarget] = useState<{
+    workspaceId: string;
+    workspaceName: string;
+    count: number;
+  } | null>(null);
   const [isDragOver, setIsDragOver] = useState(false);
   const [selectedNotebookId, setSelectedNotebookId] = useState<string>("");
   // 新增：是否"为每个文件创建以文件名命名的外层笔记本"
@@ -52,11 +172,15 @@ export default function DataManager() {
   const [exportInlineImages, setExportInlineImages] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // 全量导出
+  // 全量导出 —— 按当前 scope（个人空间 / 工作区）
   const handleExportAll = async () => {
+    if (!effectiveWorkspaceId) return; // 工作区 scope 但未选中，按钮已禁用，这里再防御
     setIsExporting(true);
     setExportProgress(null);
-    await exportAllNotes((p) => setExportProgress(p), { inlineImages: exportInlineImages });
+    await exportAllNotes(
+      (p) => setExportProgress(p),
+      { inlineImages: exportInlineImages, workspaceId: effectiveWorkspaceId },
+    );
     setIsExporting(false);
   };
 
@@ -119,29 +243,69 @@ export default function DataManager() {
   };
 
   const handleImport = async () => {
+    if (!effectiveWorkspaceId) return; // 工作区 scope 但未选中，按钮已禁用，这里再防御
     setIsImporting(true);
     setImportProgress(null);
+    setLastImportTarget(null);
+    // scope 匹配检查：state.notebooks 是侧边栏激活 ws 的，scope 不匹配时
+    // 不允许把"侧边栏 ws 的笔记本 id"硬塞到目标 ws 的 import 里——只走自动创建。
+    const scopeMatchesGlobal = effectiveWorkspaceId === getCurrentWorkspace();
+    const safeNotebookId = scopeMatchesGlobal ? selectedNotebookId : "";
     // perFileNotebook 与 selectedNotebookId 互斥：只要选了具体笔记本，就不启用 per-file
-    const usePerFile = !selectedNotebookId && perFileNotebook;
+    const usePerFile = !safeNotebookId && perFileNotebook;
     const result = await importNotes(
       importFiles,
-      selectedNotebookId || undefined,
+      safeNotebookId || undefined,
       (p) => setImportProgress(p),
       {
         perFileNotebook: usePerFile,
         duplicateStrategy,
+        workspaceId: effectiveWorkspaceId,
       }
     );
     setIsImporting(false);
 
     if (result.success) {
-      api.getNotebooks().then(actions.setNotebooks).catch(console.error);
+      // 记下"导入到了哪里"——用于成功横幅展示目标空间名及一键切换入口。
+      // 用户最常踩的坑：从 A 工作区导出 → DataManager 选 B 导入 → 弹窗关闭后侧
+      // 边栏还在 A，看不到笔记，误以为"显示成功但没导入"。
+      const targetName =
+        scope === "personal"
+          ? t('dataManager.scope.personal')
+          : (selectedWorkspaceName || t('dataManager.scope.workspace'));
+      setLastImportTarget({
+        workspaceId: effectiveWorkspaceId,
+        workspaceName: targetName,
+        count: result.count,
+      });
+      // 仅当目标 scope 与全局一致时，才需要刷新侧边栏的笔记本列表（否则
+      // refresh 拿到的还是侧边栏 ws 的，不会看到导入的笔记本）。
+      if (scopeMatchesGlobal) {
+        api.getNotebooks().then(actions.setNotebooks).catch(console.error);
+      }
       setTimeout(() => {
         setImportFiles([]);
         setImportProgress(null);
         setHasZip(false);
+        // 注意：lastImportTarget 不在这里清空——它要持续展示，直到用户主动
+        // 关闭横幅或点击"切到该工作区查看"。
       }, 3000);
     }
+  };
+
+  /** 横幅"切到目标工作区查看"——切换全局 workspace，并关闭整个 SettingsModal 弹窗。 */
+  const handleSwitchToImportTarget = () => {
+    if (!lastImportTarget) return;
+    setCurrentWorkspace(lastImportTarget.workspaceId);
+    window.dispatchEvent(
+      new CustomEvent("nowen:workspace-changed", {
+        detail: { workspaceId: lastImportTarget.workspaceId },
+      }),
+    );
+    setLastImportTarget(null);
+    // 通过自定义事件请求关闭 SettingsModal（由父组件决定是否监听）。
+    // 即便父组件未处理，工作区切换本身也会触发 App 顶层的"重置流程"。
+    window.dispatchEvent(new CustomEvent("nowen:close-settings"));
   };
 
   const clearImportList = () => {
@@ -197,6 +361,26 @@ export default function DataManager() {
     }
   };
 
+  // 工作区 scope 但还没选中具体工作区时（如该用户没有任何协作工作区），
+  // 导出/导入按钮应被禁用，避免发出 ?workspaceId= （后端会按个人空间错处理）
+  const workspaceScopeNotReady = scope === "workspace" && !effectiveWorkspaceId;
+
+  // -----------------------------------------------------------------
+  // 入口闸门
+  //   - isAdmin === null：身份未拉到，渲染骨架占位（避免闪现拒绝页又秒变正常）
+  //   - isAdmin === true：完整三 scope（personal/workspace/system）
+  //   - isAdmin === false：仅展示 personal scope 的导出/导入；workspace/system
+  //     scope 在下方 tab 渲染时直接从可选项中移除，且 personal 内部还会按
+  //     personalExport/Import Locked 进一步禁用按钮。
+  // -----------------------------------------------------------------
+  if (isAdmin === null) {
+    return (
+      <div className="flex items-center justify-center py-16 text-zinc-400 dark:text-zinc-600">
+        <Loader2 size={20} className="animate-spin" />
+      </div>
+    );
+  }
+
   return (
     <div className="space-y-6">
       <div>
@@ -205,10 +389,95 @@ export default function DataManager() {
           {t('dataManager.description')}
         </p>
 
+        {/* ===== 一级 Tab：scope（个人空间 / 工作区 / 系统） =====
+            把"导出/导入/数据库/备份/危险区"按数据范围拆开：
+              - 个人空间：你自己的数据（notes.workspaceId IS NULL）
+              - 工作区：当前选中的协作工作区数据
+              - 系统：SQLite 文件级 / 全库范围操作（与具体工作区无关）
+            选中后，下方的二级 tab 会按 SUBTABS_BY_SCOPE 自动过滤。 */}
+        <div
+          role="tablist"
+          aria-label="data scope"
+          className="flex flex-wrap gap-1 p-1 mb-3 rounded-lg bg-zinc-100/70 dark:bg-zinc-800/50 border border-zinc-200/60 dark:border-zinc-800"
+        >
+          {([
+            { id: "personal",  icon: UserIcon,  label: t('dataManager.scope.personal'), adminOnly: false },
+            { id: "workspace", icon: Users,     label: t('dataManager.scope.workspace'), adminOnly: true  },
+            { id: "system",    icon: ServerCog, label: t('dataManager.scope.system'),   adminOnly: true  },
+          ] as const)
+            // 非管理员：只保留 personal。workspace/system 涉及跨用户/全库操作，
+            // 严格 admin-only —— 不仅隐藏按钮，连 tab 都不渲染，避免被看见。
+            .filter((s) => isAdmin || !s.adminOnly)
+            .map((s) => {
+            const active = scope === s.id;
+            const Icon = s.icon;
+            return (
+              <button
+                key={s.id}
+                role="tab"
+                aria-selected={active}
+                onClick={() => setScope(s.id)}
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium transition-colors ${
+                  active
+                    ? "bg-white dark:bg-zinc-900 text-zinc-900 dark:text-zinc-100 shadow-sm"
+                    : "text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100 hover:bg-white/60 dark:hover:bg-zinc-900/40"
+                }`}
+              >
+                <Icon size={14} />
+                {s.label}
+              </button>
+            );
+          })}
+        </div>
+
+        {/* ===== 当前 scope 提示横幅 =====
+            明确告诉用户当前正在操作哪部分数据；workspace scope 还要让用户选具体工作区。 */}
+        {scope === "personal" && (
+          <div className="mb-3 flex items-start gap-2 px-3 py-2 rounded-lg border border-indigo-200/60 dark:border-indigo-900/40 bg-indigo-50/40 dark:bg-indigo-500/5 text-xs text-indigo-700 dark:text-indigo-300">
+            <UserIcon size={14} className="flex-shrink-0 mt-0.5" />
+            <span>{t('dataManager.scope.personalHint')}</span>
+          </div>
+        )}
+        {scope === "workspace" && (
+          <div className="mb-3 space-y-2">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-xs text-zinc-600 dark:text-zinc-400">
+                {t('dataManager.scope.currentWorkspaceLabel')}
+              </span>
+              {workspaces.length === 0 ? (
+                <span className="text-xs text-amber-600 dark:text-amber-400">
+                  {t('dataManager.scope.workspaceNeedSwitch')}
+                </span>
+              ) : (
+                <select
+                  value={selectedWorkspaceId}
+                  onChange={(e) => setSelectedWorkspaceId(e.target.value)}
+                  className="text-xs rounded-md border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-800 text-zinc-700 dark:text-zinc-300 px-2 py-1 outline-none focus:ring-2 focus:ring-indigo-500/30 focus:border-indigo-500"
+                >
+                  {workspaces.map((w) => (
+                    <option key={w.id} value={w.id}>{w.name}</option>
+                  ))}
+                </select>
+              )}
+            </div>
+            {selectedWorkspaceName && (
+              <div className="flex items-start gap-2 px-3 py-2 rounded-lg border border-emerald-200/60 dark:border-emerald-900/40 bg-emerald-50/40 dark:bg-emerald-500/5 text-xs text-emerald-700 dark:text-emerald-300">
+                <Users size={14} className="flex-shrink-0 mt-0.5" />
+                <span>{t('dataManager.scope.workspaceHint', { name: selectedWorkspaceName })}</span>
+              </div>
+            )}
+          </div>
+        )}
+        {scope === "system" && (
+          <div className="mb-3 flex items-start gap-2 px-3 py-2 rounded-lg border border-amber-200/60 dark:border-amber-900/40 bg-amber-50/40 dark:bg-amber-500/5 text-xs text-amber-700 dark:text-amber-300">
+            <ServerCog size={14} className="flex-shrink-0 mt-0.5" />
+            <span>{t('dataManager.scope.systemHint')}</span>
+          </div>
+        )}
+
         {/* ===== 二级 Tab 切换 =====
-            功能分组过多时，一页顺序展示会拉出极长的滚动，新用户定位功能困难。
-            这里用"药丸式"二级 tab 把 5 个功能域（导出 / 导入 / 数据库 / 备份 / 危险区）
-            分开，点击切换；默认落在「导出」——最常用且相对安全。 */}
+            按当前 scope 过滤可见项：personal/workspace 只显示导出/导入；
+            system 显示数据库/备份/危险区。 */}
         <div
           role="tablist"
           aria-label={t('dataManager.title')}
@@ -220,7 +489,7 @@ export default function DataManager() {
             { id: "database", icon: Database,        label: t('dataManager.tabs.database'), tone: "sky"     },
             { id: "backup",   icon: Save,            label: t('dataManager.tabs.backup'),   tone: "violet"  },
             { id: "danger",   icon: AlertTriangle,   label: t('dataManager.tabs.danger'),   tone: "red"     },
-          ] as const).map((tab) => {
+          ] as const).filter((tab) => SUBTABS_BY_SCOPE[scope].includes(tab.id)).map((tab) => {
             const active = activeSubTab === tab.id;
             const Icon = tab.icon;
             const activeToneClass =
@@ -254,6 +523,16 @@ export default function DataManager() {
           <FolderDown size={18} className="text-indigo-500" />
           <h4 className="text-base font-semibold text-zinc-900 dark:text-zinc-100">{t('dataManager.exportBackup')}</h4>
         </div>
+
+        {/* 普通用户且管理员已关闭"个人空间导出"开关时：展示 lock 横幅并禁用下方按钮。
+            不直接隐藏整个 section —— 让用户能看见"这里本来有导出，但被管理员关闭了"，
+            比悄悄消失更透明、减少"我的设置是不是 bug"类困惑。 */}
+        {personalExportLocked && (
+          <div className="mb-3 flex items-start gap-2 px-3 py-2 rounded-lg border border-amber-200/60 dark:border-amber-900/40 bg-amber-50/40 dark:bg-amber-500/5 text-xs text-amber-700 dark:text-amber-300">
+            <ShieldAlert size={14} className="flex-shrink-0 mt-0.5" />
+            <span>{t('dataManager.scope.personalExportDisabled')}</span>
+          </div>
+        )}
 
         <div className="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-zinc-50/50 dark:bg-zinc-800/30 p-4">
           <p className="text-sm text-zinc-500 dark:text-zinc-400 mb-4">
@@ -308,9 +587,9 @@ export default function DataManager() {
 
           <button
             onClick={handleExportAll}
-            disabled={isExporting}
+            disabled={isExporting || workspaceScopeNotReady || personalExportLocked}
             className={`flex items-center justify-center w-full py-2.5 px-4 rounded-lg font-medium text-sm transition-all ${
-              isExporting
+              isExporting || workspaceScopeNotReady || personalExportLocked
                 ? "bg-zinc-100 dark:bg-zinc-800 text-zinc-400 dark:text-zinc-600 cursor-not-allowed"
                 : exportProgress?.phase === "done"
                 ? "bg-green-500 hover:bg-green-600 text-white shadow-md"
@@ -347,6 +626,16 @@ export default function DataManager() {
           <h4 className="text-base font-semibold text-zinc-900 dark:text-zinc-100">{t('dataManager.importNotes')}</h4>
         </div>
 
+        {/* 与 export 区对称：管理员关闭"个人空间导入"时，对普通用户展示 lock 横幅
+            并禁用下方入口（第三方导入也一并隐藏，避免绕过主入口从小米云/OPPO 云
+            等途径导入）。 */}
+        {personalImportLocked && (
+          <div className="mb-3 flex items-start gap-2 px-3 py-2 rounded-lg border border-amber-200/60 dark:border-amber-900/40 bg-amber-50/40 dark:bg-amber-500/5 text-xs text-amber-700 dark:text-amber-300">
+            <ShieldAlert size={14} className="flex-shrink-0 mt-0.5" />
+            <span>{t('dataManager.scope.personalImportDisabled')}</span>
+          </div>
+        )}
+
         <div className="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-zinc-50/50 dark:bg-zinc-800/30 p-4">
           <p className="text-sm text-zinc-500 dark:text-zinc-400 mb-4">
             {t('dataManager.importDescription')}
@@ -355,14 +644,17 @@ export default function DataManager() {
           {/* Dropzone */}
           {importFiles.length === 0 && (
             <div
-              onDragOver={handleDragOver}
-              onDragLeave={handleDragLeave}
-              onDrop={handleDrop}
-              onClick={() => fileInputRef.current?.click()}
-              className={`relative border-2 border-dashed rounded-xl p-8 text-center cursor-pointer transition-all ${
-                isDragOver
-                  ? "border-indigo-400 bg-indigo-50/50 dark:bg-indigo-500/5 dark:border-indigo-500"
-                  : "border-zinc-300 dark:border-zinc-700 hover:border-indigo-300 dark:hover:border-zinc-600 hover:bg-zinc-50 dark:hover:bg-zinc-800/50"
+              onDragOver={personalImportLocked ? undefined : handleDragOver}
+              onDragLeave={personalImportLocked ? undefined : handleDragLeave}
+              onDrop={personalImportLocked ? undefined : handleDrop}
+              onClick={() => { if (!personalImportLocked) fileInputRef.current?.click(); }}
+              aria-disabled={personalImportLocked}
+              className={`relative border-2 border-dashed rounded-xl p-8 text-center transition-all ${
+                personalImportLocked
+                  ? "border-zinc-200 dark:border-zinc-800 bg-zinc-50/30 dark:bg-zinc-800/20 text-zinc-400 dark:text-zinc-600 cursor-not-allowed"
+                  : isDragOver
+                  ? "border-indigo-400 bg-indigo-50/50 dark:bg-indigo-500/5 dark:border-indigo-500 cursor-pointer"
+                  : "border-zinc-300 dark:border-zinc-700 hover:border-indigo-300 dark:hover:border-zinc-600 hover:bg-zinc-50 dark:hover:bg-zinc-800/50 cursor-pointer"
               }`}
             >
               <input
@@ -371,6 +663,7 @@ export default function DataManager() {
                 multiple
                 accept=".md,.txt,.markdown,.html,.htm,.zip,.png,.jpg,.jpeg,.gif,.webp,.svg,.bmp"
                 onChange={handleFileSelect}
+                disabled={personalImportLocked}
                 className="hidden"
               />
               <Upload
@@ -411,22 +704,33 @@ export default function DataManager() {
                 </button>
               </div>
 
-              {/* 目标笔记本选择 */}
-              <div className="mb-3">
-                <label className="text-xs text-zinc-500 dark:text-zinc-400 mb-1 block">{t('dataManager.importToNotebook')}</label>
-                <select
-                  value={selectedNotebookId}
-                  onChange={(e) => setSelectedNotebookId(e.target.value)}
-                  className="w-full text-sm rounded-lg border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-800 text-zinc-700 dark:text-zinc-300 px-3 py-1.5 outline-none focus:ring-2 focus:ring-indigo-500/30 focus:border-indigo-500"
-                >
-                  <option value="">{t('dataManager.autoCreateNotebook')}</option>
-                  {state.notebooks.map((nb) => (
-                    <option key={nb.id} value={nb.id}>
-                      {nb.icon} {nb.name}
-                    </option>
-                  ))}
-                </select>
-              </div>
+              {/* 目标笔记本选择
+                  state.notebooks 是"侧边栏当前激活工作区"的笔记本列表。如果用户
+                  在 DataManager 里选的 scope 与侧边栏激活 scope 不一致，列表中的
+                  笔记本 id 不属于目标 workspace，硬塞进 import 会产生跨空间脏数据。
+                  这里加一道"scope 匹配"判断：不匹配时只允许"自动创建"，并提示原因。 */}
+              {(() => {
+                const currentGlobalWs = getCurrentWorkspace();
+                const scopeMatchesGlobal = effectiveWorkspaceId === currentGlobalWs;
+                return (
+                  <div className="mb-3">
+                    <label className="text-xs text-zinc-500 dark:text-zinc-400 mb-1 block">{t('dataManager.importToNotebook')}</label>
+                    <select
+                      value={scopeMatchesGlobal ? selectedNotebookId : ""}
+                      onChange={(e) => setSelectedNotebookId(e.target.value)}
+                      disabled={!scopeMatchesGlobal}
+                      className="w-full text-sm rounded-lg border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-800 text-zinc-700 dark:text-zinc-300 px-3 py-1.5 outline-none focus:ring-2 focus:ring-indigo-500/30 focus:border-indigo-500 disabled:opacity-60 disabled:cursor-not-allowed"
+                    >
+                      <option value="">{t('dataManager.autoCreateNotebook')}</option>
+                      {scopeMatchesGlobal && state.notebooks.map((nb) => (
+                        <option key={nb.id} value={nb.id}>
+                          {nb.icon} {nb.name}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                );
+              })()}
 
               {/* 按文件名建笔记本 —— 仅对散文件生效 */}
               {!hasZip && (
@@ -526,12 +830,52 @@ export default function DataManager() {
                 </div>
               )}
 
+              {/* 导入完成横幅
+                  明确告诉用户笔记导入到了哪个空间，并在目标 ≠ 当前侧边栏空间时
+                  提供一键切换入口；解决"显示成功但看不到笔记"的核心体感问题。 */}
+              {lastImportTarget && (
+                <div className="mt-3 p-3 rounded-lg border border-emerald-200 dark:border-emerald-900/50 bg-emerald-50/70 dark:bg-emerald-500/10">
+                  <div className="flex items-start gap-2">
+                    <CheckCircle size={16} className="text-emerald-600 dark:text-emerald-400 flex-shrink-0 mt-0.5" />
+                    <div className="flex-1 min-w-0">
+                      <div className="text-sm font-medium text-emerald-700 dark:text-emerald-300">
+                        {t('dataManager.importDoneTitle', { count: lastImportTarget.count })}
+                      </div>
+                      <div className="text-xs text-emerald-700/80 dark:text-emerald-300/80 mt-0.5 break-all">
+                        {t('dataManager.importDoneTargetLabel')}
+                        <span className="font-semibold">{lastImportTarget.workspaceName}</span>
+                      </div>
+                      {lastImportTarget.workspaceId !== getCurrentWorkspace() && (
+                        <div className="mt-2 flex flex-wrap gap-2">
+                          <button
+                            onClick={handleSwitchToImportTarget}
+                            className="text-xs px-2.5 py-1 rounded-md bg-emerald-600 hover:bg-emerald-700 text-white font-medium transition-colors"
+                          >
+                            {t('dataManager.importDoneSwitch')}
+                          </button>
+                          <div className="text-xs text-emerald-700/80 dark:text-emerald-300/80 self-center">
+                            {t('dataManager.importDoneSwitchHint')}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                    <button
+                      onClick={() => setLastImportTarget(null)}
+                      className="text-emerald-700/60 dark:text-emerald-300/60 hover:text-emerald-700 dark:hover:text-emerald-300 flex-shrink-0"
+                      aria-label="dismiss"
+                    >
+                      <X size={14} />
+                    </button>
+                  </div>
+                </div>
+              )}
+
               {/* 导入按钮 */}
               <button
                 onClick={handleImport}
-                disabled={isImporting || selectedCount === 0}
+                disabled={isImporting || selectedCount === 0 || workspaceScopeNotReady || personalImportLocked}
                 className={`mt-3 flex items-center justify-center w-full py-2.5 px-4 rounded-lg font-medium text-sm transition-all ${
-                  isImporting || selectedCount === 0
+                  isImporting || selectedCount === 0 || workspaceScopeNotReady || personalImportLocked
                     ? "bg-zinc-100 dark:bg-zinc-800 text-zinc-400 dark:text-zinc-600 cursor-not-allowed"
                     : importProgress?.phase === "done"
                     ? "bg-green-500 hover:bg-green-600 text-white shadow-md"
@@ -560,17 +904,24 @@ export default function DataManager() {
         </div>
       </section>
 
-      {/* ===== 小米云服务导入 ===== */}
-      <MiCloudImport />
+      {/* 第三方云/备忘录导入：同样受 personalImport 开关约束。
+          管理员关闭开关时，不应存在"主入口禁用但 MiCloud / OPPO / iCloud / 有道
+          还能用"的绕过漏洞；对普通用户 lock 时直接整体隐藏。 */}
+      {!personalImportLocked && (
+        <>
+          {/* ===== 小米云服务导入 ===== */}
+          <MiCloudImport />
 
-      {/* ===== OPPO 云便签导入 ===== */}
-      <OppoCloudImport />
+          {/* ===== OPPO 云便签导入 ===== */}
+          <OppoCloudImport />
 
-      {/* ===== iPhone 备忘录导入 ===== */}
-      <ICloudImport />
+          {/* ===== iPhone 备忘录导入 ===== */}
+          <ICloudImport />
 
-      {/* ===== 有道云笔记导入 ===== */}
-      <YoudaoImport />
+          {/* ===== 有道云笔记导入 ===== */}
+          <YoudaoImport />
+        </>
+      )}
       </>
       )}
 
@@ -1427,6 +1778,14 @@ function BackupSection() {
   // 自动备份配置区本地状态：避免每次拖滑杆都打 status；只在 status 重载时同步。
   const [autoEnabled, setAutoEnabled] = useState(false);
   const [autoIntervalHours, setAutoIntervalHours] = useState(24);
+  // 调度模式：interval=按间隔小时；daily=每天 HH:mm。默认 interval（兼容旧行为）。
+  const [autoMode, setAutoMode] = useState<"interval" | "daily">("interval");
+  const [autoDailyAt, setAutoDailyAt] = useState("03:00");
+  // 自动清理保留数量（仅 db-only），默认 15，范围 1~100。
+  const [autoKeepCount, setAutoKeepCount] = useState(15);
+  // 自动备份成功后是否发邮件 + 收件人。默认 false；启用时邮箱必填。
+  const [autoEmailOnSuccess, setAutoEmailOnSuccess] = useState(false);
+  const [autoEmailTo, setAutoEmailTo] = useState("");
   const [autoSaving, setAutoSaving] = useState(false);
   const [autoMsg, setAutoMsg] = useState<{ type: "ok" | "err"; text: string } | null>(null);
 
@@ -1444,6 +1803,12 @@ function BackupSection() {
       // 同步自动备份本地编辑值
       setAutoEnabled(s.autoBackupRunning);
       setAutoIntervalHours(s.autoBackupIntervalHours);
+      // 新字段：旧后端不返回这些字段时回退默认值，避免 UI 闪烁
+      setAutoMode(s.autoBackupMode === "daily" ? "daily" : "interval");
+      setAutoDailyAt(s.autoBackupDailyAt || "03:00");
+      setAutoKeepCount(typeof s.autoBackupKeepCount === "number" ? s.autoBackupKeepCount : 15);
+      setAutoEmailOnSuccess(s.autoBackupEmailOnSuccess === true);
+      setAutoEmailTo(s.autoBackupEmailTo || "");
     } catch (err: any) {
       setError(err.message || "load failed");
     } finally {
@@ -1595,11 +1960,25 @@ function BackupSection() {
 
   /** 保存自动备份配置 —— 走 sudo */
   const handleSaveAuto = async () => {
+    // 启用邮件通知前的本地校验：避免点保存才被后端 400 顶回
+    if (autoEnabled && autoEmailOnSuccess) {
+      const okMail = /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(autoEmailTo.trim());
+      if (!okMail) {
+        setAutoMsg({ type: "err", text: t("dataManager.backup.autoEmailInvalid") });
+        return;
+      }
+    }
     setAutoSaving(true);
     setAutoMsg(null);
     try {
       const out = await withSudo(
-        (tk) => api.backup.setAuto(autoEnabled, autoIntervalHours, tk),
+        (tk) => api.backup.setAuto(autoEnabled, autoIntervalHours, tk, {
+          mode: autoMode,
+          dailyAt: autoDailyAt,
+          keepCount: autoKeepCount,
+          emailOnSuccess: autoEmailOnSuccess,
+          emailTo: autoEmailTo.trim(),
+        }),
         askPassword,
         sudoTokenRef.current,
       );
@@ -1807,39 +2186,152 @@ function BackupSection() {
             </label>
           </div>
 
-          <div className={autoEnabled ? "" : "opacity-50 pointer-events-none"}>
+          <div className={autoEnabled ? "space-y-3" : "opacity-50 pointer-events-none space-y-3"}>
+            {/* 调度模式切换：interval（每 N 小时） / daily（每天 HH:mm）。
+                旧版本只有 interval，daily 是新增——能精确落在低峰时段，
+                避免重启服务后调度被踢出固定节奏。 */}
+            <div className="flex items-center gap-3 text-xs text-zinc-600 dark:text-zinc-400">
+              <span className="whitespace-nowrap">{t("dataManager.backup.scheduleModeLabel")}</span>
+              <label className="flex items-center gap-1.5 cursor-pointer">
+                <input
+                  type="radio"
+                  name="auto-backup-mode"
+                  value="interval"
+                  checked={autoMode === "interval"}
+                  onChange={() => setAutoMode("interval")}
+                  className="accent-emerald-600"
+                  disabled={!autoEnabled}
+                />
+                <span>{t("dataManager.backup.scheduleModeInterval")}</span>
+              </label>
+              <label className="flex items-center gap-1.5 cursor-pointer">
+                <input
+                  type="radio"
+                  name="auto-backup-mode"
+                  value="daily"
+                  checked={autoMode === "daily"}
+                  onChange={() => setAutoMode("daily")}
+                  className="accent-emerald-600"
+                  disabled={!autoEnabled}
+                />
+                <span>{t("dataManager.backup.scheduleModeDaily")}</span>
+              </label>
+            </div>
+
+            {/* interval 模式：滑块 + 数字 */}
+            {autoMode === "interval" && (
+              <div>
+                <div className="flex items-center gap-3">
+                  <label className="text-xs text-zinc-600 dark:text-zinc-400 whitespace-nowrap">
+                    {t("dataManager.backup.intervalLabel")}
+                  </label>
+                  <input
+                    type="range"
+                    min={1}
+                    max={168}
+                    step={1}
+                    value={Math.min(autoIntervalHours, 168)}
+                    onChange={(e) => setAutoIntervalHours(Number(e.target.value))}
+                    className="flex-1 accent-emerald-600"
+                    disabled={!autoEnabled}
+                  />
+                  <input
+                    type="number"
+                    min={1}
+                    max={720}
+                    value={autoIntervalHours}
+                    onChange={(e) => {
+                      const n = Number(e.target.value);
+                      if (Number.isFinite(n)) setAutoIntervalHours(Math.max(1, Math.min(720, Math.round(n))));
+                    }}
+                    className="w-16 px-2 py-1 text-xs text-right rounded border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-800 text-zinc-800 dark:text-zinc-200"
+                    disabled={!autoEnabled}
+                  />
+                  <span className="text-xs text-zinc-500 whitespace-nowrap">
+                    {t("dataManager.backup.intervalUnit")}
+                  </span>
+                </div>
+                <div className="text-[11px] text-zinc-400 mt-1">
+                  {t("dataManager.backup.intervalHint")}
+                </div>
+              </div>
+            )}
+
+            {/* daily 模式：HH:mm 时间选择器（服务器本地时区） */}
+            {autoMode === "daily" && (
+              <div>
+                <div className="flex items-center gap-3">
+                  <label className="text-xs text-zinc-600 dark:text-zinc-400 whitespace-nowrap">
+                    {t("dataManager.backup.dailyAtLabel")}
+                  </label>
+                  <input
+                    type="time"
+                    value={autoDailyAt}
+                    onChange={(e) => setAutoDailyAt(e.target.value || "03:00")}
+                    className="px-2 py-1 text-xs rounded border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-800 text-zinc-800 dark:text-zinc-200"
+                    disabled={!autoEnabled}
+                  />
+                  <span className="text-xs text-zinc-500">
+                    {t("dataManager.backup.dailyAtTzNote")}
+                  </span>
+                </div>
+                <div className="text-[11px] text-zinc-400 mt-1">
+                  {t("dataManager.backup.dailyAtHint")}
+                </div>
+              </div>
+            )}
+
+            {/* 保留数量：从写死 10 → 可配置，默认 15。手动+自动两条路径都会触发清理 */}
             <div className="flex items-center gap-3">
               <label className="text-xs text-zinc-600 dark:text-zinc-400 whitespace-nowrap">
-                {t("dataManager.backup.intervalLabel")}
+                {t("dataManager.backup.keepCountLabel")}
               </label>
-              <input
-                type="range"
-                min={1}
-                max={168}
-                step={1}
-                value={Math.min(autoIntervalHours, 168)}
-                onChange={(e) => setAutoIntervalHours(Number(e.target.value))}
-                className="flex-1 accent-emerald-600"
-                disabled={!autoEnabled}
-              />
               <input
                 type="number"
                 min={1}
-                max={720}
-                value={autoIntervalHours}
+                max={100}
+                value={autoKeepCount}
                 onChange={(e) => {
                   const n = Number(e.target.value);
-                  if (Number.isFinite(n)) setAutoIntervalHours(Math.max(1, Math.min(720, Math.round(n))));
+                  if (Number.isFinite(n)) setAutoKeepCount(Math.max(1, Math.min(100, Math.round(n))));
                 }}
-                className="w-16 px-2 py-1 text-xs text-right rounded border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-800 text-zinc-800 dark:text-zinc-200"
+                className="w-20 px-2 py-1 text-xs text-right rounded border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-800 text-zinc-800 dark:text-zinc-200"
                 disabled={!autoEnabled}
               />
-              <span className="text-xs text-zinc-500 whitespace-nowrap">
-                {t("dataManager.backup.intervalUnit")}
+              <span className="text-[11px] text-zinc-400">
+                {t("dataManager.backup.keepCountHint")}
               </span>
             </div>
-            <div className="text-[11px] text-zinc-400 mt-1">
-              {t("dataManager.backup.intervalHint")}
+
+            {/* 自动发邮件：勾选后必须填合法邮箱；后端在 SMTP 未启用时会静默 skip */}
+            <div className="border-t border-zinc-200 dark:border-zinc-700 pt-3 space-y-2">
+              <label className="flex items-center gap-2 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={autoEmailOnSuccess}
+                  onChange={(e) => setAutoEmailOnSuccess(e.target.checked)}
+                  className="w-4 h-4 accent-emerald-600"
+                  disabled={!autoEnabled}
+                />
+                <span className="text-xs text-zinc-700 dark:text-zinc-300">
+                  {t("dataManager.backup.autoEmailLabel")}
+                </span>
+              </label>
+              {autoEmailOnSuccess && (
+                <div className="flex items-center gap-2 pl-6">
+                  <input
+                    type="email"
+                    value={autoEmailTo}
+                    onChange={(e) => setAutoEmailTo(e.target.value)}
+                    placeholder={t("dataManager.backup.autoEmailPlaceholder")}
+                    className="flex-1 px-2 py-1 text-xs rounded border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-800 text-zinc-800 dark:text-zinc-200"
+                    disabled={!autoEnabled}
+                  />
+                </div>
+              )}
+              <div className="text-[11px] text-zinc-400 pl-6">
+                {t("dataManager.backup.autoEmailHint")}
+              </div>
             </div>
           </div>
 
@@ -1855,10 +2347,15 @@ function BackupSection() {
               onClick={handleSaveAuto}
               disabled={
                 autoSaving ||
-                // 没变化就禁用，避免无意义 sudo 弹框
+                // 没变化就禁用，避免无意义 sudo 弹框：所有可编辑字段都要纳入比对
                 (status !== null &&
                   status.autoBackupRunning === autoEnabled &&
-                  status.autoBackupIntervalHours === autoIntervalHours)
+                  status.autoBackupIntervalHours === autoIntervalHours &&
+                  (status.autoBackupMode ?? "interval") === autoMode &&
+                  (status.autoBackupDailyAt ?? "03:00") === autoDailyAt &&
+                  (status.autoBackupKeepCount ?? 15) === autoKeepCount &&
+                  (status.autoBackupEmailOnSuccess ?? false) === autoEmailOnSuccess &&
+                  (status.autoBackupEmailTo ?? "") === autoEmailTo.trim())
               }
               className={`flex items-center justify-center py-1.5 px-3 rounded-lg text-xs font-medium transition-all ${
                 autoSaving
@@ -2009,7 +2506,10 @@ function BackupSection() {
               {t("dataManager.backup.noBackups")}
             </div>
           ) : (
-            <div className="border border-zinc-200 dark:border-zinc-700 rounded-lg overflow-hidden divide-y divide-zinc-200 dark:divide-zinc-700">
+            // 列表外层加 max-h + overflow-y-auto：当备份数量增长（保留可达 100）时
+            // 不会无限撑长把"邮件通道(SMTP)"折叠卡顶到屏幕外，改成内部滚动。
+            // 高度 ~7 行（每行 ≈56px）≈ 400px，与 SettingsModal 体感一致。
+            <div className="border border-zinc-200 dark:border-zinc-700 rounded-lg divide-y divide-zinc-200 dark:divide-zinc-700 max-h-[400px] overflow-y-auto">
               {backups.map((b) => (
                 <div key={b.filename} className="flex items-center gap-3 px-3 py-2 bg-white dark:bg-zinc-900/60 hover:bg-zinc-50 dark:hover:bg-zinc-800/40">
                   <div className="flex-1 min-w-0">

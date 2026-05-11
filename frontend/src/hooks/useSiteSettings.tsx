@@ -6,6 +6,10 @@ export interface SiteConfig {
   title: string;
   favicon: string;
   editorFontFamily: string; // 空串=默认(Inter), 自定义字体 id, 或内置字体名
+  // 注：v6 起，"个人空间导出/导入"不再是站点级全站开关；它已下沉为 users 表
+  // 的 personalExportEnabled / personalImportEnabled 两列，由管理员在
+  // 「用户管理 → 编辑用户」里为每个用户独立控制。消费方（Sidebar、DataManager）
+  // 请读当前登录用户自己（api.getMe() 的返回）上的这两字段，不要再从这里读。
 }
 
 const DEFAULT_CONFIG: SiteConfig = {
@@ -46,7 +50,7 @@ const SiteSettingsContext = createContext<SiteSettingsContextValue>({
  *
  * 历史坑点（2026-04 修复）：
  *  1. index.html 里同时存在 `<link rel="icon">`、`<link rel="alternate icon">`、
- *     `<link rel="apple-touch-icon">`。以前只更新第一个，其他继续指向旧 URL，
+ *     `<link rel="apple-touch-icon">`。以前只更新第一个，其他继续指向旧 URL,
  *     浏览器可能回退到 `alternate icon` → 看起来"换了没生效"。
  *  2. 直接改 `link.href` 时，浏览器常常复用已缓存的 favicon 不刷新。稳妥做法
  *     是 **移除旧节点、新建节点**，这样浏览器必须重新发起解析。

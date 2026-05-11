@@ -889,6 +889,13 @@ function AppearancePanel() {
             ))}
           </div>
         </div>
+
+        {/*
+         * 个人空间导入/导出的功能开关已下沉为 per-user 字段
+         * （users.personalExportEnabled / personalImportEnabled，schema v6 起）。
+         * 现在管理员需要在「用户管理」tab 里逐个用户编辑，不再是站点级全局开关。
+         * 这里历史上的 FeatureTogglesSection 已整体移除。
+         */}
       </div>
     </div>
   );
@@ -909,6 +916,15 @@ const SettingsModal = React.forwardRef<HTMLDivElement, SettingsModalProps>(
     return () => { cancelled = true; };
   }, []);
 
+  // 监听"DataManager 完成导入后请求关闭弹窗"事件——用户在 DataManager 里
+  // 把笔记导入到 ≠ 当前侧边栏的工作区，点击"切换到该工作区查看"按钮后，需要
+  // 把这层 Modal 也关掉，否则切到目标工作区但弹窗仍盖住主界面，体感很奇怪。
+  useEffect(() => {
+    const onCloseRequest = () => onClose();
+    window.addEventListener("nowen:close-settings", onCloseRequest);
+    return () => window.removeEventListener("nowen:close-settings", onCloseRequest);
+  }, [onClose]);
+
   const isAdmin = currentUser?.role === "admin";
 
   const SETTING_TABS = [
@@ -916,9 +932,13 @@ const SettingsModal = React.forwardRef<HTMLDivElement, SettingsModalProps>(
     { id: "ai" as const, label: t('settings.ai'), icon: Bot },
     { id: "security" as const, label: t('settings.security'), icon: Shield },
     ...(isAdmin ? [{ id: "users" as const, label: t('settings.users'), icon: Users }] : []),
-    // 「数据管理」内部已用二级 tab 拆出「数据库」子页（即 DataFileSection：磁盘
-    // 占用 / 数据库导入导出 / 清理孤儿 / VACUUM），无需在顶层再开一个独立面板，
-    // 否则会与 dataManagement → database 子 tab 内容完全重复，引发用户困惑。
+    // 「数据管理」面板：
+    //   - 管理员：展示三个一级 tab（个人空间 / 工作区 / 系统），包含跨用户/全库范围
+    //     的高危操作（备份、灾难恢复、工厂重置、SQLite 文件级导入导出等）；
+    //   - 普通用户：DataManager 内部只渲染"个人空间"scope 的导出/导入 —— 这是
+    //     用户对自己数据的基本自主权。是否可用再叠加后端下发的 feature flag
+    //     （personalExport/Import Enabled），由管理员集中控制。
+    //   组件内部也做了一层防御性闸门，防止用户从深链绕过这里直达 admin-only 区域。
     { id: "data" as const, label: t('settings.dataManagement'), icon: Database },
     { id: "about" as const, label: t('about.title'), icon: Info },
   ];
@@ -1093,6 +1113,8 @@ const SettingsModal = React.forwardRef<HTMLDivElement, SettingsModalProps>(
                   {activeTab === "ai" && <AISettingsPanel />}
                   {activeTab === "security" && <SecuritySettings />}
                   {activeTab === "users" && isAdmin && <UserManagement currentUserId={currentUser?.id ?? null} />}
+                  {/* data tab 对所有用户可见：DataManager 内部会按 isAdmin 自动分流
+                       —— 管理员看到完整三 scope；普通用户只看"个人空间"的导出/导入。 */}
                   {activeTab === "data" && <DataManager />}
                   {activeTab === "about" && <AboutPanel />}
                 </PanelErrorBoundary>

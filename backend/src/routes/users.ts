@@ -137,13 +137,19 @@ users.get("/", requireAdmin, (c) => {
   const rows = db
     .prepare(
       `SELECT id, username, email, displayName, avatarUrl, role, isDisabled,
+              personalExportEnabled, personalImportEnabled,
               createdAt, updatedAt, lastLoginAt,
               (SELECT COUNT(*) FROM notes n WHERE n.userId = users.id AND n.isTrashed = 0) as noteCount,
               (SELECT COUNT(*) FROM notebooks nb WHERE nb.userId = users.id) as notebookCount
        FROM users ${where}
        ORDER BY createdAt ASC`,
     )
-    .all(...params);
+    .all(...params) as Array<Record<string, any>>;
+  // 把 0/1 归一化成布尔，和前端类型对齐；同时兼容可能为空（虽然 DEFAULT 1 保证了非空）。
+  for (const r of rows) {
+    r.personalExportEnabled = r.personalExportEnabled !== 0;
+    r.personalImportEnabled = r.personalImportEnabled !== 0;
+  }
   return c.json(rows);
 });
 
@@ -202,10 +208,16 @@ users.post("/", requireAdmin, async (c) => {
 
   const user = db
     .prepare(
-      `SELECT id, username, email, displayName, avatarUrl, role, isDisabled, createdAt, updatedAt, lastLoginAt
+      `SELECT id, username, email, displayName, avatarUrl, role, isDisabled,
+              personalExportEnabled, personalImportEnabled,
+              createdAt, updatedAt, lastLoginAt
        FROM users WHERE id = ?`,
     )
-    .get(id);
+    .get(id) as Record<string, any> | undefined;
+  if (user) {
+    user.personalExportEnabled = user.personalExportEnabled !== 0;
+    user.personalImportEnabled = user.personalImportEnabled !== 0;
+  }
 
   // M6: 审计日志
   logAudit(
@@ -316,6 +328,24 @@ users.patch("/:id", requireAdmin, async (c) => {
     if (disabled && !target.isDisabled) nowDisabled = true;
   }
 
+  // 方案 B：个人空间导出 / 导入开关改为 per-user，由管理员在「编辑用户」弹窗里切换。
+  //   - 非高危字段：不要求 sudo、不 bump tokenVersion——避免日常勾选被拦住。
+  //   - 管理员对自己的两列若置 0，业务层（routes/export.ts 的闸门）仍会因 role=admin
+  //     而无条件放行，确保管理员永远保有数据救援能力。
+  //   - 用 INTEGER 存 0/1，这里按 truthy 归一化：支持 boolean、0/1、"true"/"false"。
+  const toInt01 = (v: unknown): 0 | 1 => {
+    if (v === false || v === 0 || v === "false" || v === "0") return 0;
+    return 1;
+  };
+  if (body.personalExportEnabled !== undefined) {
+    fields.push("personalExportEnabled = ?");
+    params.push(toInt01(body.personalExportEnabled));
+  }
+  if (body.personalImportEnabled !== undefined) {
+    fields.push("personalImportEnabled = ?");
+    params.push(toInt01(body.personalImportEnabled));
+  }
+
   if (fields.length === 0) return c.json({ error: "没有可更新的字段" }, 400);
 
   // C3: 禁用用户 / 角色变更 时，bump tokenVersion 让其所有旧 JWT 立即失效
@@ -376,10 +406,16 @@ users.patch("/:id", requireAdmin, async (c) => {
 
   const user = db
     .prepare(
-      `SELECT id, username, email, displayName, avatarUrl, role, isDisabled, createdAt, updatedAt, lastLoginAt
+      `SELECT id, username, email, displayName, avatarUrl, role, isDisabled,
+              personalExportEnabled, personalImportEnabled,
+              createdAt, updatedAt, lastLoginAt
        FROM users WHERE id = ?`,
     )
-    .get(targetId);
+    .get(targetId) as Record<string, any> | undefined;
+  if (user) {
+    user.personalExportEnabled = user.personalExportEnabled !== 0;
+    user.personalImportEnabled = user.personalImportEnabled !== 0;
+  }
   return c.json(user);
 });
 

@@ -6,6 +6,15 @@ export interface User {
   displayName?: string | null;
   role?: "admin" | "user";
   isDisabled?: 0 | 1 | number;
+  /**
+   * 个人空间导出/导入开关（v6 per-user 开关，从原来的全站 system_settings 下沉）。
+   *   - 由管理员在「用户管理 → 编辑用户」里为每个用户独立控制；
+   *   - 管理员本人不受此开关约束，后端 export 路由对 role=admin 无条件放行；
+   *   - /api/me 和 /api/users（列表）都会返回布尔值；旧接口若缺失（老后端），
+   *     前端应兜底视作 true 以维持原行为。
+   */
+  personalExportEnabled?: boolean;
+  personalImportEnabled?: boolean;
   createdAt: string;
   updatedAt?: string;
   lastLoginAt?: string | null;

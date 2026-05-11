@@ -400,10 +400,24 @@ app.get("/api/me", (c) => {
   const userId = c.req.header("X-User-Id");
   const user = db
     .prepare(
-      "SELECT id, username, email, avatarUrl, displayName, role, createdAt FROM users WHERE id = ?",
+      `SELECT id, username, email, avatarUrl, displayName, role,
+              personalExportEnabled, personalImportEnabled,
+              createdAt
+       FROM users WHERE id = ?`,
     )
     .get(userId) as any;
-  if (user && !user.role) user.role = "user";
+  if (user) {
+    if (!user.role) user.role = "user";
+    // v6：把 users.personalExport/ImportEnabled 以 boolean 形式下发，
+    // 前端 Sidebar / DataManager 直接按布尔判定 UI 可见性。
+    // 即使列缺失（例如旧库迁移失败），也兜底为 true，保持与 DEFAULT 1 一致。
+    user.personalExportEnabled = user.personalExportEnabled === undefined
+      ? true
+      : user.personalExportEnabled !== 0;
+    user.personalImportEnabled = user.personalImportEnabled === undefined
+      ? true
+      : user.personalImportEnabled !== 0;
+  }
   return c.json(user);
 });
 
@@ -477,7 +491,8 @@ try {
   const mgr = getBackupManager();
   const cfg = mgr.readEffectiveAutoConfig();
   if (cfg.enabled) {
-    mgr.startAutoBackup(cfg.intervalHours, { persist: false });
+    // 用对象签名传完整配置，让 mode/dailyAt/keepCount/邮件设置在重启后能恢复
+    mgr.startAutoBackup(cfg, { persist: false });
   } else {
     console.log("[Backup] 自动备份已禁用（system_settings 或 ENV 配置）");
   }

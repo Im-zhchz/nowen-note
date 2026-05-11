@@ -60,6 +60,15 @@ export interface ImportOptions {
   duplicateStrategy?: "merge" | "unique";
   /** perFileNotebook 启用时，清洗后为空的回退名 */
   fallbackNotebookName?: string;
+  /**
+   * 显式指定导入目标 workspace。
+   * - undefined → 走 api 默认（即当前激活工作区）
+   * - "personal" → 落到个人空间（notes.workspaceId 写 NULL）
+   * - <workspaceId> → 落到指定工作区
+   * 与 exportAllNotes 的 workspaceId 选项配对：DataManager 拆分"个人空间 / 工作区"
+   * Tab 后，每个 Tab 各自传 scope，避免依赖侧边栏当前选中的 workspace。
+   */
+  workspaceId?: string;
 }
 
 export type ImportProgress = {
@@ -773,7 +782,7 @@ export async function importNotes(
       return note;
     });
 
-    const result = await api.importNotes(notes, notebookId);
+    const result = await api.importNotes(notes, notebookId, undefined, options?.workspaceId);
 
     onProgress?.({
       phase: "done",

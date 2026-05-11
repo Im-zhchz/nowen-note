@@ -536,9 +536,23 @@ function handleOfflineEnqueue<T>(url: string, method: string, bodyStr?: string):
 
 export const api = {
   // Public (no auth required)
-  getSiteSettingsPublic: async (): Promise<{ site_title: string; site_favicon: string; editor_font_family: string }> => {
+  getSiteSettingsPublic: async (): Promise<{
+    site_title: string;
+    site_favicon: string;
+    editor_font_family: string;
+    // 功能开关（字符串 "true"/"false"，未写过时 DEFAULTS 保证为 "true"）
+    feature_personal_export_enabled?: string;
+    feature_personal_import_enabled?: string;
+  }> => {
     const res = await fetch(`${getBaseUrl()}/settings`);
-    if (!res.ok) return { site_title: "nowen-note", site_favicon: "", editor_font_family: "" };
+    if (!res.ok)
+      return {
+        site_title: "nowen-note",
+        site_favicon: "",
+        editor_font_family: "",
+        feature_personal_export_enabled: "true",
+        feature_personal_import_enabled: "true",
+      };
     return res.json();
   },
 
@@ -627,7 +641,19 @@ export const api = {
   ) => request<User>("/users", { method: "POST", body: JSON.stringify(data), sudoToken }),
   adminUpdateUser: (
     id: string,
-    data: Partial<{ username: string; email: string | null; displayName: string | null; role: "admin" | "user"; isDisabled: boolean }>,
+    data: Partial<{
+      username: string;
+      email: string | null;
+      displayName: string | null;
+      role: "admin" | "user";
+      isDisabled: boolean;
+      /**
+       * v6 per-user 开关：个人空间导出 / 导入。
+       * 非高危字段——后端 PATCH /users/:id 对这两列不要求 sudo，也不 bump tokenVersion。
+       */
+      personalExportEnabled: boolean;
+      personalImportEnabled: boolean;
+    }>,
     sudoToken?: string,
   ) => request<User>(`/users/${id}`, { method: "PATCH", body: JSON.stringify(data), sudoToken }),
   adminResetUserPassword: (id: string, newPassword: string, sudoToken?: string) =>
@@ -935,21 +961,53 @@ export const api = {
     request<{ success: boolean }>("/auth/logout", { method: "POST" }).catch(() => ({ success: false })),
 
   // Export / Import
-  getExportNotes: () => request<any[]>("/export/notes"),
+  // 与其它集合接口（notes / notebooks / tasks 等）保持一致：
+  //   - personal 不带 workspaceId（后端按 NULL 落盘 / 过滤）
+  //   - workspace 带 ?workspaceId=<uuid>
+  // 调用方也可以显式传 workspaceId 覆盖（DataManager 拆"个人空间 / 工作区" Tab 后会用到）。
+  getExportNotes: (workspaceId?: string) => {
+    const ws = workspaceId ?? getCurrentWorkspace();
+    const qs = ws && ws !== "personal" ? `?workspaceId=${encodeURIComponent(ws)}` : "";
+    return request<any[]>(`/export/notes${qs}`);
+  },
   importNotes: (
     notes: { title: string; content: string; contentText: string; createdAt?: string; updatedAt?: string; notebookName?: string; notebookPath?: string[] }[],
     notebookId?: string,
     notebookName?: string,
-  ) =>
-    request<{ success: boolean; count: number; notebookId: string; notebookIds?: string[]; notes: any[] }>("/export/import", {
+    workspaceId?: string,
+  ) => {
+    const ws = workspaceId ?? getCurrentWorkspace();
+    const qs = ws && ws !== "personal" ? `?workspaceId=${encodeURIComponent(ws)}` : "";
+    return request<{ success: boolean; count: number; notebookId: string; notebookIds?: string[]; notes: any[]; workspaceId?: string | null }>(`/export/import${qs}`, {
       method: "POST",
       body: JSON.stringify({ notes, notebookId, notebookName }),
-    }),
+    });
+  },
 
   // Site Settings
-  getSiteSettings: () => request<{ site_title: string; site_favicon: string; editor_font_family: string }>("/settings"),
-  updateSiteSettings: (data: { site_title?: string; site_favicon?: string; editor_font_family?: string }) =>
-    request<{ site_title: string; site_favicon: string; editor_font_family: string }>("/settings", {
+  getSiteSettings: () =>
+    request<{
+      site_title: string;
+      site_favicon: string;
+      editor_font_family: string;
+      feature_personal_export_enabled?: string;
+      feature_personal_import_enabled?: string;
+    }>("/settings"),
+  updateSiteSettings: (data: {
+    site_title?: string;
+    site_favicon?: string;
+    editor_font_family?: string;
+    // 布尔值或 "true"/"false" 字符串；后端做归一化
+    feature_personal_export_enabled?: boolean | string;
+    feature_personal_import_enabled?: boolean | string;
+  }) =>
+    request<{
+      site_title: string;
+      site_favicon: string;
+      editor_font_family: string;
+      feature_personal_export_enabled?: string;
+      feature_personal_import_enabled?: string;
+    }>("/settings", {
       method: "PUT",
       body: JSON.stringify(data),
     }),
@@ -1951,6 +2009,12 @@ export const api = {
         degraded: boolean;
         autoBackupRunning: boolean;
         autoBackupIntervalHours: number;
+        autoBackupMode?: "interval" | "daily";
+        autoBackupDailyAt?: string;
+        autoBackupKeepCount?: number;
+        autoBackupEmailOnSuccess?: boolean;
+        autoBackupEmailTo?: string;
+        autoBackupNextRunAt?: string | null;
         hoursSinceLastSuccess: number | null;
         backupDir: string;
         dataDir: string;
@@ -2047,13 +2111,41 @@ export const api = {
     /**
      * 启停自动备份（管理员 + sudo）
      *
-     * 后端会把 {enabled, intervalHours} 持久化到 system_settings.backup:auto，
-     * 重启后由 BackupManager.readEffectiveAutoConfig 读取并按需启动。
+     * 后端把全量配置持久化到 system_settings.backup:auto，重启后由
+     * BackupManager.readEffectiveAutoConfig 读取并按需启动。
+     *
+     * 旧签名 setAuto(enabled, intervalHours, sudoToken) 仍可用——
+     * 新增的 mode/dailyAt/keepCount/email* 缺省时由后端走默认值。
      */
-    setAuto: (enabled: boolean, intervalHours?: number, sudoToken?: string) =>
-      request<{ success: true; message: string; enabled: boolean; intervalHours: number }>(
+    setAuto: (
+      enabled: boolean,
+      intervalHours?: number,
+      sudoToken?: string,
+      extra?: {
+        mode?: "interval" | "daily";
+        dailyAt?: string;
+        keepCount?: number;
+        emailOnSuccess?: boolean;
+        emailTo?: string;
+      },
+    ) =>
+      request<{
+        success: true;
+        message: string;
+        enabled: boolean;
+        intervalHours: number;
+        mode?: "interval" | "daily";
+        dailyAt?: string;
+        keepCount?: number;
+        emailOnSuccess?: boolean;
+        emailTo?: string;
+      }>(
         "/backups/auto",
-        { method: "POST", body: JSON.stringify({ enabled, intervalHours }), sudoToken },
+        {
+          method: "POST",
+          body: JSON.stringify({ enabled, intervalHours, ...(extra || {}) }),
+          sudoToken,
+        },
       ),
 
     /** 删除一份备份（管理员 + sudo） */

@@ -2,34 +2,137 @@ import { Hono } from "hono";
 import { getDb } from "../db/schema";
 import { extractInlineBase64Images } from "./attachments";
 import { broadcastToUser } from "../services/realtime";
+import { isSystemAdmin } from "../middleware/acl";
 
 const app = new Hono();
 
-// 获取所有笔记（含完整内容）+ 笔记本信息，用于前端打包导出
+/**
+ * 个人空间导出/导入开关闸门（方案 B：per-user）。
+ *
+ * 历史（v5 及以前）：
+ *   这两个开关保存在 system_settings 的 `feature_personal_export_enabled` /
+ *   `feature_personal_import_enabled` 两个全局键里——"要么全站开、要么全站关"。
+ *
+ * 现在（v6 之后）：
+ *   开关下沉为 users 表的两列（personalExportEnabled / personalImportEnabled），
+ *   由管理员在「用户管理 → 编辑用户」里逐个切换。这里按目标 userId 直接读它
+ *   自己的行，没有记录时按"开启"兜底（理论上 DEFAULT 1 已保证非空）。
+ *
+ * 设计约束：
+ *  - 仅当目标是"个人空间"（workspaceFilter 解出的 param === null）时才检查；
+ *    工作区的导出/导入沿用各自的成员权限语义，不受该开关影响。
+ *  - 系统管理员不受开关约束（管理员需要随时具备数据救援能力，即使管理员自己的
+ *    两列被误置为 0 也能兜底放行）。
+ *  - 普通用户在开关关闭时返回 403，并附 code=FEATURE_DISABLED，便于前端
+ *    定位文案与隐藏入口。
+ */
+function denyIfPersonalFeatureDisabled(
+  userId: string,
+  isPersonalScope: boolean,
+  feature: "personalExportEnabled" | "personalImportEnabled",
+): { error: string; code: string } | null {
+  if (!isPersonalScope) return null;
+  if (isSystemAdmin(userId)) return null;
+
+  try {
+    const db = getDb();
+    const row = db
+      .prepare(
+        `SELECT personalExportEnabled, personalImportEnabled FROM users WHERE id = ?`,
+      )
+      .get(userId) as
+      | { personalExportEnabled: number; personalImportEnabled: number }
+      | undefined;
+    // 用户不存在 / 读库异常按"放行"兜底——让真正的权限问题交给上层中间件去拦，
+    // 这里不要因 DB 抖动造成导出入口意外报 403。
+    if (!row) return null;
+    const enabled = row[feature] !== 0;
+    if (enabled) return null;
+  } catch {
+    return null;
+  }
+
+  return {
+    error:
+      feature === "personalExportEnabled"
+        ? "管理员已禁用你的个人空间导出功能"
+        : "管理员已禁用你的个人空间导入功能",
+    code: "FEATURE_DISABLED",
+  };
+}
+
+/**
+ * 解析 query 里的 workspaceId 为 SQLite 过滤条件。
+ *   - 缺省 / "personal" → 个人空间（notes.workspaceId IS NULL）
+ *   - 其它字符串       → 指定工作区（notes.workspaceId = ?）
+ *
+ * 返回 { sql, param }：sql 片段用于拼到 WHERE 后；param 为对应参数（NULL 时 undefined）。
+ *
+ * 注意：与 notes/notebooks/tasks 等业务接口的隔离语义保持一致——前端 personal 不带
+ * 参数、workspace 带 `?workspaceId=<uuid>`。
+ */
+function workspaceFilter(raw: string | undefined): { sql: string; param: string | null } {
+  const ws = (raw || "").trim();
+  if (!ws || ws === "personal") {
+    return { sql: "AND n.workspaceId IS NULL", param: null };
+  }
+  return { sql: "AND n.workspaceId = ?", param: ws };
+}
+
+// 获取笔记（含完整内容）+ 笔记本信息，用于前端打包导出
+//   - 默认按 personal（workspaceId IS NULL）
+//   - 传 ?workspaceId=<uuid> 时按指定工作区过滤
 app.get("/notes", (c) => {
   const db = getDb();
   const userId = c.req.header("X-User-Id")!;
+  const wsRaw = c.req.query("workspaceId") ?? undefined;
+  const { sql: wsSql, param: wsParam } = workspaceFilter(wsRaw);
+
+  // 闸门：个人空间导出——按当前用户的 users.personalExportEnabled 判定（方案 B）
+  const denied = denyIfPersonalFeatureDisabled(
+    userId,
+    wsParam === null,
+    "personalExportEnabled",
+  );
+  if (denied) return c.json(denied, 403);
 
   // 注意：必须同时返回 notebookId。
   //   前端 "按笔记本导出（含子孙）" 依赖 notebookId 过滤；如果只给 notebookName，
   //   同名子笔记本在不同父目录下会混淆，且重命名/移动后无法准确识别归属。
-  const notes = db.prepare(`
+  const stmt = db.prepare(`
     SELECT n.id, n.title, n.content, n.contentText, n.createdAt, n.updatedAt,
            n.notebookId as notebookId,
            nb.name as notebookName
     FROM notes n
     LEFT JOIN notebooks nb ON n.notebookId = nb.id
     WHERE n.userId = ? AND n.isTrashed = 0
+      ${wsSql}
     ORDER BY nb.name, n.title
-  `).all(userId);
+  `);
+  const notes = wsParam === null ? stmt.all(userId) : stmt.all(userId, wsParam);
 
   return c.json(notes);
 });
 
 // 导入笔记（批量）
+//   - 默认按 personal（写入 notes.workspaceId = NULL，notebooks 也按 NULL 域查找/创建）
+//   - 传 ?workspaceId=<uuid> 时所有新笔记和新笔记本都落到该工作区
 app.post("/import", async (c) => {
   const db = getDb();
   const userId = c.req.header("X-User-Id")!;
+  const wsRaw = c.req.query("workspaceId") ?? undefined;
+  // 工作区参数：personal/空 → null（写库时也是 NULL），否则保持字符串
+  const targetWs: string | null =
+    !wsRaw || wsRaw.trim() === "" || wsRaw.trim() === "personal" ? null : wsRaw.trim();
+
+  // 闸门：个人空间导入——按当前用户的 users.personalImportEnabled 判定（方案 B）
+  const denied = denyIfPersonalFeatureDisabled(
+    userId,
+    targetWs === null,
+    "personalImportEnabled",
+  );
+  if (denied) return c.json(denied, 403);
+
   const body = await c.req.json();
   const { notes, notebookId, notebookName } = body as {
     notes: {
@@ -51,33 +154,44 @@ app.post("/import", async (c) => {
 
   const { v4: uuid } = require("uuid");
 
-  // 笔记本名 -> id 的缓存（用户维度）
+  // 笔记本名 -> id 的缓存（用户 + workspaceId 维度；不同空间不共享）
   const nbCache = new Map<string, string>();
+
+  // 工作区比较：notebooks.workspaceId 也用 NULL 表示个人空间，IS 比较可同时匹配。
+  const findNbByName = db.prepare(
+    "SELECT id FROM notebooks WHERE userId = ? AND name = ? AND workspaceId IS ?"
+  );
+  const insertNbByName = db.prepare(
+    "INSERT INTO notebooks (id, userId, name, icon, workspaceId) VALUES (?, ?, ?, ?, ?)"
+  );
 
   const getOrCreateNotebookByName = (name: string, icon = "📥"): string => {
     const key = name.trim() || "导入的笔记";
     const cached = nbCache.get(key);
     if (cached) return cached;
-    const existing = db.prepare(
-      "SELECT id FROM notebooks WHERE userId = ? AND name = ?"
-    ).get(userId, key) as { id: string } | undefined;
+    const existing = findNbByName.get(userId, key, targetWs) as { id: string } | undefined;
     if (existing) {
       nbCache.set(key, existing.id);
       return existing.id;
     }
     const id = uuid();
-    db.prepare(
-      "INSERT INTO notebooks (id, userId, name, icon) VALUES (?, ?, ?, ?)"
-    ).run(id, userId, key, icon);
+    insertNbByName.run(id, userId, key, icon, targetWs);
     nbCache.set(key, id);
     return id;
   };
 
   /**
    * 按层级路径（从根到叶）查找或创建笔记本，返回叶级 id。
-   * 匹配规则：`(userId, parentId, name)` 唯一；每级都复用已存在的同名子笔记本。
+   * 匹配规则：`(userId, workspaceId, parentId, name)` 唯一；每级都复用已存在的同名子笔记本。
    * 空/非法路径返回 null，由调用方回退。
    */
+  const findChild = db.prepare(
+    "SELECT id FROM notebooks WHERE userId = ? AND name = ? AND parentId IS ? AND workspaceId IS ?"
+  );
+  const insertNbWithParent = db.prepare(
+    "INSERT INTO notebooks (id, userId, parentId, name, icon, workspaceId) VALUES (?, ?, ?, ?, ?, ?)"
+  );
+
   const getOrCreateNotebookByPath = (path: string[], icon = "📥"): string | null => {
     const segs = path
       .map((s) => (typeof s === "string" ? s.trim() : ""))
@@ -92,21 +206,14 @@ app.post("/import", async (c) => {
     let parentId: string | null = null;
     let currentId: string | null = null;
 
-    const findChild = db.prepare(
-      "SELECT id FROM notebooks WHERE userId = ? AND name = ? AND parentId IS ?"
-    );
-    const insertNb = db.prepare(
-      "INSERT INTO notebooks (id, userId, parentId, name, icon) VALUES (?, ?, ?, ?, ?)"
-    );
-
     for (const seg of segs) {
-      // better-sqlite3：使用 IS 比较可同时匹配 NULL 和非 NULL 的 parentId
-      const row = findChild.get(userId, seg, parentId) as { id: string } | undefined;
+      // better-sqlite3：使用 IS 比较可同时匹配 NULL 和非 NULL 的 parentId / workspaceId
+      const row = findChild.get(userId, seg, parentId, targetWs) as { id: string } | undefined;
       if (row) {
         currentId = row.id;
       } else {
         const newId = uuid();
-        insertNb.run(newId, userId, parentId, seg, icon);
+        insertNbWithParent.run(newId, userId, parentId, seg, icon, targetWs);
         currentId = newId;
       }
       parentId = currentId;
@@ -118,19 +225,21 @@ app.post("/import", async (c) => {
 
   // 决定"默认笔记本 id"：
   // - 若前端传了 notebookId，则所有笔记都归到该 id（覆盖 note.notebookName）
-  // - 否则若传了全局 notebookName，按该名找/建
+  //   注意：调用方有责任保证该 id 属于目标 workspace；后端不强校验。
+  // - 否则若传了全局 notebookName，按该名找/建（限定在 targetWs 域）
   // - 否则每条 note 若带 notebookName 就按各自名找/建，没带的归到"导入的笔记"
   const explicitFallbackId =
     notebookId ||
     (notebookName && notebookName.trim() ? getOrCreateNotebookByName(notebookName.trim()) : null);
 
+  // INSERT 时显式带 workspaceId，确保新笔记落到指定工作区。
   const insertWithDates = db.prepare(`
-    INSERT INTO notes (id, userId, notebookId, title, content, contentText, createdAt, updatedAt)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO notes (id, userId, notebookId, title, content, contentText, createdAt, updatedAt, workspaceId)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   const insertDefault = db.prepare(`
-    INSERT INTO notes (id, userId, notebookId, title, content, contentText)
-    VALUES (?, ?, ?, ?, ?, ?)
+    INSERT INTO notes (id, userId, notebookId, title, content, contentText, workspaceId)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
   `);
   // 导入后如果发现 content 里有内联 base64 图片，需要再 UPDATE 一次把 src 换成 URL。
   // 这里必须在 INSERT notes 之后才能写 attachments 行（外键依赖），所以走两步。
@@ -168,9 +277,9 @@ app.post("/import", async (c) => {
       if (note.createdAt || note.updatedAt) {
         const createdAt = note.createdAt || new Date().toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, '');
         const updatedAt = note.updatedAt || createdAt;
-        insertWithDates.run(id, userId, targetId, note.title, note.content, note.contentText, createdAt, updatedAt);
+        insertWithDates.run(id, userId, targetId, note.title, note.content, note.contentText, createdAt, updatedAt, targetWs);
       } else {
-        insertDefault.run(id, userId, targetId, note.title, note.content, note.contentText);
+        insertDefault.run(id, userId, targetId, note.title, note.content, note.contentText, targetWs);
       }
 
       // 抽取 content 里的内联 base64 图片为 attachments：
@@ -178,18 +287,12 @@ app.post("/import", async (c) => {
       //     notes.content 撑大到 MB 级，后续 GET 性能崩塌（这是本次改造的根本目的）。
       //   - 短路策略保证"没有内联图"的常规导入完全无额外成本。
       if (note.content && note.content.indexOf("data:image") >= 0) {
-        // workspaceId 从刚插入的 note 行读回，确保附件与笔记同域。
-        // 当前导入链路统一落到个人空间（notes.workspaceId 为 NULL），
-        // 这里读一次让未来若给 INSERT 增加 workspaceId 也无需再改附件抽取。
-        const wsRow = db
-          .prepare("SELECT workspaceId FROM notes WHERE id = ?")
-          .get(id) as { workspaceId: string | null } | undefined;
-        const noteWorkspaceId = wsRow?.workspaceId ?? null;
+        // 附件与笔记同 workspace（targetWs 已决定）。
         const { content: rewritten, replacedCount } = extractInlineBase64Images(
           note.content,
           userId,
           id,
-          noteWorkspaceId,
+          targetWs,
         );
         if (replacedCount > 0) {
           updateContent.run(rewritten, id);
@@ -206,11 +309,13 @@ app.post("/import", async (c) => {
     type: "notes:imported" as any,
     count: imported.length,
     notebookIds: Array.from(usedNotebookIds),
+    workspaceId: targetWs,
   });
 
   return c.json({
     success: true,
     count: imported.length,
+    workspaceId: targetWs,
     // 向后兼容：若仅写入一个笔记本，直接返回 id；否则返回首个
     notebookId: explicitFallbackId || imported[0]?.notebookId,
     notebookIds: Array.from(usedNotebookIds),

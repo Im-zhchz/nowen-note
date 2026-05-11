@@ -356,6 +356,61 @@ export const MIGRATIONS: Migration[] = [
       `).run();
     },
   },
+
+  // ==========================================================================
+  // v6：把"个人空间导出/导入"开关从站点级全局下沉为 per-user 字段
+  // --------------------------------------------------------------------------
+  // 背景：
+  //   v5 之前，是否允许普通用户在个人空间导出 / 导入笔记由 system_settings 里的
+  //   `feature_personal_export_enabled` / `feature_personal_import_enabled` 两个
+  //   全局开关控制——"要么全站开、要么全站关"，缺少"对个别用户开、其他用户关"
+  //   的细粒度运维能力。
+  //
+  // 方案 B（per-user）：
+  //   把开关落到 `users` 表的两列，由管理员在「用户管理 → 编辑用户」里逐个切换。
+  //   - 默认值 1（开启），保证存量用户在升级后行为不变。
+  //   - 普通用户不能自行修改这两列（routes/users.ts 的 PATCH 只接受管理员）；
+  //     非高危字段，不走 sudo、不 bump tokenVersion——避免日常运维过度打扰。
+  //   - 旧的全局 feature_* 键保留在 system_settings（不做 DELETE），只是不再被
+  //     读写；让回滚到 v5 代码时依然能读到旧值。
+  //
+  // 回滚：
+  //   回到 v5 时两列仍然存在但不被读写，不会破坏旧版行为。
+  //   如果确实需要把 per-user 开关"广播"回全局，运维可自行根据 users 表的值
+  //   重建 system_settings 里的两个 feature_* 键。
+  //
+  // 幂等性：
+  //   `addColumnIfMissing` 在列已存在时跳过，二次运行无副作用。
+  {
+    version: 6,
+    name: "users-personal-export-import-per-user-toggle",
+    up: (db) => {
+      const addColumnIfMissing = (
+        table: string,
+        column: string,
+        definition: string,
+      ) => {
+        const cols = db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
+        if (cols.length === 0) return;
+        if (cols.some((c) => c.name === column)) return;
+        db.prepare(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`).run();
+      };
+
+      // 1 = 开启；0 = 禁用。管理员账号同样按 users 行的值生效，但业务层
+      // （routes/export.ts 的闸门）会对 role='admin' 的用户无条件放行，
+      // 确保管理员永远保有数据救援能力，不会因"管理员给自己关了"而锁死。
+      addColumnIfMissing(
+        "users",
+        "personalExportEnabled",
+        "INTEGER NOT NULL DEFAULT 1",
+      );
+      addColumnIfMissing(
+        "users",
+        "personalImportEnabled",
+        "INTEGER NOT NULL DEFAULT 1",
+      );
+    },
+  },
 ];
 
 /** 当前代码已知的最高 schema 版本（== MIGRATIONS 里 max(version)）。 */
