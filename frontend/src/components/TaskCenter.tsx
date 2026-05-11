@@ -769,6 +769,21 @@ export default function TaskCenter() {
       const updated = await api.updateTask(id, data);
       setTasks((prev) => prev.map((t) => (t.id === id ? updated : t)));
       if (selectedTask?.id === id) setSelectedTask(updated);
+      // 关键字段（dueDate / priority / isCompleted 等）变化会影响左侧
+      // 「今天 / 未来 7 天 / 已逾期 / 已完成」分组计数，需要同步刷新统计。
+      // 用 affectsStats 判断，避免改个标题/备注也发一次 stats 请求。
+      const affectsStats =
+        "dueDate" in data ||
+        "isCompleted" in data ||
+        "priority" in data;
+      if (affectsStats) {
+        try {
+          const s = await api.getTaskStats();
+          setStats(s);
+        } catch (e) {
+          console.error("Failed to refresh task stats:", e);
+        }
+      }
     } catch (err) {
       console.error("Failed to update task:", err);
     }
