@@ -10,6 +10,9 @@
  *   - sqlite-vec / sqlite-vec-windows-x64 / sqlite-vec-darwin-* / sqlite-vec-linux-*
  *                               平台相关二进制 .so/.dylib/.dll，runtime 探测路径
  *   - bonjour-service           含 multicast-dns 等动态加载的 native-ish 行为
+ *   - unpdf                     纯 ESM 包，内含 pdf.js worker / 字体等资源，
+ *                               业务侧已用 `await import("unpdf")` 动态加载，
+ *                               external 后由运行时 node_modules 直接解析
  *
  * 其他业务依赖（hono, ws, jsonwebtoken, mammoth, jszip, yjs, zod 等）全部 inline 进 bundle。
  */
@@ -34,6 +37,7 @@ const external = [
   "sqlite-vec-darwin-arm64",
   "sqlite-vec-linux-x64",
   "bonjour-service",
+  "unpdf",
 ];
 
 const start = Date.now();
