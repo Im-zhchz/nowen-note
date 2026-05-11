@@ -1142,6 +1142,13 @@ fi
 GEN_CHANGELOG_SCRIPT="${REPO_ROOT}/scripts/generate-changelog.mjs"
 if [ "$BUILD_ONLY" != "1" ] && [ -f "$GEN_CHANGELOG_SCRIPT" ]; then
     info "生成 CHANGELOG / README 区块 / public/changelog.json"
+    # 显式传 --since <上一个 v* tag>，避免 generate-changelog.mjs 在 HEAD 已等同于某个
+    # v* tag（重跑发布 / 版本号回写后的 tag 点上）时，误把更早版本的 commits 再重新
+    # 归入本版 —— 这会导致 README/CHANGELOG 出现巨大的重复分组块（同一个 "✨ 新增"
+    # 连续出现两次）。取"除本版外最大的 v* tag"作为起点最稳妥。
+    LAST_RELEASE_TAG="$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname 2>/dev/null \
+        | grep -v -x "v${VERSION}" \
+        | head -n1 || true)"
     GEN_ARGS=(
         "$GEN_CHANGELOG_SCRIPT"
         --version "$VERSION"
@@ -1149,6 +1156,12 @@ if [ "$BUILD_ONLY" != "1" ] && [ -f "$GEN_CHANGELOG_SCRIPT" ]; then
         --sync-readme
         --emit-json
     )
+    if [ -n "$LAST_RELEASE_TAG" ]; then
+        GEN_ARGS+=( --since "$LAST_RELEASE_TAG" )
+        info "  since tag: ${LAST_RELEASE_TAG}"
+    else
+        info "  since tag: (无历史 tag，回退到全历史)"
+    fi
     if [ "$DRY_RUN" = "1" ]; then
         echo "  (dry-run) node ${GEN_ARGS[*]}"
     else
@@ -2282,9 +2295,16 @@ if [ "$DO_GITHUB_RELEASE" = "1" ]; then
         # 自动生成一份默认说明
         # 优先取 generate-changelog.mjs --section 的输出（本版分组好的 markdown），
         # 失败则退回到原始的 metadata 摘要。
+        # 这里走到时 HEAD 上很可能已经打了 v${VERSION} tag（tag step 在本步前完成），
+        # 所以必须显式传 --since 来绕开 HEAD^ 陷阱，避免把上个版本的 commits 再重复收一遍。
         AUTO_NOTES=""
         if [ -f "$GEN_CHANGELOG_SCRIPT" ]; then
-            CHANGELOG_SECTION="$(node "$GEN_CHANGELOG_SCRIPT" --version "$VERSION" --section 2>/dev/null || true)"
+            NOTES_SINCE_TAG="$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname 2>/dev/null \
+                | grep -v -x "v${VERSION}" \
+                | head -n1 || true)"
+            SECTION_ARGS=( --version "$VERSION" --section )
+            [ -n "$NOTES_SINCE_TAG" ] && SECTION_ARGS+=( --since "$NOTES_SINCE_TAG" )
+            CHANGELOG_SECTION="$(node "$GEN_CHANGELOG_SCRIPT" "${SECTION_ARGS[@]}" 2>/dev/null || true)"
             if [ -n "$CHANGELOG_SECTION" ]; then
                 AUTO_NOTES="$CHANGELOG_SECTION"$'\n\n---\n'
             fi

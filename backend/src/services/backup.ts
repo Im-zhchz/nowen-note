@@ -1411,7 +1411,7 @@ export class BackupManager {
    * @param cfg  完整配置；intervalHours 范围由路由层做了 1~720 校验
    * @param opts.persist  路由触发为 true，启动期按落库值恢复为 false
    */
-  startAutoBackup(cfg: AutoBackupConfig, opts: { persist?: boolean } = {}): void;
+  startAutoBackup(cfg: AutoBackupConfig, opts?: { persist?: boolean }): void;
   /** @deprecated 旧签名，仅保留以兼容历史调用 —— 仅 enabled+intervalHours，mode 强制 interval */
   startAutoBackup(intervalHours: number, opts?: { persist?: boolean }): void;
   startAutoBackup(

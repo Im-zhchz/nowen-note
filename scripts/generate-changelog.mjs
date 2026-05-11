@@ -41,6 +41,7 @@ const REPO_ROOT = path.resolve(__dirname, "..");
 function parseArgs(argv) {
   const args = {
     version: "",
+    since: "",
     write: false,
     section: false,
     syncReadme: false,
@@ -55,6 +56,7 @@ function parseArgs(argv) {
     switch (a) {
       case "-v":
       case "--version":       args.version = argv[++i] || ""; break;
+      case "--since":         args.since = argv[++i] || ""; break;
       case "--write":         args.write = true; break;
       case "--section":       args.section = true; break;
       case "--sync-readme":   args.syncReadme = true; break;
@@ -77,6 +79,8 @@ function printHelp() {
 
 选项:
   -v, --version X.Y.Z   本次要发布的版本号（必填，除非只用 --sync-readme / --emit-json）
+      --since <tag>     起始 tag（commit range = <tag>..HEAD）；release.sh 发版时应显式传入，
+                        避免 HEAD 已落在同名 tag 上时把上一个版本的 commits 重复归入本版
       --write           把本版条目插入 CHANGELOG.md 顶部
       --section         仅输出本版 Markdown 片段到 stdout（用于 GitHub Release notes）
       --sync-readme     用 CHANGELOG.md 的最近 N 版刷新 README.md / README.en.md
@@ -88,7 +92,7 @@ function printHelp() {
 
 示例:
   # 发版时（release.sh 内部调用）
-  node scripts/generate-changelog.mjs --version 1.0.32 --write --sync-readme --emit-json
+  node scripts/generate-changelog.mjs --version 1.0.33 --since v1.0.32 --write --sync-readme --emit-json
 
   # 仅生成本版 Release notes 片段（不写文件）
   node scripts/generate-changelog.mjs --version 1.0.32 --section
@@ -108,14 +112,42 @@ function git(args, opts = {}) {
   }).trim();
 }
 
-function getLastTag() {
+function getLastTag(excludeVersion = "") {
+  // 优先尝试"HEAD^ 之前最近的 v* tag"——大多数情况下它就是上一个版本。
+  // 但如果 HEAD 本身已经打了当前版本 tag（例如重跑 release），HEAD^ 对应的 tag 很可能还是
+  // 当前版本或更前一版的 "v1.0.31"（让 commits 从 v1.0.31..HEAD 又重新收一遍）。
+  // 所以当传入 excludeVersion 时，遇到同名 tag 会继续往前找，保证不会把当前版本
+  // 或更早版本的 commits 再重复归入。
+  const normalize = (v) => String(v || "").replace(/^v/, "");
+  const targetExclude = normalize(excludeVersion);
+
+  const candidates = [];
   try {
-    // describe --tags --abbrev=0 找"最近"的 tag；限制 'v*' 避免别的临时 tag 干扰
-    return git(`describe --tags --abbrev=0 --match 'v*' HEAD^`);
-  } catch {
-    // 没有 tag（首版发布）或 HEAD^ 不存在 → 回退到全历史
-    return "";
+    candidates.push(git(`describe --tags --abbrev=0 --match 'v*' HEAD^`));
+  } catch { /* HEAD^ 不存在 */ }
+  try {
+    const head = git(`describe --tags --abbrev=0 --match 'v*' HEAD`);
+    if (head) candidates.push(head);
+  } catch { /* 无任何 tag */ }
+
+  // 再列出全部 v* tag（按版本倒序），作为兜底
+  try {
+    const all = git(`tag --list 'v*' --sort=-v:refname`);
+    if (all) {
+      for (const line of all.split(/\r?\n/)) {
+        const t = line.trim();
+        if (t) candidates.push(t);
+      }
+    }
+  } catch { /* ignore */ }
+
+  for (const tag of candidates) {
+    if (!tag) continue;
+    if (targetExclude && normalize(tag) === targetExclude) continue;
+    // 返回第一个"非当前版本"的 tag
+    return tag;
   }
+  return "";
 }
 
 function getCommitsSince(sinceTag) {
@@ -411,7 +443,8 @@ function main() {
   let section = "";
   if (args.version) {
     const version = args.version.replace(/^v/, "");
-    const lastTag = getLastTag();
+    // 优先使用显式传入的 --since；否则回退到自动探测（排除当前版本自己的 tag）
+    const lastTag = args.since ? args.since : getLastTag(version);
     const commits = getCommitsSince(lastTag);
     const items = dedupe(commits.map(categorize))
       // 工作流上常有 chore(release): vX.Y.Z 这种自动 commit，归到 other 里也显得噪音，直接剔掉
