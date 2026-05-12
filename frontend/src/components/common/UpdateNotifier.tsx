@@ -87,6 +87,38 @@ const CLIENT_BUILD_ID: string | null = detectClientBuildId();
 const POLL_INTERVAL_MS = 5 * 60 * 1000;
 const DISMISS_KEY = "nowen-update-dismissed-version";
 
+/**
+ * dismiss 的读写。
+ *
+ * 历史：原本只写 sessionStorage，关 tab 即失效——这是对的，因为发版很频繁，
+ * 不希望旧 dismiss 永久压住新提示。
+ *
+ * 现状不够用的两个场景：
+ *   1) 用户点"刷新"：仅 reload()，没记 dismiss。如果刷新后版本依然不一致
+ *      （典型：dev/leading 版本本地 v1.0.36 而服务器 v1.0.32），就会再弹，
+ *      用户感觉"按了刷新没用"。
+ *   2) 用户在多 tab 工作：A tab dismiss，B tab 仍弹，体感像"关不掉"。
+ *
+ * 解决：dismiss 同时写 sessionStorage（向后兼容老逻辑）和 localStorage
+ * （跨 tab、跨会话生效）；读取时取两者较新的那个。下一次 server.appVersion
+ * 真的变化（=新发版）时，dismiss key 自然失效，提示能力不会被永久关闭。
+ */
+function readDismissed(): string | null {
+  try {
+    const ls = localStorage.getItem(DISMISS_KEY);
+    if (ls) return ls;
+  } catch { /* ignore */ }
+  try {
+    return sessionStorage.getItem(DISMISS_KEY);
+  } catch {
+    return null;
+  }
+}
+function writeDismissed(key: string) {
+  try { sessionStorage.setItem(DISMISS_KEY, key); } catch { /* ignore */ }
+  try { localStorage.setItem(DISMISS_KEY, key); } catch { /* ignore */ }
+}
+
 // Android native 壳的 APK 下载页（落在 GitHub release 页，最稳）
 const APK_DOWNLOAD_URL = "https://github.com/cropflre/nowen-note/releases/latest";
 
@@ -125,13 +157,7 @@ export default function UpdateNotifier() {
     frontendBuildId?: string;
     minClientVersion?: string;
   } | null>(null);
-  const [dismissed, setDismissed] = useState<string | null>(() => {
-    try {
-      return sessionStorage.getItem(DISMISS_KEY);
-    } catch {
-      return null;
-    }
-  });
+  const [dismissed, setDismissed] = useState<string | null>(() => readDismissed());
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const check = useCallback(async () => {
@@ -209,6 +235,16 @@ export default function UpdateNotifier() {
       return { kind: "none", serverDisplay: "" };
     }
 
+    // 客户端版本号 > 服务端：典型 dev/leading 场景（例如本地 v1.0.36 vs
+    // 线上 v1.0.32）。刷新多少次 bundle 都不会让本地 "降级" 到低版本，
+    // 此时提示对用户完全无意义，只会反复骚扰。直接静默。
+    if (
+      CLIENT_VERSION !== "0.0.0" &&
+      compareVersions(CLIENT_VERSION, serverApp) > 0
+    ) {
+      return { kind: "none", serverDisplay: "" };
+    }
+
     // 走到这里说明 appVersion 真的不同 → 提示
     const buildKey =
       serverInfo.frontendBuildId && CLIENT_BUILD_ID && serverInfo.frontendBuildId !== CLIENT_BUILD_ID
@@ -227,7 +263,26 @@ export default function UpdateNotifier() {
 
   if (state.kind === "none") return null;
 
+  /**
+   * 计算当前这对 (server, client) 版本差异对应的 dismiss key。
+   * 规则与 state 计算里保持一致：appVersion 为主、buildId 仅作为 "同版本号不同
+   * bundle" 的精细去重维度。抽成函数后 handleReload / handleDismiss 共用，保证
+   * 两处行为一致。
+   */
+  const computeDismissKey = useCallback((): string | null => {
+    if (!serverInfo) return null;
+    const buildKey =
+      serverInfo.frontendBuildId && CLIENT_BUILD_ID && serverInfo.frontendBuildId !== CLIENT_BUILD_ID
+        ? `build:${serverInfo.frontendBuildId}`
+        : null;
+    return buildKey ?? serverInfo.appVersion ?? null;
+  }, [serverInfo]);
+
   const handleReload = () => {
+    // 先记 dismiss：刷新后如果版本差异依旧存在（后端没推新 bundle、或本地是
+    // leading 版本），就不会立刻又弹出——用户点"刷新"的意图已经被尊重过一次。
+    const key = computeDismissKey();
+    if (key) writeDismissed(key);
     try {
       window.location.reload();
     } catch {
@@ -241,17 +296,9 @@ export default function UpdateNotifier() {
     // 所以 dismiss key 至少能拿到一个稳定的服务器版本号；buildId 只在两边
     // 都有且不同时作为更精细的去重维度，避免"同版本号下 bundle 微变"也被
     // 一次 dismiss 永久压住。
-    if (!serverInfo) return;
-    const buildKey =
-      serverInfo.frontendBuildId && CLIENT_BUILD_ID && serverInfo.frontendBuildId !== CLIENT_BUILD_ID
-        ? `build:${serverInfo.frontendBuildId}`
-        : null;
-    const key = buildKey ?? serverInfo.appVersion;
-    try {
-      sessionStorage.setItem(DISMISS_KEY, key);
-    } catch {
-      /* ignore */
-    }
+    const key = computeDismissKey();
+    if (!key) return;
+    writeDismissed(key);
     setDismissed(key);
   };
 

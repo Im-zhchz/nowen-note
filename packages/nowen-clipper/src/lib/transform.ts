@@ -215,10 +215,16 @@ export function buildContentBundle(params: {
     : "";
 
   // 附录：来源 + 标签
+  // 来源行设计：
+  //   - 始终展示完整 URL 作为链接文本（方便用户一眼看到具体页面，而不是只看到站点名）；
+  //   - siteName 不为空时作为前缀的"站点标签"放在 URL 前，便于扫读；
+  //   - target=_blank + rel 让点击在新页签打开，避免跳出当前笔记页面；
+  //   - word-break:break-all 防止长 URL 撑爆容器、被截断成 "..."。
   const footerParts: string[] = [];
   if (includeSource) {
+    const sitePrefix = siteName ? `${escapeText(siteName)} · ` : "";
     footerParts.push(
-      `<hr/>\n<p><small>📎 来源：<a href="${escapeAttr(sourceUrl)}">${escapeText(siteName || sourceUrl)}</a></small></p>`,
+      `<hr/>\n<p><small>📎 来源：${sitePrefix}<a href="${escapeAttr(sourceUrl)}" target="_blank" rel="noopener noreferrer" style="word-break:break-all;">${escapeText(sourceUrl)}</a></small></p>`,
     );
   }
   if (tags.length > 0) {

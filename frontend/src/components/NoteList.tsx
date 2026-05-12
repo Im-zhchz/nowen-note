@@ -380,6 +380,151 @@ function MoveNoteModal({
   );
 }
 
+/* ===== AI 批量归类确认面板 =====
+ * 用途：批量 "AI 归类" 按钮扫描出建议后，弹此面板让用户人工确认是否执行移动。
+ * 设计要点：
+ *   - 只读展示「笔记标题 → 目标笔记本（置信度）」；原笔记本也标出，方便对照；
+ *   - 每行一个 checkbox，默认全部勾选；支持一键全选/取消；
+ *   - 点"确认移动"才真的调接口，点"取消"丢弃整个计划；
+ *   - plan=null 时不渲染，避免空弹窗。
+ */
+function AiClassifyConfirmModal({
+  plan,
+  onCancel,
+  onToggle,
+  onToggleAll,
+  onConfirm,
+}: {
+  plan: Array<{
+    noteId: string;
+    noteTitle: string;
+    fromNotebookName: string;
+    toNotebookName: string;
+    toPath?: string;
+    confidence: number;
+    checked: boolean;
+  }> | null;
+  onCancel: () => void;
+  onToggle: (noteId: string) => void;
+  onToggleAll: (checked: boolean) => void;
+  onConfirm: () => void;
+}) {
+  const { t } = useTranslation();
+  if (!plan) return null;
+  const checkedCount = plan.filter((p) => p.checked).length;
+  const allChecked = checkedCount === plan.length;
+  // ESC 关闭
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onCancel(); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onCancel]);
+
+  return createPortal(
+    <div className="fixed inset-0 z-[9999] flex items-center justify-center p-4 bg-black/40 backdrop-blur-sm" onClick={onCancel}>
+      <motion.div
+        initial={{ opacity: 0, scale: 0.96 }}
+        animate={{ opacity: 1, scale: 1 }}
+        exit={{ opacity: 0, scale: 0.96 }}
+        transition={{ duration: 0.15 }}
+        className="w-full max-w-lg max-h-[80vh] flex flex-col bg-app-surface rounded-xl shadow-2xl border border-app-border overflow-hidden"
+        onClick={(e) => e.stopPropagation()}
+      >
+        {/* 头部 */}
+        <div className="px-4 py-3 border-b border-app-border flex items-center gap-2">
+          <Sparkles size={16} className="text-violet-500" />
+          <div className="flex-1 min-w-0">
+            <div className="text-sm font-semibold text-tx-primary">
+              {t('noteList.bulkAiClassifyConfirmTitle') || "AI 归类建议确认"}
+            </div>
+            <div className="text-[11px] text-tx-tertiary mt-0.5">
+              {t('noteList.bulkAiClassifyConfirmSubtitle', { count: plan.length })
+                || `共 ${plan.length} 条建议，取消勾选即可跳过，点击确认后才会移动`}
+            </div>
+          </div>
+          <button
+            className="p-1 rounded-md hover:bg-app-hover text-tx-tertiary"
+            onClick={onCancel}
+            aria-label="close"
+          >
+            <X size={16} />
+          </button>
+        </div>
+
+        {/* 全选行 */}
+        <div className="px-4 py-2 border-b border-app-border flex items-center gap-2 bg-app-subtle/50">
+          <input
+            type="checkbox"
+            checked={allChecked}
+            // indeterminate 只能通过 ref 设置；这里简化不做三态视觉，功能上 toggleAll 够用
+            onChange={(e) => onToggleAll(e.target.checked)}
+            className="cursor-pointer"
+          />
+          <span className="text-xs text-tx-secondary">
+            {allChecked
+              ? (t('noteList.bulkAiClassifyUnselectAll') || "取消全选")
+              : (t('noteList.bulkAiClassifySelectAll') || "全选")}
+          </span>
+          <span className="ml-auto text-[11px] text-tx-tertiary tabular-nums">
+            {checkedCount}/{plan.length}
+          </span>
+        </div>
+
+        {/* 列表 */}
+        <div className="flex-1 overflow-auto">
+          {plan.map((item) => (
+            <label
+              key={item.noteId}
+              className="flex items-start gap-2 px-4 py-2.5 border-b border-app-border/50 hover:bg-app-hover cursor-pointer"
+            >
+              <input
+                type="checkbox"
+                checked={item.checked}
+                onChange={() => onToggle(item.noteId)}
+                className="mt-0.5 cursor-pointer"
+              />
+              <div className="flex-1 min-w-0">
+                <div className="text-[13px] text-tx-primary truncate">
+                  {item.noteTitle}
+                </div>
+                <div className="text-[11px] text-tx-tertiary mt-0.5 flex items-center gap-1 flex-wrap">
+                  <span className="truncate max-w-[40%]">{item.fromNotebookName}</span>
+                  <ChevronRight size={10} className="shrink-0 text-tx-tertiary/70" />
+                  <span className="text-violet-600 dark:text-violet-400 truncate max-w-[45%]" title={item.toPath || item.toNotebookName}>
+                    {item.toPath || item.toNotebookName}
+                  </span>
+                  <span className="ml-auto tabular-nums text-tx-tertiary">
+                    {(item.confidence * 100).toFixed(0)}%
+                  </span>
+                </div>
+              </div>
+            </label>
+          ))}
+        </div>
+
+        {/* 底部操作栏 */}
+        <div className="px-4 py-3 border-t border-app-border flex items-center gap-2 justify-end">
+          <button
+            className="px-3 py-1.5 text-xs rounded-md text-tx-secondary hover:bg-app-hover"
+            onClick={onCancel}
+          >
+            {t('common.cancel') || "取消"}
+          </button>
+          <button
+            className="px-3 py-1.5 text-xs font-medium rounded-md bg-violet-600 text-white hover:bg-violet-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+            onClick={onConfirm}
+            disabled={checkedCount === 0}
+          >
+            {t('noteList.bulkAiClassifyConfirmMove', { count: checkedCount })
+              || `确认移动 (${checkedCount})`}
+          </button>
+        </div>
+      </motion.div>
+    </div>,
+    document.body,
+  );
+}
+
 /* ===== 新建笔记时选择笔记本 ===== */
 function NotebookPickerModal({
   isOpen, notebooks, onPick, onClose,
@@ -457,15 +602,22 @@ function NotebookPickerModal({
   );
 }
 
-/* ===== 迷你日历筛选器 ===== */
+/* ===== 迷你日历筛选器 =====
+ * dateCounts：每个日期（YYYY-MM-DD）对应当天的笔记数量。
+ *   - 由父组件根据**不含 dateFilter** 的笔记列表聚合传入，这样切日期筛选
+ *     不会把日历徽章也过滤到只剩当天；
+ *   - 未传或某日期无命中则不显示徽章，避免 0 挤占格子。
+ */
 function MiniCalendarFilter({
   selectedDate,
   onSelect,
   onClear,
+  dateCounts,
 }: {
   selectedDate: string | null; // YYYY-MM-DD
   onSelect: (date: string) => void;
   onClear: () => void;
+  dateCounts?: Record<string, number>;
 }) {
   const { t } = useTranslation();
   const today = new Date();
@@ -556,6 +708,8 @@ function MiniCalendarFilter({
         {cells.map(({ day, current, dateStr }, idx) => {
           const isToday = dateStr === todayStr;
           const isSelected = dateStr === selectedDate;
+          // 当日笔记数量（仅在 current 月内显示徽章；非当月格子保持简洁）
+          const count = current ? (dateCounts?.[dateStr] || 0) : 0;
           return (
             <button
               key={idx}
@@ -564,14 +718,31 @@ function MiniCalendarFilter({
                 else onSelect(dateStr);
               }}
               className={cn(
-                "h-7 text-[11px] rounded-md transition-all flex items-center justify-center",
+                // 高度从 h-7 增到 h-9，给底部数量徽章留位置
+                "h-9 text-[11px] rounded-md transition-all flex flex-col items-center justify-center gap-0.5",
                 !current && "text-tx-tertiary/40",
                 current && !isSelected && !isToday && "text-tx-secondary hover:bg-app-hover",
                 isToday && !isSelected && "text-accent-primary font-bold",
                 isSelected && "bg-accent-primary text-white font-medium shadow-sm"
               )}
             >
-              {day}
+              <span className="leading-none">{day}</span>
+              {/* 数量徽章：
+                  - 仅当当月、count>0 时显示；
+                  - 未选中：用 accent 主色（半透明）小圆点风格数字；
+                  - 选中：白底蓝字反转，避免在蓝色高亮上看不清。 */}
+              {count > 0 && (
+                <span
+                  className={cn(
+                    "text-[8px] leading-none px-1 min-w-[12px] h-3 rounded-full inline-flex items-center justify-center tabular-nums font-medium",
+                    isSelected
+                      ? "bg-white/90 text-accent-primary"
+                      : "bg-accent-primary/15 text-accent-primary"
+                  )}
+                >
+                  {count > 99 ? "99+" : count}
+                </span>
+              )}
             </button>
           );
         })}
@@ -1073,6 +1244,67 @@ export default function NoteList() {
     // 追加依赖：notesRefreshToken 递增时强制刷新当前视图
   }, [fetchNotes, state.notesRefreshToken]);
 
+  // ─── 日历徽章数据源 ──────────────────────────────────────────────
+  // 单独维护一份**不带 dateFilter** 的笔记列表用于日历每日数量徽章。
+  // 不复用 state.notes 的原因：当用户已经选了某一天，state.notes 只剩当天，
+  // 日历就只会在那一天显示数字，其他日期看起来全是 0 —— 体验崩坏。
+  //
+  // 拉取策略：
+  //   - 仅在日历面板**首次打开**或视图维度（viewMode/notebook/tag/sortPref/
+  //     refreshToken）变化时拉取；
+  //   - dateFilter 切换不触发，避免与 fetchNotes 同步重复请求；
+  //   - trash/search 视图不显示日历，无需拉取。
+  const [calendarNotes, setCalendarNotes] = useState<NoteListItem[]>([]);
+  useEffect(() => {
+    if (!showCalendar) return;
+    if (state.viewMode === "trash" || state.viewMode === "search") return;
+    let cancelled = false;
+    const sortParams: Record<string, string> = { sortBy: sortPref.by, sortOrder: sortPref.dir };
+    const fetcher = async (): Promise<NoteListItem[]> => {
+      if (state.viewMode === "notebook" && state.selectedNotebookId) {
+        return api.getNotes({ notebookId: state.selectedNotebookId, ...sortParams });
+      }
+      if (state.viewMode === "favorites") {
+        return api.getNotes({ isFavorite: "1", ...sortParams });
+      }
+      if (state.viewMode === "tag" && state.selectedTagId) {
+        return api.getNotesWithTag(state.selectedTagId, sortParams);
+      }
+      // 默认 / "所有笔记"
+      return api.getNotes(sortParams);
+    };
+    fetcher()
+      .then((notes) => { if (!cancelled) setCalendarNotes(notes); })
+      .catch((err) => { console.error("[calendar] fetch failed:", err); });
+    return () => { cancelled = true; };
+  }, [
+    showCalendar,
+    state.viewMode,
+    state.selectedNotebookId,
+    state.selectedTagId,
+    sortPref.by,
+    sortPref.dir,
+    state.notesRefreshToken,
+  ]);
+
+  // 按本地日期聚合每日笔记数：YYYY-MM-DD → count。
+  // 取 updatedAt 与后端日期筛选保持一致（后端用 notes.updatedAt 比较 dateFrom/dateTo）。
+  const dateCounts = useMemo(() => {
+    const map: Record<string, number> = {};
+    for (const n of calendarNotes) {
+      // updatedAt 形如 "2026-05-12 14:30:00" 或 ISO；统一按本地时区切到 YYYY-MM-DD
+      const raw = n.updatedAt;
+      if (!raw) continue;
+      // 直接取前 10 字符（YYYY-MM-DD）即可：后端存的就是本地时间字符串，
+      // 与 todayStr 的 getFullYear/getMonth/getDate 同基准。
+      const key = String(raw).slice(0, 10);
+      if (key.length !== 10) continue;
+      map[key] = (map[key] || 0) + 1;
+    }
+    return map;
+  }, [calendarNotes]);
+
+
   // ─── 本地排序：确保 updateNoteInList 后列表立即按选定顺序排列 ───────
   // 后端返回的列表已排序，但保存后 EditorPane 只做了 updateNoteInList（原地更新
   // 字段）不重新拉列表，导致被编辑笔记的 updatedAt 更新了却没挪位置——看起来排序没生效。
@@ -1379,8 +1611,31 @@ export default function NoteList() {
     }
   }, [bulkAiRunning, selectedIds, state.notes, state.tags, actions, t]);
 
+  // ── 批量 AI 归类：改为"扫描 → 用户确认 → 执行"两段式 ─────────────────
+  // 原本是「扫描后直接移动」，用户看到结果时笔记已经被搬走，找不回来也无法反悔。
+  // 现在先把 AI 建议收集到 pendingClassify，弹一个确认面板让用户审核/勾选，
+  // 确认后才真正调 updateNote。单条归类入口（编辑器内）本来就是列表式交互，
+  // 无需改动；此改动仅影响多选底部工具栏的 "AI 归类" 按钮。
+  //
+  // 数据结构：每一项代表一条"AI 建议移动"的候选，包含置信度与目标笔记本信息。
+  // checked=false 可让用户逐条反选；<阈值 / 建议就是当前笔记本 的条目不会进入列表。
+  type ClassifyPlanItem = {
+    noteId: string;
+    noteTitle: string;
+    fromNotebookId: string | null;
+    fromNotebookName: string;
+    toNotebookId: string;
+    toNotebookName: string;
+    toPath?: string;           // 目标笔记本完整路径（"父/子"），有就展示
+    confidence: number;        // 0~1
+    checked: boolean;
+  };
+  const [pendingClassify, setPendingClassify] = useState<ClassifyPlanItem[] | null>(null);
+  // 扫描阶段进度：done/total，用于弹窗 loading 态
+  const [classifyScanning, setClassifyScanning] = useState<{ done: number; total: number } | null>(null);
+
   const bulkAiClassify = useCallback(async () => {
-    if (bulkAiRunning) return;
+    if (bulkAiRunning || classifyScanning) return;
     const ids = Array.from(selectedIds).filter((id) => {
       const n = state.notes.find((x) => x.id === id);
       return n && !n.isLocked;
@@ -1406,9 +1661,10 @@ export default function NoteList() {
       return;
     }
 
-    setBulkAiRunning({ kind: "classify", done: 0, total: ids.length });
-    let movedCount = 0;
-    let skippedCount = 0;
+    // 阶段 1：扫描 —— 并发调 /ai/classify 收集 top-1 建议，不做任何移动
+    setClassifyScanning({ done: 0, total: ids.length });
+    const plan: ClassifyPlanItem[] = [];
+    let skippedCount = 0; // 建议相同 / 置信度不足 / 无建议
     let failCount = 0;
 
     await runInBatches(ids, BULK_AI_CONCURRENCY, async (id) => {
@@ -1416,15 +1672,70 @@ export default function NoteList() {
       if (!note) { failCount++; return; }
       try {
         const res = await api.aiClassify({ noteId: id });
-        // 取 top-1 建议；需要不同于当前、且 confidence 达阈值
         const top = res.suggestions.find((s) => s.notebookId !== note.notebookId);
         if (!top || top.confidence < BULK_CLASSIFY_THRESHOLD) {
           skippedCount++;
           return;
         }
-        await api.updateNote(id, { notebookId: top.notebookId } as any);
+        const fromNb = state.notebooks.find((n) => n.id === note.notebookId);
+        plan.push({
+          noteId: id,
+          noteTitle: note.title || (t('noteList.untitled') as string) || "未命名",
+          fromNotebookId: note.notebookId,
+          fromNotebookName: fromNb?.name || "—",
+          toNotebookId: top.notebookId,
+          toNotebookName: top.notebookName,
+          toPath: (top as any).path,
+          confidence: top.confidence,
+          checked: true, // 默认勾选，用户只需反选不想移的
+        });
+      } catch {
+        failCount++;
+      }
+    }, (done, total) => {
+      setClassifyScanning({ done, total });
+    });
+
+    setClassifyScanning(null);
+
+    if (plan.length === 0) {
+      // 全部没建议 / 相同 / 失败——不弹窗，直接汇总
+      toast.info(
+        t('noteList.bulkAiClassifyNoPlan', { skipped: skippedCount, failed: failCount })
+          || `AI 未给出可移动的建议（跳过 ${skippedCount} 条，失败 ${failCount} 条）`,
+      );
+      return;
+    }
+
+    // 阶段 2：展示确认面板，等待用户决策；真正的移动在 confirmClassifyPlan 里
+    setPendingClassify(plan);
+    if (skippedCount > 0 || failCount > 0) {
+      // 侧附提示：有部分条目跳过/失败，避免用户疑惑
+      toast.info(
+        t('noteList.bulkAiClassifyPartial', { matched: plan.length, skipped: skippedCount, failed: failCount })
+          || `AI 给出 ${plan.length} 条建议，另有 ${skippedCount} 条跳过、${failCount} 条失败`,
+      );
+    }
+  }, [bulkAiRunning, classifyScanning, selectedIds, state.notes, state.notebooks, t]);
+
+  /** 用户确认后执行真正的移动。由 pendingClassify 面板的"确认"按钮触发。 */
+  const confirmClassifyPlan = useCallback(async () => {
+    if (!pendingClassify || bulkAiRunning) return;
+    const toMove = pendingClassify.filter((p) => p.checked);
+    if (toMove.length === 0) {
+      setPendingClassify(null);
+      return;
+    }
+    setPendingClassify(null);
+    setBulkAiRunning({ kind: "classify", done: 0, total: toMove.length });
+    let movedCount = 0;
+    let failCount = 0;
+
+    await runInBatches(toMove, BULK_AI_CONCURRENCY, async (item) => {
+      try {
+        await api.updateNote(item.noteId, { notebookId: item.toNotebookId } as any);
         movedCount++;
-        actions.updateNoteInList({ id, notebookId: top.notebookId });
+        actions.updateNoteInList({ id: item.noteId, notebookId: item.toNotebookId });
       } catch {
         failCount++;
       }
@@ -1435,15 +1746,11 @@ export default function NoteList() {
     setBulkAiRunning(null);
     actions.refreshNotebooks();
     actions.refreshNotes();
-    // 汇总一次性提示；三组数字齐全，避免多次 toast 叠加
     toast.success(
-      t('noteList.bulkAiClassifyDone', {
-        moved: movedCount,
-        skipped: skippedCount,
-        failed: failCount,
-      }) || `批量归类完成：已移动 ${movedCount} 条，跳过 ${skippedCount} 条，失败 ${failCount} 条`,
+      t('noteList.bulkAiClassifyDone2', { moved: movedCount, failed: failCount })
+        || `批量归类完成：已移动 ${movedCount} 条，失败 ${failCount} 条`,
     );
-  }, [bulkAiRunning, selectedIds, state.notes, actions, t]);
+  }, [pendingClassify, bulkAiRunning, actions, t]);
 
   // 根据当前视图和目标笔记动态构建菜单项
   const getMenuItems = (): ContextMenuItem[] => {
@@ -2040,6 +2347,7 @@ export default function NoteList() {
             selectedDate={dateFilter}
             onSelect={(d) => setDateFilter(d)}
             onClear={() => setDateFilter(null)}
+            dateCounts={dateCounts}
           />
         </div>
       )}
@@ -2117,16 +2425,18 @@ export default function NoteList() {
                 <button
                   className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium rounded-md text-violet-600 dark:text-violet-400 hover:bg-violet-500/10 disabled:opacity-50 disabled:cursor-wait transition-colors"
                   onClick={bulkAiClassify}
-                  disabled={!!bulkAiRunning}
-                  title={t('noteList.bulkAiClassifyTip') || "AI 自动归类（置信度≥60% 才会移动）"}
+                  disabled={!!bulkAiRunning || !!classifyScanning}
+                  title={t('noteList.bulkAiClassifyTip') || "AI 自动归类（先扫描，再人工确认是否移动）"}
                 >
-                  {bulkAiRunning?.kind === "classify" ? (
+                  {(bulkAiRunning?.kind === "classify" || classifyScanning) ? (
                     <Loader2 size={12} className="animate-spin" />
                   ) : (
                     <Sparkles size={12} />
                   )}
                   <span>
-                    {bulkAiRunning?.kind === "classify"
+                    {classifyScanning
+                      ? `${t('noteList.bulkAiClassifyScanning') || 'AI 扫描中'} ${classifyScanning.done}/${classifyScanning.total}`
+                      : bulkAiRunning?.kind === "classify"
                       ? `${bulkAiRunning.done}/${bulkAiRunning.total}`
                       : (t('noteList.bulkAiClassify') || "AI 归类")}
                   </span>
@@ -2313,6 +2623,21 @@ export default function NoteList() {
           await createNoteInNotebook(nbId);
         }}
         onClose={() => setPickerOpen(false)}
+      />
+
+      {/* AI 批量归类确认面板：扫描完成后弹出，用户逐条审核再执行移动 */}
+      <AiClassifyConfirmModal
+        plan={pendingClassify}
+        onCancel={() => setPendingClassify(null)}
+        onToggle={(noteId) => {
+          setPendingClassify((prev) =>
+            prev ? prev.map((p) => p.noteId === noteId ? { ...p, checked: !p.checked } : p) : prev,
+          );
+        }}
+        onToggleAll={(checked) => {
+          setPendingClassify((prev) => prev ? prev.map((p) => ({ ...p, checked })) : prev);
+        }}
+        onConfirm={confirmClassifyPlan}
       />
     </div>
   );

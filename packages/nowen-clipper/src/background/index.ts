@@ -1057,7 +1057,11 @@ function injectAIBlock(
   }
 }
 
-/** replace 模式重建笔记尾部（来源 + 标签） */
+/** replace 模式重建笔记尾部（来源 + 标签）
+ * 与 transform.ts 的 HTML 版保持一致：
+ *   - 链接文本始终是完整 URL，方便用户看到具体页面而不是仅站点名；
+ *   - siteName 作为前缀短标签放在链接前。
+ */
 function buildFooterMd(
   includeSource: boolean,
   url: string,
@@ -1066,7 +1070,8 @@ function buildFooterMd(
 ): string {
   const parts: string[] = [];
   if (includeSource) {
-    parts.push(`---\n\n📎 来源：[${siteName || url}](${url})`);
+    const prefix = siteName ? `${siteName} · ` : "";
+    parts.push(`---\n\n📎 来源：${prefix}[${url}](${url})`);
   }
   if (tags.length) {
     parts.push(tags.map((t) => `#${t}`).join(" "));
