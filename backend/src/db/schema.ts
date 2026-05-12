@@ -2,6 +2,7 @@ import Database from "better-sqlite3";
 import path from "path";
 import fs from "fs";
 import { runMigrations, getCurrentSchemaVersion, CURRENT_SCHEMA_VERSION } from "./migrations.js";
+import { enableIncrementalAutoVacuum } from "../lib/reclaimSpace.js";
 
 const DB_PATH = process.env.DB_PATH || path.join(process.env.ELECTRON_USER_DATA || path.join(process.cwd(), "data"), "nowen-note.db");
 
@@ -59,6 +60,13 @@ export function getDb(): Database.Database {
     // synchronous = NORMAL：WAL 模式下 NORMAL 已经能在断电时保证持久化，
     // 性能比 FULL 好得多；这是 SQLite 官方对 WAL 的推荐值。
     db.pragma("synchronous = NORMAL");
+    // auto_vacuum = INCREMENTAL：让 DELETE 产生的 free page 可以通过
+    //   PRAGMA incremental_vacuum(...) 真正归还给操作系统，用户看到的
+    //   .db 文件大小会随删除动作缩小。
+    // 老库首次迁移会做一次 VACUUM 以切换模式（一次性代价），之后每次
+    //   reclaimSpace() 的 incremental_vacuum 都是廉价的文件尾截断。
+    // 失败不致命：失败时退回到历史"占用只增不减"的行为，不影响数据正确性。
+    enableIncrementalAutoVacuum(db);
     // 完整性快速自检：5~50ms 量级，能发现绝大多数 page-level 损坏。
     // 损坏时直接抛错让进程拒绝启动——比"看似能跑、读到一半才报错"安全得多。
     try {

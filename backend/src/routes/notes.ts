@@ -14,6 +14,7 @@ import { broadcastNoteUpdated, broadcastNoteDeleted, broadcastYjsUpdate } from "
 import { yFlush, yDestroyDoc, yReplaceContentAsUpdate } from "../services/yjs";
 import { deleteAttachmentFilesByNoteIds, extractInlineBase64Images } from "./attachments";
 import { syncReferences as syncAttachmentReferences } from "../lib/attachmentRefs";
+import { reclaimSpace } from "../lib/reclaimSpace";
 
 const app = new Hono();
 
@@ -220,34 +221,16 @@ app.delete("/trash/empty", (c) => {
   // 背景：SQLite 的 DELETE 只把 page 标成 free，不会归还给操作系统。用户
   // 反馈"清空回收站后占用没减少"，根因就在这里。
   //
-  // 两步策略：
-  //   1) 始终做一次 wal_checkpoint(TRUNCATE) —— 把 WAL 并回主文件并截断，
-  //      立刻缩小 -wal 文件体积（"数据库占用"指标最直观的那一块）；零成本。
-  //   2) 仅当本次释放体量 > 阈值（默认 50MB）才做 VACUUM —— VACUUM 要独占锁
-  //      且要重写整个主库，小体量不值当做。
-
-  // wal_checkpoint 总是做（极廉价，且能让 -wal 大小立刻降下来）
-  let walTruncated = false;
-  try {
-    db.pragma("wal_checkpoint(TRUNCATE)");
-    walTruncated = true;
-  } catch (e) {
-    console.warn("[notes.trash/empty] wal_checkpoint failed:", e);
-  }
-
-  // 超阈值才 VACUUM（默认 50MB，可通过环境变量调整）
-  const VACUUM_THRESHOLD = Number(process.env.TRASH_VACUUM_THRESHOLD_BYTES || 50 * 1024 * 1024);
-  let vacuumed = false;
-  if (freedBytesEstimate >= VACUUM_THRESHOLD && ids.length > 0) {
-    try {
-      db.exec("VACUUM");
-      vacuumed = true;
-      // VACUUM 后再做一次 checkpoint 把遗留变更落盘
-      try { db.pragma("wal_checkpoint(TRUNCATE)"); } catch { /* ignore */ }
-    } catch (e) {
-      console.warn("[notes.trash/empty] VACUUM failed:", e);
-    }
-  }
+  // 策略（由 reclaimSpace 统一实现）：
+  //   1) 总是 wal_checkpoint(TRUNCATE)：-wal 文件立刻归零。
+  //   2) 总是 incremental_vacuum：把主库里空闲 page 归还给 OS，
+  //      .db 文件尺寸真正缩小（依赖连接初始化时的 auto_vacuum=INCREMENTAL）。
+  //   3) 仅在本次释放量超过阈值（默认 50MB）时才做全量 VACUUM，避免小删除
+  //      背负重写整库的代价。
+  const { walTruncated, incrementalVacuumed, vacuumed } = reclaimSpace(db, {
+    freedBytesEstimate,
+    tag: "notes.trash/empty",
+  });
 
   emitWebhook("note.trash_emptied", userId, { count: ids.length, removedFiles, vacuumed });
   logAudit(userId, "note", "trash_empty", { count: ids.length, noteIds: ids, removedFiles, vacuumed });
@@ -259,6 +242,7 @@ app.delete("/trash/empty", (c) => {
     removedFiles,
     // 让前端能感知"确实做了 checkpoint / VACUUM"，用于 toast 提示
     walTruncated,
+    incrementalVacuumed,
     vacuumed,
     freedBytesEstimate,
   });
@@ -790,10 +774,34 @@ app.delete("/:id", (c) => {
     console.warn("[notes.delete] deleteAttachmentFilesByNoteIds failed:", e);
   }
 
+  // 估算本次释放的字节数——仅用于判断是否值当做全量 VACUUM。
+  // 失败时当作 0，后续只会做 checkpoint + incremental_vacuum，不会误触发 VACUUM。
+  let freedBytesEstimate = 0;
+  try {
+    const attBytes = db
+      .prepare("SELECT COALESCE(SUM(size), 0) AS bytes FROM attachments WHERE noteId = ?")
+      .get(id) as { bytes: number } | undefined;
+    freedBytesEstimate += attBytes?.bytes || 0;
+    const noteBytes = db
+      .prepare(
+        `SELECT COALESCE(LENGTH(content), 0)
+              + COALESCE(LENGTH(contentText), 0)
+              + COALESCE(LENGTH(title), 0) AS bytes
+           FROM notes WHERE id = ?`,
+      )
+      .get(id) as { bytes: number } | undefined;
+    freedBytesEstimate += noteBytes?.bytes || 0;
+  } catch { /* ignore */ }
+
   db.prepare("DELETE FROM notes WHERE id = ?").run(id);
 
   // Phase 3: 释放内存 Y.Doc（CASCADE 已清 note_yupdates/note_ysnapshots）
   try { yDestroyDoc(id); } catch {}
+
+  // 回收磁盘空间：与"清空回收站"一致的 checkpoint + incremental_vacuum 策略。
+  // 没有这一步，单删笔记永远不会让 .db 主文件缩小（SQLite 默认不归还 free page），
+  // 用户感知就是"删了笔记占用不降"，这是此前的缺陷。
+  reclaimSpace(db, { freedBytesEstimate, tag: "notes.delete" });
 
   emitWebhook("note.deleted", userId, { noteId: id, removedFiles });
   logAudit(userId, "note", "delete", { noteId: id, removedFiles }, { targetType: "note", targetId: id });

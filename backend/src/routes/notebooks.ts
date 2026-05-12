@@ -8,6 +8,9 @@ import {
   hasPermission,
   buildVisibilityWhere,
 } from "../middleware/acl";
+import { deleteAttachmentFilesByNoteIds } from "./attachments";
+import { reclaimSpace } from "../lib/reclaimSpace";
+import { yDestroyDoc } from "../services/yjs";
 
 const app = new Hono();
 
@@ -284,8 +287,76 @@ app.delete("/:id", (c) => {
     return c.json({ error: "forbidden" }, 403);
   }
 
+  // ⚠ notebooks 的 FK 是 ON DELETE CASCADE，删笔记本会连带把该笔记本（以及
+  // 所有后代笔记本）下的全部 notes 都删掉。注意 DB 级 CASCADE **只处理 DB
+  // 行**：attachments 的物理文件、Y.Doc 内存实例需要我们手动清理。
+  //
+  // 额外的"存储占用不降"根因也在这里：大量笔记和附件被删后，SQLite 的
+  // free page 不会自动归还给 OS，.db 文件尺寸纹丝不动。删完后统一
+  // reclaimSpace() 一下。
+  //
+  // 采集待删 note id：递归查出当前笔记本及其所有后代笔记本下的笔记。
+  // 用递归 CTE 避免应用层多次查询。
+  let affectedNoteIds: string[] = [];
+  try {
+    affectedNoteIds = (db
+      .prepare(
+        `WITH RECURSIVE sub(id) AS (
+           SELECT id FROM notebooks WHERE id = ?
+           UNION ALL
+           SELECT n.id FROM notebooks n JOIN sub ON n.parentId = sub.id
+         )
+         SELECT n.id FROM notes n WHERE n.notebookId IN (SELECT id FROM sub)`,
+      )
+      .all(id) as { id: string }[]).map((r) => r.id);
+  } catch (e) {
+    console.warn("[notebooks.delete] collect affected noteIds failed:", (e as Error).message);
+  }
+
+  // 估算释放字节数（只算一次；DELETE 后这些行就查不到了）
+  let freedBytesEstimate = 0;
+  let removedFiles = 0;
+  if (affectedNoteIds.length > 0) {
+    try {
+      const placeholders = affectedNoteIds.map(() => "?").join(",");
+      const attBytes = db
+        .prepare(
+          `SELECT COALESCE(SUM(size), 0) AS bytes FROM attachments WHERE noteId IN (${placeholders})`,
+        )
+        .get(...affectedNoteIds) as { bytes: number } | undefined;
+      freedBytesEstimate += attBytes?.bytes || 0;
+      const noteBytes = db
+        .prepare(
+          `SELECT COALESCE(SUM(
+             COALESCE(LENGTH(content), 0) +
+             COALESCE(LENGTH(contentText), 0) +
+             COALESCE(LENGTH(title), 0)
+           ), 0) AS bytes FROM notes WHERE id IN (${placeholders})`,
+        )
+        .get(...affectedNoteIds) as { bytes: number } | undefined;
+      freedBytesEstimate += noteBytes?.bytes || 0;
+    } catch { /* 估算失败不阻塞 */ }
+
+    // 必须在 DELETE 之前清理磁盘附件（否则 CASCADE 后 path 就查不到了）。
+    try {
+      removedFiles = deleteAttachmentFilesByNoteIds(affectedNoteIds);
+    } catch (e) {
+      console.warn("[notebooks.delete] deleteAttachmentFilesByNoteIds failed:", (e as Error).message);
+    }
+  }
+
   db.prepare("DELETE FROM notebooks WHERE id = ?").run(id);
-  return c.json({ success: true });
+
+  // 释放内存 Y.Doc（DB 里 note_yupdates/ysnapshots 已随 CASCADE 清理）
+  for (const nid of affectedNoteIds) {
+    try { yDestroyDoc(nid); } catch { /* ignore */ }
+  }
+
+  // 真正让 .db / .db-wal 文件缩小。小量删除走 incremental_vacuum；
+  // 批量（≥ 阈值，默认 50MB）额外 VACUUM 碎片整理一次。
+  reclaimSpace(db, { freedBytesEstimate, tag: "notebooks.delete" });
+
+  return c.json({ success: true, removedNoteCount: affectedNoteIds.length, removedFiles });
 });
 
 export default app;
