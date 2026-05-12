@@ -54,10 +54,19 @@ const config: CapacitorConfig = {
       backgroundColor: "#F5F3EE",
     },
     Keyboard: {
-      // 键盘弹出时不自动调整 WebView 大小，由前端 JS 手动控制布局
+      // 键盘弹出时不自动调整 WebView 大小，由前端 JS 手动控制布局。
+      //
+      // 与 AndroidManifest.xml 中 `windowSoftInputMode="adjustNothing"` 配套：
+      //   - resize:"none" 让 Capacitor 不主动通知 JS 调整视口；
+      //   - adjustNothing 让 Android 系统也不调整 Activity；
+      //   - 双管齐下确保 WebView 始终保持全屏，键盘纯绘制在最上层；
+      //   - 前端通过 Capacitor Keyboard.addListener 拿精确键盘高度自己加 padding。
+      //
+      // **不要打开 `resizeOnFullScreen`**：该字段在 Android 全屏时会强制使用
+      // Native resize 模式（覆盖 `resize` 字段），导致 WebView frame 被原生层
+      // 压扁，而 CSS 视口仍按全屏算 —— 表现为键盘上方露出 Activity windowBackground
+      // (Light 主题下 = 白色)，即"输入框下方一大片白色空白延伸到键盘顶端"。
       resize: "none",
-      // 点击 WebView 空白区域时自动收起键盘
-      resizeOnFullScreen: true,
     },
   },
 };

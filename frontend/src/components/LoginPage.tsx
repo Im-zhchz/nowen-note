@@ -6,6 +6,8 @@ import { getServerUrl, setServerUrl, clearServerUrl, testServerConnection, fetch
 import { buildServerUrl, parseServerUrl, type ServerAddressParts } from "@/lib/serverUrl";
 import ServerAddressInput from "@/components/ServerAddressInput";
 import LanDiscoveryPanel from "@/components/LanDiscoveryPanel";
+import { useKeyboardLayout } from "@/hooks/useCapacitor";
+import { useKeyboardVisible } from "@/hooks/useKeyboardVisible";
 import {
   loadRememberedCredentials,
   saveRememberedCredentials,
@@ -24,6 +26,88 @@ type Mode = "login" | "register";
 
 export default function LoginPage({ onLogin, isClientMode = false, onDisconnect }: LoginPageProps) {
   const [mode, setMode] = useState<Mode>("login");
+  // 登录页外层滚动容器 ref（软键盘适配用，见下方 useEffect）
+  const scrollContainerRef = useRef<HTMLDivElement | null>(null);
+  // 登录页键盘适配 —— 直接复用全站既有的原生键盘事件链，**不要再自己用
+  // visualViewport 推断键盘高度**（推断在 Android `Keyboard.resize: "none"`
+  // 下不稳，会出现"露白"或残留 padding）。
+  //
+  // 实现方式：
+  //   1) `useKeyboardLayout()`：注册 Capacitor 原生 `keyboardWillShow/Hide`
+  //      事件，事件回调里把 `info.keyboardHeight` 写入 CSS 变量
+  //      `--keyboard-height` 和 `data-keyboard` 属性。这是从原生层拿到的
+  //      **精确像素**，与 WebView CSS 视口无关，跨 Android/iOS 一致。
+  //      AppLayout（登录后）也调用了同一个 hook —— 没有冲突，各自 add/remove
+  //      自己的 listener。**登录页必须独立调一次**，否则没人写 CSS 变量。
+  //   2) `useKeyboardVisible()`：MutationObserver 监听 html 上 CSS 变量
+  //      变化，把 `{ visible, height }` 转成 React state 供本组件用。
+  //
+  // 为什么之前的 `visualViewport.height` 方案不行？
+  //   - 在 Android `Keyboard.resize: "none"` 下，WebView 全屏不缩，但
+  //     `visualViewport.height` 也**不一定缩**（取决于 WebView 版本/厂商定制
+  //     —— 部分 ROM 上 visualViewport 完全不感知键盘）。原生事件是唯一稳的源。
+  //   - 上一版用 `maxHeight = visualViewport.height` 让外层容器只占屏幕上方，
+  //     容器下方到屏幕底之间露出 body 背景（≈白色），就是截图里的"红框白块"。
+  useKeyboardLayout();
+  const { height: keyboardHeight } = useKeyboardVisible();
+
+  // 【Android/iOS 关键修复】主动把 focused input 滚到容器可视区上 1/4 处。
+  //
+  // 背景：
+  //   - 全局 CSS `html, body, #root { overflow: hidden }` 禁止了文档级滚动，
+  //     因此必须在 LoginPage 外层 div 自己挂 overflow-y-auto 作为滚动容器。
+  //   - Android WebView 下，浏览器自带的 focus-scrollIntoView **几乎不工作**,
+  //     尤其是可滚动祖先不是 document 而是内部 div 时；iOS 相对稳但也有抖动。
+  //   - 原生 `el.scrollIntoView({ block: "center" })` 会向上冒泡到**最近的**
+  //     可滚动祖先 —— 就是我们的 scrollContainerRef —— 但在 Android WebView
+  //     多次实测行为不可靠。因此直接**手动算 scrollTop**，跨平台最稳。
+  //
+  // 实现：
+  //   1) 监听 document.focusin（冒泡，能捕获所有 input/textarea focus）；
+  //   2) 同时监听 visualViewport.resize（键盘弹起/收起触发的视口变化）；
+  //   3) 延迟 80ms 等 keyboardHeight state & DOM 布局完成；
+  //   4) 计算 scrollTop 让输入框出现在容器可视区上 1/4 处（非居中），留下
+  //      3/4 给"登录按钮 + 底部提示"，避免按钮被键盘盖住。
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const scrollFocusedIntoView = () => {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => {
+        const container = scrollContainerRef.current;
+        const el = document.activeElement as HTMLElement | null;
+        if (
+          !container ||
+          !el ||
+          (el.tagName !== "INPUT" && el.tagName !== "TEXTAREA")
+        ) {
+          return;
+        }
+        const containerRect = container.getBoundingClientRect();
+        const elRect = el.getBoundingClientRect();
+        // 输入框相对容器顶部的偏移（含当前已滚动部分）
+        const offsetTop = elRect.top - containerRect.top + container.scrollTop;
+        // 目标：把输入框滚到可视区**上 1/4 处**（而非居中）。
+        // 理由：登录表单里用户真正需要看到的是"当前输入框 + 其下方的
+        // 登录按钮 + 底部提示"，不是输入框上方的 logo/标题。如果把 input
+        // 居中（container.clientHeight / 2），下方只剩一半可视区，登录按钮
+        // 往往被挤到键盘下方 —— 截图里"记住密码下方一大片空白、按钮不可见"
+        // 就是这个原因。滚到 1/4 处留下 3/4 可视区给下方内容，按钮始终可见。
+        const target = offsetTop - container.clientHeight * 0.25;
+        const maxScroll = container.scrollHeight - container.clientHeight;
+        const next = Math.max(0, Math.min(target, maxScroll));
+        container.scrollTo({ top: next, behavior: "smooth" });
+      }, 80);
+    };
+    document.addEventListener("focusin", scrollFocusedIntoView);
+    const vv = window.visualViewport;
+    if (vv) vv.addEventListener("resize", scrollFocusedIntoView);
+    return () => {
+      if (timer) clearTimeout(timer);
+      document.removeEventListener("focusin", scrollFocusedIntoView);
+      if (vv) vv.removeEventListener("resize", scrollFocusedIntoView);
+    };
+  }, []);
   // 服务器地址拆成 (protocol, host, port) 三段，避免用户手填整串 URL 出错；
   // 旧数据 localStorage 里是完整 URL，下方 useEffect 里用 parseServerUrl 回填
   const [serverParts, setServerParts] = useState<ServerAddressParts>({
@@ -376,11 +460,54 @@ export default function LoginPage({ onLogin, isClientMode = false, onDisconnect 
 
   return (
     <div
-      className="min-h-screen flex items-center justify-center bg-zinc-50 dark:bg-zinc-950 selection:bg-indigo-500/30 transition-colors"
+      ref={scrollContainerRef}
+      className="flex flex-col items-center bg-zinc-50 dark:bg-zinc-950 selection:bg-indigo-500/30 transition-colors overflow-y-auto overflow-x-hidden"
       style={{
-        // 刘海屏 / Android 状态栏避让，保证登录卡片不会被状态栏/手势条遮挡
+        // 移动端软键盘处理（最终方案，踩坑历史见下）：
+        //
+        // 踩过的坑：
+        //   1) Capacitor `Keyboard.resize: "none"`：原生层**不缩 WebView frame**,
+        //      WebView 始终全屏。键盘绘制在 WebView 之上。
+        //   2) 想用 `visualViewport.height` 推断键盘高度 —— 在部分 Android ROM
+        //      上 visualViewport 完全不感知键盘，推不出真实高度。
+        //   3) 致命错误（上一版 BUG）：把外层容器 maxHeight 设成 visualViewport.height,
+        //      容器只占屏幕上方部分；容器下方到 WebView 底（即键盘所在区域）
+        //      露出 body 背景 —— 浅色模式 body = var(--color-bg) ≈ 白色，于是用户
+        //      看到"登录按钮下方一直到键盘顶端是一整片白色"（截图红框区域）。
+        //   4) `useKeyboardLayout()` 默认只挂载在 AppLayout（登录后），登录页
+        //      是 AuthGate 直接 return <LoginPage />，原生事件链没人注册，
+        //      `--keyboard-height` 永远是 0 —— 这就是历史上多次"看似对了
+        //      但键盘弹起没反应"的根本原因。**修复**：登录页内独立调一次
+        //      `useKeyboardLayout()`，与 AppLayout 各自维护 listener，互不冲突。
+        //   5) 全局 CSS `html, body, #root { overflow: hidden }` 禁止文档
+        //      级滚动，**必须由 LoginPage 外层自己 overflow-y-auto** 作为
+        //      滚动容器（所以这里必须保留 overflow-y-auto、挂 ref）。
+        //   6) Android WebView focus 时不会自动 scrollIntoView —— 见上方
+        //      useEffect，手动监听 focusin + 算 scrollTop 让 input 出现在
+        //      可视区上 1/4 处（非居中），保证 input 下方的登录按钮可见。
+        //   7) 前后 `flex-1 min-h-0` 占位实测在 iOS WKWebView 下会出现
+        //      **上下不对称**（下方占位异常大、按钮被挤到键盘下方），改用
+        //      卡片 `my-auto`：flex 规范下 auto margin 内容不足时吸收剩余
+        //      空间实现居中，内容溢出时**坍缩为 0**，行为比 flex-1 更稳。
+        //
+        // 最终方案：
+        //   a) 容器高 = 100dvh（动态视口高，撑满 WebView），bg 与卡片同色系，
+        //      **永远不会露出 body 白底**。
+        //   b) `paddingBottom: keyboardHeight + safe-area-bottom`：键盘弹起时
+        //      原生事件回调写入精确像素，padding 把内容推到键盘上方；未弹起
+        //      时 keyboardHeight=0，等价于普通 safe-area padding。
+        //   c) flex-col + items-center + 卡片 auto-margin（**双态**）+ `flex-shrink-0`：
+        //      - 键盘未弹起：卡片 `my-auto`，整页垂直居中；
+        //      - 键盘已弹起：卡片 `mt-auto`（仅上方 auto），卡片**贴键盘上沿**，
+        //        否则会被在"键盘上方可视区"里二次居中，导致卡片下方到键盘顶
+        //        之间留出一大片白色（上一版症状）。
+        //      - 内容 > 可用区时 auto margin 按 flex 规范坍缩为 0，overflow-y-auto
+        //        滚动接管。
+        //   d) focusin 触发手动 scrollTo，把 focused input 滚到上 1/4 处。
+        minHeight: '100dvh',
+        maxHeight: '100dvh',
         paddingTop: 'var(--safe-area-top)',
-        paddingBottom: 'var(--safe-area-bottom)',
+        paddingBottom: `calc(var(--safe-area-bottom) + ${keyboardHeight}px)`,
       }}
     >
       {/* 背景装饰 */}
@@ -393,7 +520,18 @@ export default function LoginPage({ onLogin, isClientMode = false, onDisconnect 
         initial={{ opacity: 0, y: 24 }}
         animate={{ opacity: 1, y: 0 }}
         transition={{ duration: 0.5, ease: [0.25, 0.46, 0.45, 0.94] }}
-        className="relative w-full max-w-[420px] mx-4"
+        // 居中策略（双态）：
+        //   - 键盘**未**弹起：`my-auto` —— flex 容器把剩余空间均分到卡片
+        //     上下，卡片整页垂直居中。
+        //   - 键盘**已**弹起：`mt-auto`（去掉下方 auto margin）—— 上方撑满
+        //     auto，下方 margin 为 0，卡片**贴近底部 padding**（即贴键盘
+        //     上沿）。否则 `my-auto` 会让卡片在"容器减键盘高的可用区"中再
+        //     次居中，结果是**卡片下方到键盘顶之间出现一大片白色空白**
+        //     （上一版用户截图正是这个症状：按钮下方白茫茫一片）。
+        //   - 内容 > 可用区时 auto margin 按 flex 规范坍缩为 0，overflow-y-auto
+        //     滚动接管。比 flex-1 占位元素更可靠（实测占位方案在 iOS
+        //     WKWebView 下会出现上下不对称）。
+        className={`relative w-full max-w-[420px] mx-4 py-6 flex-shrink-0 ${keyboardHeight > 0 ? 'mt-auto' : 'my-auto'}`}
       >
         <div className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-2xl shadow-xl dark:shadow-2xl dark:shadow-black/20 p-8">
           {/* Logo & Title */}

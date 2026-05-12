@@ -16,7 +16,31 @@
             android:label="@string/title_activity_main"
             android:theme="@style/AppTheme.NoActionBarLaunch"
             android:launchMode="singleTask"
-            android:exported="true">
+            android:exported="true"
+            android:windowSoftInputMode="adjustNothing">
+
+            <!--
+              windowSoftInputMode="adjustNothing" 关键说明（解决"键盘弹起后输入框
+              下方一大片白色空白"的根因）：
+
+              背景：
+                - Capacitor 配置 `Keyboard.resize: "none"` 只控制插件**报给 JS 的
+                  resize 事件**（即不调整 WebView 视口大小），但**无法阻止 Android
+                  系统级的 windowSoftInputMode 行为**。
+                - Activity 默认 `adjustResize`（或 `adjustPan`）会让系统在键盘弹起时
+                  **从底部压缩 Activity 内容区**。Capacitor 的 WebView 跟着 Activity
+                  frame 一起被压扁，但 **CSS 视口仍按全屏算**（100dvh / 100vh 不变）。
+                - WebView 的 native frame ≠ CSS viewport，被压上来的那段区域露出
+                  Activity 的 windowBackground = 白色（AppTheme 是 Light 主题）。
+                  → 视觉表现：登录卡片 / 编辑器下方一大片白色一直延伸到键盘顶端。
+
+              修复：
+                设 `adjustNothing` 让系统完全不动 Activity，键盘纯绘制在最上层，
+                WebView 始终全屏。前端通过 Capacitor `Keyboard.addListener`
+                （见 `useKeyboardLayout` hook）拿到精确键盘高度，自己 padding
+                把内容推到键盘上方 —— 这是 Capacitor 官方与 `resize:"none"`
+                配套的标准方案。
+            -->
 
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
