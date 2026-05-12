@@ -911,6 +911,340 @@ ai.post("/parse-document", async (c) => {
   }
 });
 
+// ============================================================
+// 剪藏增强（nowen-clipper 专用）
+// ------------------------------------------------------------
+//
+// POST /api/ai/clip-enhance
+//
+// 用途：浏览器扩展剪藏页面后，先把正文过一遍 LLM，产出
+//        {title?, summary?, outline?, tags?, highlight?, translation?}
+//        然后让客户端按 mode 决定怎么拼回笔记（默认追加在原文上面，
+//        保留原文为"事实"，AI 产物为"加工"）。
+//
+// 设计要点：
+//   - 非流式（剪藏场景不需要打字动画；MV3 service worker 30s 易回收，流式不靠谱）
+//   - 单次调用多任务（让 LLM 用 JSON 模式一次返回所有字段，省 token 省往返）
+//   - 失败不抛错：返回 {ok:false, error}，由客户端决定是否降级保存原文
+//   - 输入截断：默认 6000 字，超长取头 4000 + 尾 2000（标题党文章头部最关键，
+//     结尾常有总结，中间噪声多）
+//
+// 入参：
+//   {
+//     title: string,             // 页面标题（用于上下文）
+//     url?: string,              // 来源 URL（用于上下文）
+//     siteName?: string,         // 站点名
+//     contentText: string,       // 正文纯文本（不含 HTML 标签）
+//     tasks: {                   // 哪些任务要做（多选）
+//       summary?: boolean,       //   TL;DR 摘要
+//       outline?: boolean,       //   结构化大纲
+//       tags?: boolean,          //   自动标签 3-5 个
+//       title?: boolean,         //   重写标题（针对标题党页面）
+//       highlight?: boolean,     //   重点高亮（提取 3-5 个关键句）
+//       translation?: boolean,   //   翻译为中文（外文剪藏）
+//     },
+//     language?: string,         // 输出语言，默认 "zh-CN"
+//     customInstruction?: string,// 用户自定义补充指令（拼到 system prompt 末尾）
+//     maxInputChars?: number,    // 输入截断长度，默认 6000
+//   }
+//
+// 返回：
+//   {
+//     ok: true,
+//     enhanced: {
+//       title?: string,          // tasks.title 才返回
+//       summary?: string,        // 一段或几句话
+//       outline?: string,        // Markdown 多级列表
+//       tags?: string[],         // 字符串数组
+//       highlights?: string[],   // 关键句数组
+//       translation?: string,    // 中文译文（Markdown）
+//     },
+//     model: string,
+//     truncated: boolean,        // 输入是否被截断
+//   }
+//   或：{ ok: false, error: string }
+ai.post("/clip-enhance", async (c) => {
+  const settings = getAISettings();
+  if (!settings.ai_api_url) {
+    return c.json({ ok: false, error: "未配置 AI 服务" }, 400);
+  }
+  if (!NO_KEY_PROVIDERS.includes(settings.ai_provider) && !settings.ai_api_key) {
+    return c.json({ ok: false, error: "未配置 API Key" }, 400);
+  }
+
+  type Tasks = {
+    summary?: boolean;
+    outline?: boolean;
+    tags?: boolean;
+    title?: boolean;
+    highlight?: boolean;
+    translation?: boolean;
+  };
+
+  let body: {
+    title?: string;
+    url?: string;
+    siteName?: string;
+    contentText?: string;
+    tasks?: Tasks;
+    language?: string;
+    customInstruction?: string;
+    maxInputChars?: number;
+  };
+  try {
+    body = await c.req.json();
+  } catch {
+    return c.json({ ok: false, error: "请求体不是合法 JSON" }, 400);
+  }
+
+  const contentText = (body.contentText || "").trim();
+  if (!contentText || contentText.length < 20) {
+    return c.json({ ok: false, error: "正文过短，跳过 AI 优化" }, 400);
+  }
+
+  const tasks: Tasks = body.tasks || { summary: true, tags: true };
+  // 至少选一项任务
+  const anyTask =
+    tasks.summary || tasks.outline || tasks.tags || tasks.title || tasks.highlight || tasks.translation;
+  if (!anyTask) {
+    return c.json({ ok: false, error: "未指定任何优化任务" }, 400);
+  }
+
+  const language = (body.language || "zh-CN").toLowerCase();
+  const isChinese = language.startsWith("zh");
+
+  // 输入截断：默认 6000 字，超长取头 4000 + 尾 2000
+  const MAX_INPUT = Math.min(Math.max(body.maxInputChars ?? 6000, 1000), 12000);
+  let inputText = contentText;
+  let truncated = false;
+  if (inputText.length > MAX_INPUT) {
+    const head = Math.floor(MAX_INPUT * 0.66);
+    const tail = MAX_INPUT - head - 32; // 留空给省略号
+    inputText =
+      inputText.slice(0, head) +
+      "\n\n...[中间内容已省略]...\n\n" +
+      inputText.slice(inputText.length - tail);
+    truncated = true;
+  }
+
+  // 构造 schema 描述（让 LLM 知道返回哪些字段）
+  const schemaFields: string[] = [];
+  if (tasks.title) {
+    schemaFields.push(
+      isChinese
+        ? `  "title": "改写后的简洁标题（≤30字，去除"震惊体"等标题党用语）"`
+        : `  "title": "rewritten concise title (<=30 chars)"`,
+    );
+  }
+  if (tasks.summary) {
+    schemaFields.push(
+      isChinese
+        ? `  "summary": "用 1-3 句话概括文章核心观点（≤120字），客观陈述，不要议论"`
+        : `  "summary": "1-3 sentences TL;DR (<=120 chars), neutral tone"`,
+    );
+  }
+  if (tasks.outline) {
+    schemaFields.push(
+      isChinese
+        ? `  "outline": "用 Markdown 多级列表给出文章结构大纲（- 一级要点\\n  - 二级要点），3-7 个一级要点"`
+        : `  "outline": "Markdown bulleted outline (3-7 top-level items)"`,
+    );
+  }
+  if (tasks.tags) {
+    schemaFields.push(
+      isChinese
+        ? `  "tags": ["3-5 个分类标签，每个 2-6 字的名词或短语，不要带#号"]`
+        : `  "tags": ["3-5 short noun tags"]`,
+    );
+  }
+  if (tasks.highlight) {
+    schemaFields.push(
+      isChinese
+        ? `  "highlights": ["3-5 句从原文中精选的关键句（保留原文表述，不要改写）"]`
+        : `  "highlights": ["3-5 verbatim key sentences from source"]`,
+    );
+  }
+  if (tasks.translation) {
+    schemaFields.push(
+      isChinese
+        ? `  "translation": "将正文完整翻译为流畅中文（保留段落和列表结构，用 Markdown 格式）"`
+        : `  "translation": "full translation to target language in Markdown"`,
+    );
+  }
+
+  const systemPrompt = isChinese
+    ? `你是一位资深的网页剪藏助手，专门帮用户把杂乱的网页正文整理成可读、可检索、可归档的笔记素材。
+
+请严格按用户要求的字段输出**纯 JSON**（不要包裹在 markdown 代码块里，不要任何前后缀解释）。
+
+输出 JSON 的字段要求：
+{
+${schemaFields.join(",\n")}
+}
+
+通用规则：
+1. 字段值用简体中文。
+2. 摘要保持客观，不复制原文连续大段，不臆造信息。
+3. 标签用名词短语（如"前端工程"、"产品设计"），不要用句子，不要带 # 号。
+4. 大纲要反映原文真实结构，不是凭空想象的目录。
+5. 如果原文质量太低（广告/导航文本/乱码）以致无法完成任务，对应字段输出空字符串或空数组，但 JSON 结构保持完整。
+6. 不要输出 JSON 之外的任何字符。${body.customInstruction ? `\n\n补充指令：${body.customInstruction}` : ""}`
+    : `You are a web clipper assistant. Output strict JSON (no markdown code fences, no explanation) with the following fields:
+
+{
+${schemaFields.join(",\n")}
+}
+
+Rules: be concise, neutral, faithful to source. If source is unusable, return empty string/array for that field but keep JSON structure intact.${body.customInstruction ? `\n\nAdditional: ${body.customInstruction}` : ""}`;
+
+  const ctxLines: string[] = [];
+  if (body.title) ctxLines.push(`标题：${body.title}`);
+  if (body.siteName) ctxLines.push(`站点：${body.siteName}`);
+  if (body.url) ctxLines.push(`URL：${body.url}`);
+  const userPrompt =
+    (ctxLines.length ? ctxLines.join("\n") + "\n\n" : "") +
+    (isChinese ? "正文：\n" : "Content:\n") +
+    inputText;
+
+  const aiHeaders: Record<string, string> = { "Content-Type": "application/json" };
+  if (settings.ai_api_key) {
+    aiHeaders["Authorization"] = `Bearer ${settings.ai_api_key}`;
+  }
+
+  const baseUrl = settings.ai_api_url.replace(/\/+$/, "");
+
+  try {
+    // 优先用 OpenAI 风格的 response_format: { type: "json_object" }
+    // 某些 provider（Ollama 老版本、自建 vLLM 等）不支持，失败后会自动回退到普通模式。
+    const reqBody: any = {
+      model: settings.ai_model,
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+      stream: false,
+      temperature: 0.3,
+      max_tokens: 2000,
+    };
+    // 尝试启用 JSON mode（OpenAI / DeepSeek / Qwen / Gemini OpenAI-compat 都支持）
+    if (
+      settings.ai_provider === "openai" ||
+      settings.ai_provider === "deepseek" ||
+      settings.ai_provider === "qwen" ||
+      settings.ai_provider === "doubao" ||
+      settings.ai_provider === "custom"
+    ) {
+      reqBody.response_format = { type: "json_object" };
+    }
+
+    const res = await fetch(`${baseUrl}/chat/completions`, {
+      method: "POST",
+      headers: aiHeaders,
+      body: JSON.stringify(reqBody),
+      signal: AbortSignal.timeout(45000),
+    });
+
+    if (!res.ok) {
+      const errText = await res.text().catch(() => "");
+      return c.json(
+        { ok: false, error: `AI 服务返回 ${res.status}：${errText.slice(0, 200) || res.statusText}` },
+        200, // 200 + ok:false：客户端根据 ok 字段判断是否降级，不要触发 fetch 异常路径
+      );
+    }
+
+    const data = await res.json();
+    let raw = data?.choices?.[0]?.message?.content;
+    if (!raw || typeof raw !== "string") {
+      return c.json({ ok: false, error: "AI 返回内容为空" }, 200);
+    }
+
+    // 兜底：去掉可能的 ```json 代码块包裹
+    raw = raw.trim();
+    const fenceMatch = raw.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+    if (fenceMatch) raw = fenceMatch[1].trim();
+
+    let parsed: any;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      // 二次兜底：从文本里抽第一个 { ... } 块
+      const m = raw.match(/\{[\s\S]*\}/);
+      if (m) {
+        try {
+          parsed = JSON.parse(m[0]);
+        } catch {
+          return c.json(
+            { ok: false, error: "AI 返回的不是合法 JSON：" + raw.slice(0, 200) },
+            200,
+          );
+        }
+      } else {
+        return c.json(
+          { ok: false, error: "AI 返回的不是合法 JSON：" + raw.slice(0, 200) },
+          200,
+        );
+      }
+    }
+
+    // 规整字段（防止 LLM 给出奇怪类型）
+    const enhanced: Record<string, any> = {};
+    if (tasks.title && typeof parsed.title === "string" && parsed.title.trim()) {
+      enhanced.title = parsed.title.trim().slice(0, 200);
+    }
+    if (tasks.summary && typeof parsed.summary === "string" && parsed.summary.trim()) {
+      enhanced.summary = parsed.summary.trim();
+    }
+    if (tasks.outline && typeof parsed.outline === "string" && parsed.outline.trim()) {
+      enhanced.outline = parsed.outline.trim();
+    }
+    if (tasks.tags) {
+      let tagArr: string[] = [];
+      if (Array.isArray(parsed.tags)) {
+        tagArr = parsed.tags
+          .filter((t: any) => typeof t === "string")
+          .map((t: string) => t.trim().replace(/^#+/, ""))
+          .filter((t: string) => t.length > 0 && t.length <= 20)
+          .slice(0, 8);
+      } else if (typeof parsed.tags === "string") {
+        tagArr = parsed.tags
+          .split(/[,，、\s]+/)
+          .map((t: string) => t.trim().replace(/^#+/, ""))
+          .filter((t: string) => t.length > 0 && t.length <= 20)
+          .slice(0, 8);
+      }
+      if (tagArr.length) enhanced.tags = tagArr;
+    }
+    if (tasks.highlight) {
+      let hs: string[] = [];
+      if (Array.isArray(parsed.highlights)) {
+        hs = parsed.highlights
+          .filter((s: any) => typeof s === "string")
+          .map((s: string) => s.trim())
+          .filter((s: string) => s.length > 0)
+          .slice(0, 8);
+      }
+      if (hs.length) enhanced.highlights = hs;
+    }
+    if (
+      tasks.translation &&
+      typeof parsed.translation === "string" &&
+      parsed.translation.trim()
+    ) {
+      enhanced.translation = parsed.translation.trim();
+    }
+
+    return c.json({
+      ok: true,
+      enhanced,
+      model: settings.ai_model,
+      truncated,
+    });
+  } catch (err: any) {
+    const msg = err?.name === "TimeoutError" ? "AI 请求超时（45 秒）" : err?.message || String(err);
+    return c.json({ ok: false, error: msg }, 200);
+  }
+});
+
 // ===== ⑤ 批量 Markdown 格式化 =====
 ai.post("/batch-format", async (c) => {
   const settings = getAISettings();

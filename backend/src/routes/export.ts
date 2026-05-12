@@ -1,6 +1,7 @@
 import { Hono } from "hono";
 import { getDb } from "../db/schema";
 import { extractInlineBase64Images } from "./attachments";
+import { syncReferences as syncAttachmentReferences } from "../lib/attachmentRefs";
 import { broadcastToUser } from "../services/realtime";
 import { isSystemAdmin } from "../middleware/acl";
 
@@ -286,6 +287,7 @@ app.post("/import", async (c) => {
       //   - 导入 zip 时前端 importService 会把图片编码进 data URI；若直接入库会把
       //     notes.content 撑大到 MB 级，后续 GET 性能崩塌（这是本次改造的根本目的）。
       //   - 短路策略保证"没有内联图"的常规导入完全无额外成本。
+      let finalContent: string | null = note.content ?? null;
       if (note.content && note.content.indexOf("data:image") >= 0) {
         // 附件与笔记同 workspace（targetWs 已决定）。
         const { content: rewritten, replacedCount } = extractInlineBase64Images(
@@ -296,6 +298,22 @@ app.post("/import", async (c) => {
         );
         if (replacedCount > 0) {
           updateContent.run(rewritten, id);
+          finalContent = rewritten;
+        }
+      }
+
+      // v11: 维护 attachment_references 倒排（在事务内）。
+      // 仅当最终 content 含 `/api/attachments/` 才走，避免无意义查询。
+      if (finalContent && finalContent.indexOf("/api/attachments/") >= 0) {
+        try {
+          syncAttachmentReferences(db, id, finalContent);
+        } catch (e) {
+          // 单条失败不阻断整批导入；日志便于事后排查
+          console.warn(
+            "[export.import] syncAttachmentReferences failed for note",
+            id,
+            e instanceof Error ? e.message : e,
+          );
         }
       }
 

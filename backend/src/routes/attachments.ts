@@ -44,6 +44,7 @@ import { Hono } from "hono";
 import type { Context } from "hono";
 import { getDb } from "../db/schema";
 import { v4 as uuid } from "uuid";
+import crypto from "crypto";
 import fs from "fs";
 import path from "path";
 import { resolveNotePermission, hasPermission } from "../middleware/acl";
@@ -285,8 +286,52 @@ app.post("/", async (c) => {
   const ext = pickExt(file.name, mime);
   const savePath = path.join(ATTACHMENTS_DIR, `${id}.${ext}`);
 
+  let buffer: Buffer;
   try {
-    const buffer = Buffer.from(await file.arrayBuffer());
+    buffer = Buffer.from(await file.arrayBuffer());
+  } catch (err: any) {
+    return c.json({ error: `读取上传内容失败: ${err?.message || err}` }, 500);
+  }
+
+  // v11 hash 去重：先算 SHA-256，在同 scope（userId + workspaceId）内查命中。
+  // 命中策略：
+  //   - 相同 (userId, workspaceId, hash) 已存在一行 → 直接返回老 id，
+  //     既不写新文件，也不写新 attachments 行。前端拿到一样的 url 就行。
+  //   - 未命中 → 走正常落盘 + 入库流程，把 hash 一并写下来供后续命中。
+  // 范围"同 user 内"而非全局：避免跨用户 ACL 麻烦，删除时引用计数也只在
+  // 自己的范围内有效（不会因为另一个用户的笔记还在引用就拒删自己的附件）。
+  const sha256 = crypto.createHash("sha256").update(buffer).digest("hex");
+  const dedupRow = db
+    .prepare(
+      noteWorkspaceId
+        ? `SELECT id, mimeType, size, filename FROM attachments
+            WHERE userId = ? AND workspaceId = ? AND hash = ? LIMIT 1`
+        : `SELECT id, mimeType, size, filename FROM attachments
+            WHERE userId = ? AND workspaceId IS NULL AND hash = ? LIMIT 1`,
+    )
+    .get(
+      ...(noteWorkspaceId
+        ? [userId, noteWorkspaceId, sha256]
+        : [userId, sha256]),
+    ) as { id: string; mimeType: string; size: number; filename: string } | undefined;
+
+  if (dedupRow) {
+    // 命中：直接返回老附件 id；不写盘、不写 DB
+    return c.json(
+      {
+        id: dedupRow.id,
+        url: `/api/attachments/${dedupRow.id}`,
+        mimeType: dedupRow.mimeType,
+        size: dedupRow.size,
+        filename: dedupRow.filename,
+        category: isImageMime(dedupRow.mimeType) ? "image" : "file",
+        deduplicated: true,
+      },
+      200,
+    );
+  }
+
+  try {
     fs.writeFileSync(savePath, buffer);
   } catch (err: any) {
     return c.json({ error: `写入文件失败: ${err?.message || err}` }, 500);
@@ -302,8 +347,8 @@ app.post("/", async (c) => {
   // 却只在个人空间看得见"的错位。
   try {
     db.prepare(
-      `INSERT INTO attachments (id, noteId, userId, filename, mimeType, size, path, workspaceId)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO attachments (id, noteId, userId, filename, mimeType, size, path, workspaceId, hash)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
       id,
       noteId,
@@ -313,6 +358,7 @@ app.post("/", async (c) => {
       file.size,
       `${id}.${ext}`,
       noteWorkspaceId,
+      sha256,
     );
   } catch (err: any) {
     // DB 写失败时把已落盘文件清掉，避免孤儿
@@ -363,10 +409,22 @@ app.delete("/:id", (c) => {
   }
 
   const absPath = path.join(ATTACHMENTS_DIR, row.path);
-  try {
-    if (fs.existsSync(absPath)) fs.unlinkSync(absPath);
-  } catch {
-    /* 文件删不掉不阻塞，DB 记录仍然要清掉 */
+
+  // v11 引用计数：dedup 启用后理论上同一 path 不会重复，但极小概率下（迁移
+  // 之前的老数据、并发上传竞态）可能多行共享同一物理文件。删除前确认：
+  // 若还有其它 attachments 行指向同一 path，仅删本行不动磁盘文件，避免造成
+  // 另一行的引用变成"裂图/404"。
+  const sameFileCount = db
+    .prepare("SELECT COUNT(*) AS c FROM attachments WHERE path = ? AND id <> ?")
+    .get(row.path, id) as { c: number };
+  const shouldUnlink = sameFileCount.c === 0;
+
+  if (shouldUnlink) {
+    try {
+      if (fs.existsSync(absPath)) fs.unlinkSync(absPath);
+    } catch {
+      /* 文件删不掉不阻塞，DB 记录仍然要清掉 */
+    }
   }
   db.prepare("DELETE FROM attachments WHERE id = ?").run(id);
 
@@ -432,8 +490,17 @@ export function extractInlineBase64Images(
   ensureAttachmentsDir();
   const db = getDb();
   const insertStmt = db.prepare(
-    `INSERT INTO attachments (id, noteId, userId, filename, mimeType, size, path, workspaceId)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO attachments (id, noteId, userId, filename, mimeType, size, path, workspaceId, hash)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  );
+  // v11 hash dedup 命中查询：与 POST /api/attachments 走同款"同 user + 同 workspace"
+  // 范围。命中则直接复用老 id，不写新文件不写新行；URL 仍指向老附件。
+  const dedupSelect = db.prepare(
+    workspaceId
+      ? `SELECT id FROM attachments
+          WHERE userId = ? AND workspaceId = ? AND hash = ? LIMIT 1`
+      : `SELECT id FROM attachments
+          WHERE userId = ? AND workspaceId IS NULL AND hash = ? LIMIT 1`,
   );
 
   const attachmentIds: string[] = [];
@@ -456,6 +523,17 @@ export function extractInlineBase64Images(
         return _match;
       }
 
+      // hash dedup：先查命中，命中则不写盘不写行
+      const sha256 = crypto.createHash("sha256").update(buffer).digest("hex");
+      const hit = (workspaceId
+        ? dedupSelect.get(userId, workspaceId, sha256)
+        : dedupSelect.get(userId, sha256)) as { id: string } | undefined;
+      if (hit) {
+        attachmentIds.push(hit.id);
+        replacedCount++;
+        return `${quote}/api/attachments/${hit.id}${quote}`;
+      }
+
       const id = uuid();
       const ext = MIME_TO_EXT[mimeLower] || "bin";
       const filename = `${id}.${ext}`;
@@ -467,7 +545,7 @@ export function extractInlineBase64Images(
         return _match;
       }
       try {
-        insertStmt.run(id, noteId, userId, filename, mimeLower, buffer.length, filename, workspaceId);
+        insertStmt.run(id, noteId, userId, filename, mimeLower, buffer.length, filename, workspaceId, sha256);
       } catch {
         // DB 写失败 → 清掉磁盘文件，保留原 data URI
         try { fs.unlinkSync(savePath); } catch { /* ignore */ }

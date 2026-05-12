@@ -822,6 +822,152 @@ export const MIGRATIONS: Migration[] = [
       }
     },
   },
+
+  // ==========================================================================
+  // v11：附件图床增强 —— hash 去重 + 反向引用倒排索引
+  // --------------------------------------------------------------------------
+  // 背景（路线 A）：
+  //   FileManager 已经事实上承担"图床"职责（全局视图 + 复制外链 + 孤儿清理），
+  //   但还缺两块硬伤未补：
+  //
+  //   1) 缺 hash 去重：同一张图通过编辑器粘贴 / 剪藏 / 拖拽多次上传会落 N 份
+  //      磁盘文件 N 行 DB。规模一大磁盘膨胀严重。
+  //
+  //   2) 反查走全表 LIKE：/api/files/:id 详情接口要回答"这张图被哪些笔记引用"，
+  //      v10 之前实现是 `notes.content LIKE '%/api/attachments/<id>%'`，
+  //      笔记规模上来后 O(N) 扫全部 content 字段 + 子串匹配，content 又通常是
+  //      KB~MB 量级的 JSON/HTML，每次详情查询都很慢。
+  //
+  // 本迁移做三件事：
+  //
+  //   A. attachments 表新增 hash 列（TEXT NULL，SHA-256 hex）。
+  //      - 上传链路（/api/attachments、/api/files/upload、extractInlineBase64Images）
+  //        会计算 hash 并优先复用已存在的相同 (userId, workspaceId, hash) 行；
+  //        命中则返回老 id，不写新文件不写新行。
+  //      - 列允许 NULL：老附件不强制回填 hash（懒迁移策略）。新上传时只在
+  //        "hash 非空的行"里查命中，老行不参与去重——可接受，老数据本来就
+  //        没有去重诉求。需要时另开管理端接口/脚本逐行扫盘补 hash。
+  //      - 复合索引 (userId, workspaceId, hash)：上传查命中走这条索引。
+  //        注意 SQLite 的复合索引可对 NULL 值正常索引，但 (.., .., hash IS NULL)
+  //        的命中没意义，所以查询时一定要带 hash IS NOT NULL 谓词。
+  //
+  //   B. 新建 attachment_references 表（attachmentId, noteId 复合主键）作为
+  //      "笔记→附件引用"的倒排索引：
+  //      - PK(attachmentId, noteId)：天然去重，同一笔记多次引用同一附件只一行。
+  //      - 双外键 ON DELETE CASCADE：笔记删除 / 附件删除时自动清理对应行，
+  //        业务层零额外清理代码。
+  //      - 索引 idx_attachment_references_attachment(attachmentId)：详情接口
+  //        反查"这个附件被哪些笔记引用"走这条；按 attachmentId 单边过滤的
+  //        SQL 命中索引头部，O(log N + 命中数)。
+  //      - 索引 idx_attachment_references_note(noteId)：笔记侧增量维护用
+  //        （UPDATE/DELETE WHERE noteId = ?），不建会扫全表。
+  //
+  //   C. 一次性回填 attachment_references。
+  //      用单条 SQL + 正则不行（SQLite 默认无 regexp 函数）；改用 JS 侧扫描：
+  //      读全部 notes（id, content），逐条 extract attachment id 集合，
+  //      批量 INSERT OR IGNORE 到 attachment_references。
+  //      性能：1k 笔记 × 平均 5 个引用 ≈ 5k 行插入 + 1k 次字符串 indexOf，
+  //      在事务里 < 1s 级别，可接受。
+  //
+  //      回填时**包括** isTrashed=1 的笔记（与运行时 syncReferences 的语义一致：
+  //      回收站里的笔记保留引用，恢复后无需重算）。
+  //
+  // 幂等性：
+  //   - addColumnIfMissing 跳过已存在列；
+  //   - CREATE TABLE / INDEX IF NOT EXISTS；
+  //   - 回填用 INSERT OR IGNORE：二次运行不产生重复。
+  //
+  // 回滚：回到 v10 时新列/新表仍在但旧代码不读，行为退化为"反查走 LIKE 扫全表 +
+  //   上传不去重"——和 v10 完全一致，无破坏。
+  //
+  // 风险：
+  //   - 回填阶段需要把所有 notes.content 读到内存做字符串扫描；如果用户有
+  //     极端规模的库（>50k 笔记 + 高频附件），可能 OOM。当前用户量级不会触发。
+  //     极端规模时可改为分批 LIMIT/OFFSET，但实现复杂度上升，本次不做。
+  //   - hash 列允许 NULL 的设计意味着"老附件不参与去重"——这是有意为之的
+  //     懒迁移；如果用户希望强制回填，未来再提供一个 admin 端的 backfill 接口。
+  {
+    version: 11,
+    name: "attachment-hash-dedup-and-references",
+    up: (db) => {
+      const addColumnIfMissing = (
+        table: string,
+        column: string,
+        definition: string,
+      ) => {
+        const cols = db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
+        if (cols.length === 0) return;
+        if (cols.some((c) => c.name === column)) return;
+        db.prepare(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`).run();
+      };
+
+      // ---- A. attachments.hash + 复合索引 ----
+      addColumnIfMissing("attachments", "hash", "TEXT");
+      // 复合索引按 (userId, workspaceId, hash)：上传去重查询的 WHERE 三列齐写。
+      // 不加 UNIQUE 约束：
+      //   - 三列里 hash 可能为 NULL（老数据），UNIQUE 对多 NULL 行为有歧义；
+      //   - 应用层在"非 NULL hash"上自行保证唯一即可，不需要 DB 兜底。
+      db.exec(
+        "CREATE INDEX IF NOT EXISTS idx_attachments_user_ws_hash ON attachments(userId, workspaceId, hash);",
+      );
+
+      // ---- B. attachment_references 倒排表 ----
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS attachment_references (
+          attachmentId TEXT NOT NULL,
+          noteId TEXT NOT NULL,
+          createdAt TEXT NOT NULL DEFAULT (datetime('now')),
+          PRIMARY KEY (attachmentId, noteId),
+          FOREIGN KEY (attachmentId) REFERENCES attachments(id) ON DELETE CASCADE,
+          FOREIGN KEY (noteId) REFERENCES notes(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_attachment_references_attachment
+          ON attachment_references(attachmentId);
+        CREATE INDEX IF NOT EXISTS idx_attachment_references_note
+          ON attachment_references(noteId);
+      `);
+
+      // ---- C. 一次性回填 ----
+      // 与 lib/attachmentRefs.ts 的 extractAttachmentIdsFromContent 保持同款正则，
+      // 但这里是迁移上下文，不依赖 src/lib —— 内联一份小副本，避免 migrations
+      // 模块产生外部依赖（迁移代码应自包含，便于追溯）。
+      const ATTACHMENT_ID_RE =
+        /\/api\/attachments\/([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})/g;
+
+      const notes = db
+        .prepare("SELECT id, content FROM notes")
+        .all() as { id: string; content: string | null }[];
+
+      const insertRef = db.prepare(
+        "INSERT OR IGNORE INTO attachment_references (attachmentId, noteId) VALUES (?, ?)",
+      );
+
+      let totalInserted = 0;
+      for (const n of notes) {
+        if (!n.content || typeof n.content !== "string") continue;
+        if (n.content.indexOf("/api/attachments/") < 0) continue;
+        const re = new RegExp(ATTACHMENT_ID_RE.source, "g");
+        const seen = new Set<string>();
+        let m: RegExpExecArray | null;
+        while ((m = re.exec(n.content)) !== null) {
+          seen.add(m[1].toLowerCase());
+        }
+        for (const attId of seen) {
+          try {
+            const info = insertRef.run(attId, n.id);
+            if (info.changes > 0) totalInserted++;
+          } catch {
+            // 外键失败（笔记里写了不存在的 attachment id，例如手动改的 / 删过附件）
+            // 静默跳过 —— 这种"脏引用"不索引才是正确行为。
+          }
+        }
+      }
+
+      console.log(
+        `[migrations] v11 backfill attachment_references: scanned ${notes.length} notes, inserted ${totalInserted} rows`,
+      );
+    },
+  },
 ];
 
 /** 当前代码已知的最高 schema 版本（== MIGRATIONS 里 max(version)）。 */

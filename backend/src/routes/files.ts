@@ -36,6 +36,7 @@
 import { Hono } from "hono";
 import type { Context } from "hono";
 import { v4 as uuid } from "uuid";
+import crypto from "crypto";
 import fs from "fs";
 import path from "path";
 import { getDb } from "../db/schema";
@@ -83,6 +84,7 @@ interface FileRow {
   notebookName: string | null;
   notebookIcon: string | null;
   isTrashed: number | null;
+  hash: string | null;
 }
 
 interface FileOut {
@@ -93,6 +95,8 @@ interface FileOut {
   createdAt: string;
   category: "image" | "file";
   url: string;
+  /** SHA-256 hex；v11 之前的老附件可能为 null（懒迁移）。 */
+  hash: string | null;
   /** 首次归属的笔记（attachments.noteId）。被删除或不存在时为 null。 */
   primaryNote: {
     id: string;
@@ -113,6 +117,7 @@ function toFileOut(row: FileRow): FileOut {
     createdAt: row.createdAt,
     category: isImage(row.mimeType) ? "image" : "file",
     url: `/api/attachments/${row.id}`,
+    hash: row.hash ?? null,
     primaryNote: row.noteId
       ? {
           id: row.noteId,
@@ -346,7 +351,7 @@ app.get("/", requireWorkspaceFeature("files"), (c) => {
 
   const rows = db
     .prepare(
-      `SELECT a.id, a.filename, a.mimeType, a.size, a.path, a.createdAt,
+      `SELECT a.id, a.filename, a.mimeType, a.size, a.path, a.createdAt, a.hash,
               a.noteId,
               n.title AS noteTitle, n.notebookId, n.isTrashed,
               nb.name AS notebookName, nb.icon AS notebookIcon
@@ -484,7 +489,7 @@ app.get("/:id", (c) => {
 
   const base = db
     .prepare(
-      `SELECT a.id, a.filename, a.mimeType, a.size, a.path, a.createdAt,
+      `SELECT a.id, a.filename, a.mimeType, a.size, a.path, a.createdAt, a.hash,
               a.noteId, a.userId, a.workspaceId,
               n.title AS noteTitle, n.notebookId, n.isTrashed,
               nb.name AS notebookName, nb.icon AS notebookIcon
@@ -508,27 +513,34 @@ app.get("/:id", (c) => {
     }
   }
 
-  // 反向引用扫描：LIKE '%pattern%' 顺序扫描，无需预先建倒排。
-  const pattern = `%/api/attachments/${id}%`;
+  // v11：反向引用从倒排索引 attachment_references 查询，告别全表 LIKE 扫描。
+  // 表语义：每条 (attachmentId, noteId) 行表示"这个附件曾被这条笔记引用"，
+  //   - 写时维护：notes.POST/PUT/import 三处入口在事务内调 syncReferences；
+  //   - 自动收尾：noteId / attachmentId 任一被删，FK CASCADE 清理对应行；
+  //   - 回收站语义：isTrashed=1 的笔记保留行，前端按 isTrashed 字段决定如何标记。
+  // 因此 INNER JOIN attachment_references 即可拿到所有引用关系。
+  // scope 仍按附件可见性收口，避免跨工作区/跨用户泄露 noteId。
   const refRows = db
     .prepare(
       base.workspaceId
         ? `SELECT n.id, n.title, n.notebookId, n.isTrashed, n.updatedAt,
                   nb.name AS notebookName, nb.icon AS notebookIcon
-             FROM notes n
+             FROM attachment_references ar
+             INNER JOIN notes n ON n.id = ar.noteId
              LEFT JOIN notebooks nb ON nb.id = n.notebookId
-            WHERE n.workspaceId = ?
-              AND n.content LIKE ?
+            WHERE ar.attachmentId = ?
+              AND n.workspaceId = ?
             ORDER BY n.updatedAt DESC`
         : `SELECT n.id, n.title, n.notebookId, n.isTrashed, n.updatedAt,
                   nb.name AS notebookName, nb.icon AS notebookIcon
-             FROM notes n
+             FROM attachment_references ar
+             INNER JOIN notes n ON n.id = ar.noteId
              LEFT JOIN notebooks nb ON nb.id = n.notebookId
-            WHERE n.userId = ? AND n.workspaceId IS NULL
-              AND n.content LIKE ?
+            WHERE ar.attachmentId = ?
+              AND n.userId = ? AND n.workspaceId IS NULL
             ORDER BY n.updatedAt DESC`,
     )
-    .all(base.workspaceId ?? userId, pattern) as {
+    .all(id, base.workspaceId ?? userId) as {
       id: string;
       title: string;
       notebookId: string | null;
@@ -597,10 +609,17 @@ app.delete("/:id", (c) => {
   }
 
   const absPath = path.join(getAttachmentsDir(), row.path);
-  try {
-    if (fs.existsSync(absPath)) fs.unlinkSync(absPath);
-  } catch {
-    /* 文件删不掉不阻塞，DB 记录一致性优先 */
+  // v11 引用计数：若同一物理文件还有别的 attachments 行指向，仅删本行不动磁盘
+  // （理论上 hash dedup 后不会产生这种共享，但老数据 / 并发竞态可能出现）
+  const sameFileCount = db
+    .prepare("SELECT COUNT(*) AS c FROM attachments WHERE path = ? AND id <> ?")
+    .get(row.path, id) as { c: number };
+  if (sameFileCount.c === 0) {
+    try {
+      if (fs.existsSync(absPath)) fs.unlinkSync(absPath);
+    } catch {
+      /* 文件删不掉不阻塞，DB 记录一致性优先 */
+    }
   }
   db.prepare("DELETE FROM attachments WHERE id = ?").run(id);
 
@@ -608,7 +627,84 @@ app.delete("/:id", (c) => {
 });
 
 // ---------------------------------------------------------------------------
-// POST /api/files/batch-delete
+// PATCH /api/files/:id
+// 重命名（仅改 attachments.filename 字段，不动磁盘上的 <uuid>.<ext> 文件）。
+//
+// 背景：
+//   磁盘文件名是 `<uuid>.<ext>` 形态（不可变），用户看到的"文件名"来自
+//   attachments.filename 列——上传时记录原始文件名 / 编辑器粘贴时由前端拼一个。
+//   重命名只是修改显示名 + 下载时 Content-Disposition 用的名字，不需要碰盘。
+//
+// 请求：PATCH /api/files/:id  body: { filename: string }
+//
+// 校验：
+//   - 必须是非空字符串，长度 ≤ 255；
+//   - 拒绝路径分隔符 / 反斜杠 / 控制字符（防御性，filename 不会被当成路径）；
+//   - 保留原扩展名：若新名不含点，自动接上老名的扩展名（避免下载时丢类型）；
+//     若新名带的扩展名与老名不一致，**尊重用户**——可能是有意修正错误的扩展。
+//
+// 权限：与 DELETE /:id 同款：本人 + 笔记 write。
+// ---------------------------------------------------------------------------
+app.patch("/:id", async (c) => {
+  const userId = c.req.header("X-User-Id") || "";
+  if (!userId) return c.json({ error: "未授权" }, 401);
+  const id = c.req.param("id");
+  const db = getDb();
+
+  let body: { filename?: unknown };
+  try {
+    body = await c.req.json();
+  } catch {
+    return c.json({ error: "invalid json body" }, 400);
+  }
+  const rawName = typeof body.filename === "string" ? body.filename.trim() : "";
+  if (!rawName) {
+    return c.json({ error: "filename 不能为空" }, 400);
+  }
+  if (rawName.length > 255) {
+    return c.json({ error: "filename 过长（≤ 255）" }, 400);
+  }
+  // 拒绝路径分隔符 / 控制字符（filename 仅用于显示与 Content-Disposition，
+  // 永远不会被拼成磁盘路径，但严格点更安全）
+  // eslint-disable-next-line no-control-regex
+  if (/[\\/\x00-\x1f]/.test(rawName)) {
+    return c.json({ error: "filename 包含非法字符" }, 400);
+  }
+
+  const row = db
+    .prepare("SELECT id, noteId, userId, filename FROM attachments WHERE id = ?")
+    .get(id) as
+    | { id: string; noteId: string; userId: string; filename: string }
+    | undefined;
+  if (!row) return c.json({ error: "文件不存在" }, 404);
+
+  // 权限：本人 + 笔记 write
+  if (row.userId !== userId) {
+    return c.json({ error: "无权重命名他人文件", code: "FORBIDDEN" }, 403);
+  }
+  const { permission } = resolveNotePermission(row.noteId, userId);
+  if (!hasPermission(permission, "write")) {
+    return c.json({ error: "无权重命名该文件", code: "FORBIDDEN" }, 403);
+  }
+
+  // 自动补扩展名：新名不含点，且老名有点，则补上老的扩展。
+  let finalName = rawName;
+  if (!finalName.includes(".")) {
+    const oldDot = row.filename.lastIndexOf(".");
+    if (oldDot > 0 && oldDot < row.filename.length - 1) {
+      finalName = `${finalName}.${row.filename.slice(oldDot + 1)}`;
+    }
+  }
+
+  if (finalName === row.filename) {
+    return c.json({ success: true, filename: finalName, unchanged: true });
+  }
+
+  db.prepare("UPDATE attachments SET filename = ? WHERE id = ?").run(finalName, id);
+  return c.json({ success: true, filename: finalName });
+});
+
+
 // 批量删除文件（DB 行 + 磁盘文件）。
 //
 // 请求体：{ ids: string[] }   —— 不超过 200 个 / 次（避免单事务锁太久）
@@ -705,8 +801,17 @@ app.post("/batch-delete", async (c) => {
 
     // 第三步：删磁盘文件（DB 已经一致；磁盘层错误降级为 failed 项，
     // 但不会让用户误以为 DB 没删——文件已经从列表里消失了）
+    //
+    // v11 引用计数：本批 DELETE 之后再查一次同 path 是否还有其它 attachments
+    // 行存在（来自本批之外的笔记/用户）。只有 0 引用才真正 unlink；否则
+    // 只删 DB 行不动磁盘，避免误清掉别处仍在用的文件。
     const dir = getAttachmentsDir();
+    const stillReferencedStmt = db.prepare(
+      "SELECT 1 FROM attachments WHERE path = ? LIMIT 1",
+    );
     for (const row of deletable) {
+      const stillReferenced = stillReferencedStmt.get(row.path);
+      if (stillReferenced) continue;
       const absPath = path.join(dir, row.path);
       try {
         if (fs.existsSync(absPath)) fs.unlinkSync(absPath);
@@ -872,8 +977,50 @@ app.post("/upload", requireWorkspaceFeature("files"), async (c) => {
   const ext = pickExt(file.name, mime);
   const savePath = path.join(getAttachmentsDir(), `${id}.${ext}`);
 
+  let buffer: Buffer;
   try {
-    const buffer = Buffer.from(await file.arrayBuffer());
+    buffer = Buffer.from(await file.arrayBuffer());
+  } catch (err) {
+    return c.json(
+      { error: `读取上传内容失败: ${err instanceof Error ? err.message : String(err)}` },
+      500,
+    );
+  }
+
+  // v11 hash dedup：同 user + 同 workspace 内查命中。命中 → 复用老 id 不写盘不写 DB。
+  const sha256 = crypto.createHash("sha256").update(buffer).digest("hex");
+  const db = getDb();
+  const dedupRow = db
+    .prepare(
+      scope.workspaceId
+        ? `SELECT id, mimeType, size, filename FROM attachments
+            WHERE userId = ? AND workspaceId = ? AND hash = ? LIMIT 1`
+        : `SELECT id, mimeType, size, filename FROM attachments
+            WHERE userId = ? AND workspaceId IS NULL AND hash = ? LIMIT 1`,
+    )
+    .get(
+      ...(scope.workspaceId
+        ? [userId, scope.workspaceId, sha256]
+        : [userId, sha256]),
+    ) as { id: string; mimeType: string; size: number; filename: string } | undefined;
+
+  if (dedupRow) {
+    return c.json(
+      {
+        id: dedupRow.id,
+        url: `/api/attachments/${dedupRow.id}`,
+        mimeType: dedupRow.mimeType,
+        size: dedupRow.size,
+        filename: dedupRow.filename,
+        category: isImage(dedupRow.mimeType) ? "image" : "file",
+        createdAt: new Date().toISOString(),
+        deduplicated: true,
+      },
+      200,
+    );
+  }
+
+  try {
     fs.writeFileSync(savePath, buffer);
   } catch (err) {
     return c.json(
@@ -883,10 +1030,9 @@ app.post("/upload", requireWorkspaceFeature("files"), async (c) => {
   }
 
   try {
-    const db = getDb();
     db.prepare(
-      `INSERT INTO attachments (id, noteId, userId, filename, mimeType, size, path, workspaceId)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO attachments (id, noteId, userId, filename, mimeType, size, path, workspaceId, hash)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
       id,
       noteId,
@@ -896,6 +1042,7 @@ app.post("/upload", requireWorkspaceFeature("files"), async (c) => {
       file.size,
       `${id}.${ext}`,
       scope.workspaceId,
+      sha256,
     );
   } catch (err) {
     // DB 写失败时把已落盘文件清掉，避免孤儿

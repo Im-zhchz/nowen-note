@@ -4,6 +4,7 @@ import { v4 as uuid } from "uuid";
 import bcrypt from "bcryptjs";
 import crypto from "crypto";
 import { signShareAccessToken, verifyShareAccessToken } from "../lib/auth-security";
+import { resolvePublicOrigin, rewriteRelativeAttachmentUrls } from "../lib/shareUrlRewrite";
 
 // H3: 使用密码学安全的随机源生成分享 token。
 //     原实现用 Math.random()，理论上可被预测；改用 crypto.randomBytes。
@@ -309,10 +310,21 @@ sharedRouter.get("/:token/content", (c) => {
     return c.json({ error: "分享链接已达到最大访问次数" }, 410);
   }
 
+  // H6: 图床绝对化
+  //   分享场景下，content 里的 /api/attachments/<id>、/api/task-attachments/<id>
+  //   是相对路径，一旦分享页被第三方嵌入 / SPA 与后端不同源 / 走 CDN，
+  //   浏览器会按当前文档 origin 解析，导致图片 404。
+  //   这里在 HTTP 出口处统一改写成绝对 URL（基于反代头推断公网 origin），
+  //   不修改数据库原始内容，保留搬域可移植性。
+  const publicOrigin = resolvePublicOrigin((name) => c.req.header(name));
+  const rewrittenContent = publicOrigin
+    ? rewriteRelativeAttachmentUrls(share.content, publicOrigin)
+    : share.content;
+
   return c.json({
     noteId: share.noteId,
     title: share.title,
-    content: share.content,
+    content: rewrittenContent,
     contentText: share.contentText,
     permission: share.permission,
     updatedAt: share.noteUpdatedAt,

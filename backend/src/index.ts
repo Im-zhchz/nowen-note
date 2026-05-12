@@ -56,7 +56,11 @@ app.use("*", logger());
 app.use("*", cors({
   origin: (origin) => origin || "*",
   allowMethods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
-  allowHeaders: ["Content-Type", "X-User-Id", "Authorization"],
+  // 注意：自定义 header 必须在这里逐一列出，浏览器/WebView 跨域时才会让 OPTIONS 预检放行。
+  //   - X-Sudo-Token：管理员高危操作（备份配置、删除、恢复、邮件发送等）必带；
+  //     之前漏掉会让手机 App / Capacitor webview 跨域调用时直接 "TypeError: Failed to fetch"
+  //     —— 因为预检失败连后端都到不了。
+  allowHeaders: ["Content-Type", "X-User-Id", "Authorization", "X-Sudo-Token"],
   credentials: true,
 }));
 

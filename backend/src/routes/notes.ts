@@ -13,6 +13,7 @@ import {
 import { broadcastNoteUpdated, broadcastNoteDeleted, broadcastYjsUpdate } from "../services/realtime";
 import { yFlush, yDestroyDoc, yReplaceContentAsUpdate } from "../services/yjs";
 import { deleteAttachmentFilesByNoteIds, extractInlineBase64Images } from "./attachments";
+import { syncReferences as syncAttachmentReferences } from "../lib/attachmentRefs";
 
 const app = new Hono();
 
@@ -364,15 +365,28 @@ app.post("/", async (c) => {
   // 创建路径同样可能携带 base64（如：富文本编辑器粘贴图片后立即新建笔记保存）。
   // 必须放在 INSERT 之后，attachments.noteId 外键要求 note 行先存在。
   // 短路保证常规无内联图的创建零额外成本。
+  let finalContent: string | undefined = typeof body.content === "string" ? body.content : undefined;
   if (typeof body.content === "string" && body.content.indexOf("data:image") >= 0) {
     try {
       const r = extractInlineBase64Images(body.content, userId, id, inheritedWorkspaceId);
       if (r.replacedCount > 0) {
         db.prepare("UPDATE notes SET content = ? WHERE id = ?").run(r.content, id);
+        finalContent = r.content;
       }
     } catch (e) {
       // 抽取失败不阻断创建——base64 仍在 content 里，未来某次 PUT 会再尝试。
       console.warn("[notes.post] extractInlineBase64Images failed:", e instanceof Error ? e.message : e);
+    }
+  }
+
+  // v11: 维护 attachment_references 倒排索引（写时维护）。
+  // 失败仅打日志，不阻断笔记创建——倒排表行缺失只会让"反查引用"暂时不准，
+  // 不影响主流程；下次该笔记 PUT 时会被重新 sync。
+  if (typeof finalContent === "string" && finalContent.indexOf("/api/attachments/") >= 0) {
+    try {
+      syncAttachmentReferences(db, id, finalContent);
+    } catch (e) {
+      console.warn("[notes.post] syncAttachmentReferences failed:", e instanceof Error ? e.message : e);
     }
   }
 
@@ -614,6 +628,16 @@ app.put("/:id", async (c) => {
     }
     params.push(id);
     db.prepare(`UPDATE notes SET ${fields.join(", ")} WHERE id = ?`).run(...params);
+  }
+
+  // v11: 同步 attachment_references 倒排（仅在 content 字段被改动时；非内容字段
+  // 修改不影响附件引用关系）。失败仅打日志不阻断保存。
+  if (body.content !== undefined && typeof body.content === "string") {
+    try {
+      syncAttachmentReferences(db, id, body.content);
+    } catch (e) {
+      console.warn("[notes.put] syncAttachmentReferences failed:", e instanceof Error ? e.message : e);
+    }
   }
 
   // Y1: 返回值里 isFavorite 按当前用户动态计算（EXISTS favorites 表），
