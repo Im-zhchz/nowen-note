@@ -1361,6 +1361,21 @@ export const api = {
       }),
 
     /**
+     * 重命名附件（仅改 attachments.filename 字段；磁盘上的 <uuid>.<ext> 不动）。
+     *
+     * - 后端会自动补扩展名：若新名不含点，会把原扩展接上；
+     * - 返回 { success, filename }，filename 是后端最终采用的名字（可能补过扩展）。
+     */
+    rename: (id: string, filename: string) =>
+      request<{ success: boolean; filename: string; unchanged?: boolean }>(
+        `/files/${id}`,
+        {
+          method: "PATCH",
+          body: JSON.stringify({ filename }),
+        },
+      ),
+
+    /**
      * 上传一份文件到文件管理（无笔记归属时后端落到 holder note）。
      * 用 FormData；不要手动设 Content-Type，交给浏览器注入 multipart boundary。
      * Y4: 自动把 workspaceId 作为 query 传给后端；后端会把 holder note 与

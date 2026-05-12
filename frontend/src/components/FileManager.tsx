@@ -377,6 +377,36 @@ export default function FileManager() {
     [closeDetail, loadStats, loadReclaimable],
   );
 
+  // ---- 重命名 ----
+  // 后端只改 attachments.filename 列，磁盘文件名不动（仍是 <uuid>.<ext>），
+  // 因此重命名"零成本"——不需要重新生成 URL，引用过该附件的笔记里 <img src>
+  // 不会失效。
+  const handleRename = useCallback(
+    async (id: string, newName: string): Promise<boolean> => {
+      const trimmed = newName.trim();
+      if (!trimmed) {
+        toast.error("文件名不能为空");
+        return false;
+      }
+      try {
+        const res = await api.files.rename(id, trimmed);
+        const finalName = res.filename;
+        // 同步两个本地状态：列表行 + 当前打开的详情
+        setItems((prev) =>
+          prev.map((it) => (it.id === id ? { ...it, filename: finalName } : it)),
+        );
+        setDetail((prev) => (prev && prev.id === id ? { ...prev, filename: finalName } : prev));
+        if (!res.unchanged) toast.success("已重命名");
+        return true;
+      } catch (err: any) {
+        console.error("[FileManager] rename failed:", err);
+        toast.error(err?.message || "重命名失败");
+        return false;
+      }
+    },
+    [],
+  );
+
   // ---- 批量选择 ----
   const toggleSelectionMode = useCallback(() => {
     setSelectionMode((m) => {
@@ -966,6 +996,7 @@ export default function FileManager() {
             loading={detailLoading}
             onClose={closeDetail}
             onDelete={handleDelete}
+            onRename={handleRename}
             onJumpToNote={jumpToNote}
             onDownload={downloadItem}
             downloadingId={downloadingId}
@@ -1334,6 +1365,7 @@ function DetailDrawer({
   loading,
   onClose,
   onDelete,
+  onRename,
   onJumpToNote,
   onDownload,
   downloadingId,
@@ -1342,10 +1374,50 @@ function DetailDrawer({
   loading: boolean;
   onClose: () => void;
   onDelete: (id: string) => void;
+  onRename: (id: string, newName: string) => Promise<boolean>;
   onJumpToNote: (noteId: string) => void;
   onDownload: (item: { id: string; filename: string; url: string }) => void;
   downloadingId: string | null;
 }) {
+  // 文件名编辑态：仅在抽屉内本地维护，不上提（保存成功后父组件会刷新 detail.filename）
+  const [renaming, setRenaming] = useState(false);
+  const [renameDraft, setRenameDraft] = useState("");
+  const [renameSubmitting, setRenameSubmitting] = useState(false);
+
+  // 切换不同附件时退出编辑态，避免跨详情残留草稿
+  useEffect(() => {
+    setRenaming(false);
+    setRenameDraft("");
+    setRenameSubmitting(false);
+  }, [detail?.id]);
+
+  const startRename = useCallback(() => {
+    if (!detail) return;
+    setRenameDraft(detail.filename || "");
+    setRenaming(true);
+  }, [detail]);
+
+  const cancelRename = useCallback(() => {
+    setRenaming(false);
+    setRenameDraft("");
+  }, []);
+
+  const submitRename = useCallback(async () => {
+    if (!detail) return;
+    const next = renameDraft.trim();
+    if (!next || next === detail.filename) {
+      cancelRename();
+      return;
+    }
+    setRenameSubmitting(true);
+    const ok = await onRename(detail.id, next);
+    setRenameSubmitting(false);
+    if (ok) {
+      setRenaming(false);
+      setRenameDraft("");
+    }
+  }, [detail, renameDraft, onRename, cancelRename]);
+
   return (
     <>
       {/* 遮罩（移动端全屏；桌面端半透明覆盖） */}
@@ -1405,10 +1477,85 @@ function DetailDrawer({
 
               {/* 元信息 */}
               <div className="space-y-2 text-xs">
-                <MetaRow label="文件名" value={detail.filename} />
+                <MetaRow
+                  label="文件名"
+                  value={
+                    renaming ? (
+                      <div className="flex items-center gap-1.5">
+                        <Input
+                          autoFocus
+                          value={renameDraft}
+                          onChange={(e) => setRenameDraft(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter") {
+                              e.preventDefault();
+                              void submitRename();
+                            } else if (e.key === "Escape") {
+                              e.preventDefault();
+                              cancelRename();
+                            }
+                          }}
+                          disabled={renameSubmitting}
+                          className="h-7 text-xs flex-1 min-w-0"
+                          maxLength={255}
+                        />
+                        <Button
+                          size="sm"
+                          variant="default"
+                          className="h-7 px-2 text-[11px]"
+                          onClick={() => void submitRename()}
+                          disabled={renameSubmitting || !renameDraft.trim()}
+                        >
+                          {renameSubmitting ? <Loader2 size={12} className="animate-spin" /> : "保存"}
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          className="h-7 px-2 text-[11px]"
+                          onClick={cancelRename}
+                          disabled={renameSubmitting}
+                        >
+                          取消
+                        </Button>
+                      </div>
+                    ) : (
+                      <div className="flex items-center gap-2">
+                        <span className="flex-1 min-w-0 break-words">{detail.filename}</span>
+                        <button
+                          type="button"
+                          className="shrink-0 text-[11px] text-accent-primary hover:underline"
+                          onClick={startRename}
+                        >
+                          重命名
+                        </button>
+                      </div>
+                    )
+                  }
+                />
                 <MetaRow label="类型" value={<code className="text-[11px]">{detail.mimeType || "-"}</code>} />
                 <MetaRow label="大小" value={humanSize(detail.size)} />
                 <MetaRow label="上传时间" value={formatLocalTime(detail.createdAt)} />
+                {detail.hash && (
+                  <MetaRow
+                    label="哈希"
+                    value={
+                      <code
+                        className="text-[10px] text-tx-tertiary break-all select-all cursor-pointer"
+                        title="SHA-256；点击复制"
+                        onClick={() => {
+                          try {
+                            void navigator.clipboard.writeText(detail.hash || "");
+                            toast.success("已复制 hash");
+                          } catch {
+                            /* 忽略 */
+                          }
+                        }}
+                      >
+                        {detail.hash}
+                      </code>
+                    }
+                  />
+                )}
                 <MetaRow
                   label="下载链接"
                   value={

@@ -283,6 +283,7 @@
     "taskList": "任务列表",
     "blockquote": "引用",
     "codeBlock": "代码块",
+    "inlineCode": "行内代码",
     "horizontalRule": "分割线",
     "insertImage": "插入图片",
     "insertAttachment": "插入附件",

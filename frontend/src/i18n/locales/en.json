@@ -276,6 +276,7 @@
     "taskList": "Task List",
     "blockquote": "Blockquote",
     "codeBlock": "Code Block",
+    "inlineCode": "Inline Code",
     "horizontalRule": "Horizontal Rule",
     "insertImage": "Insert Image",
     "insertAttachment": "Insert Attachment",

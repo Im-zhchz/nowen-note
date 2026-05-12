@@ -24,7 +24,7 @@ import {
   Bold, Italic, Underline as UnderlineIcon, Strikethrough,
   List, ListOrdered, Heading1, Heading2, Heading3,
   Quote, ImagePlus, Paperclip, CheckSquare, Highlighter, Minus, Undo, Redo,
-  FileCode, Sparkles, X, ZoomIn, ZoomOut, RotateCcw,
+  Code, FileCode, Sparkles, X, ZoomIn, ZoomOut, RotateCcw,
   Table2, Indent, Outdent, AlignLeft, AlignCenter, AlignRight, Trash2,
   FileType, Check, AlertCircle, Info, ArrowUp
 } from "lucide-react";
@@ -868,7 +868,12 @@ export default forwardRef<NoteEditorHandle, TiptapEditorProps>(function TiptapEd
     extensions: [
       StarterKit.configure({
         codeBlock: false,
-        code: false,
+        // 行内代码（inline code）使用 StarterKit 默认实现：
+        //   - 反引号 `text` 触发 input rule 自动转 code mark
+        //   - 快捷键 Mod-E（StarterKit 默认）切换
+        //   - Markdown 序列化为 `text`
+        // 之前显式置 false 是为了配合 codeBlock 一起关，但代码里 IPC "code" 分支、
+        // editor.isActive("code")、工具栏按钮都依赖这个 mark，缺失会导致空跑。
         heading: { levels: [1, 2, 3] },
         // 链接：禁止点击自动打开（尤其是 mailto: / tel: 会唤起邮件/电话客户端
         // 造成误触）。保留自动识别 URL、粘贴自动链接等能力；新窗口目标仍通过
@@ -2486,6 +2491,13 @@ export default forwardRef<NoteEditorHandle, TiptapEditorProps>(function TiptapEd
         >
           <Highlighter size={iconSize} />
         </ToolbarButton>
+        <ToolbarButton
+          onClick={() => editor.chain().focus().toggleCode().run()}
+          isActive={editor.isActive("code")}
+          title={t('tiptap.inlineCode')}
+        >
+          <Code size={iconSize} />
+        </ToolbarButton>
 
         <ToolbarDivider />
 
@@ -2725,6 +2737,13 @@ export default forwardRef<NoteEditorHandle, TiptapEditorProps>(function TiptapEd
             <Highlighter size={14} />
           </ToolbarButton>
           <ToolbarButton
+            onClick={() => editor.chain().focus().toggleCode().run()}
+            isActive={editor.isActive("code")}
+            title={t('tiptap.inlineCode')}
+          >
+            <Code size={14} />
+          </ToolbarButton>
+          <ToolbarButton
             onClick={toggleCodeBlockStrict}
             isActive={editor.isActive("codeBlock")}
             title={t('tiptap.codeBlock')}
@@ -2925,17 +2944,20 @@ export default forwardRef<NoteEditorHandle, TiptapEditorProps>(function TiptapEd
                 <X size={18} />
               </button>
             </div>
-            {/* 图片 */}
+            {/* 图片
+                注意：缩放/平移交给 framer-motion 的独立 transform 通道（scale/x/y）来驱动，
+                不能再写 style.transform 字符串——motion 会接管 transform 并覆盖外部 style，
+                导致 100% 的数字一直在变但 DOM 上 transform 永远停在入场动画终态。
+                入场仅用 opacity 做淡入，初始 scale 用当前 imageZoom 防止抖动。 */}
             <motion.img
               src={previewImage}
               alt="preview"
-              initial={{ scale: 0.9 }}
-              animate={{ scale: 1 }}
-              exit={{ scale: 0.9 }}
-              transition={{ duration: 0.2 }}
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1, scale: imageZoom, x: imageDrag.x, y: imageDrag.y }}
+              exit={{ opacity: 0 }}
+              transition={{ duration: isDragging ? 0 : 0.15 }}
               className="max-w-[90vw] max-h-[90vh] object-contain select-none"
               style={{
-                transform: `scale(${imageZoom}) translate(${imageDrag.x / imageZoom}px, ${imageDrag.y / imageZoom}px)`,
                 cursor: isDragging ? 'grabbing' : 'grab',
               }}
               onMouseDown={handlePreviewMouseDown}

@@ -221,6 +221,11 @@ export interface FileItem {
   createdAt: string;
   category: FileCategory;
   url: string;
+  /**
+   * SHA-256 hex；v11 起新上传/抽取的附件会带；v11 之前的老附件为 null
+   * （懒迁移策略，不强制回填）。仅在文件管理详情视图里供"复制 hash / 排查重复"用。
+   */
+  hash: string | null;
   primaryNote: {
     id: string;
     title: string;
