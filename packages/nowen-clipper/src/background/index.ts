@@ -13,9 +13,11 @@
 import "../lib/sw-polyfill";
 
 import { getConfig, isConfigured, normalizeBaseUrl } from "../lib/storage";
-import { importNote, NowenApiError } from "../lib/api";
+import { importNote, enhanceClip, NowenApiError, type AIEnhanceResult } from "../lib/api";
 import { buildContentBundle, inlineImages } from "../lib/transform";
 import type {
+  AIEnhanceMode,
+  AIEnhanceTasks,
   ClipMode,
   ClipProgress,
   ClipRequest,
@@ -245,9 +247,79 @@ async function runClip(req: ClipRequest): Promise<ClipResult> {
     phase: "transform",
     message: "正在转换格式...",
   });
-  const tags = parseTags(req.overrideTags ?? cfg.defaultTags);
-  const { content, contentText } = buildContentBundle({
-    title: data.title,
+  let tags = parseTags(req.overrideTags ?? cfg.defaultTags);
+  let pageTitle = data.title;
+
+  // ========== AI 优化（可选）==========
+  // 默认行为：用 cfg.aiEnhanceEnabled。popup 可临时反向覆盖（req.aiEnhance）。
+  // simplified / article / selection 都可走 AI（fullpage/screenshot 已在前面分支跳过）。
+  const aiEnabled = req.aiEnhance ?? cfg.aiEnhanceEnabled;
+  const aiTasks: AIEnhanceTasks = req.aiTasks ?? cfg.aiEnhanceTasks;
+  const aiMode: AIEnhanceMode = req.aiMode ?? cfg.aiEnhanceMode;
+  let aiInfo: { ok: boolean; error?: string } | undefined;
+  let aiBlock = ""; // 在 buildContentBundle 之后注入的 AI 块（与 outputFormat 同语言）
+
+  if (aiEnabled && hasAnyTask(aiTasks) && data.text && data.text.trim().length >= 20) {
+    sendProgress({
+      type: "CLIP_PROGRESS",
+      phase: "ai-enhance",
+      message: "AI 正在优化内容...",
+    });
+    try {
+      const aiResp = await enhanceClip(cfg, {
+        title: data.title,
+        url: data.url,
+        siteName: data.siteName,
+        contentText: data.text,
+        tasks: aiTasks,
+        language: cfg.aiEnhanceLanguage,
+        customInstruction: cfg.aiCustomInstruction || undefined,
+        maxInputChars: cfg.aiMaxInputChars,
+      });
+
+      if (aiResp.ok && aiResp.enhanced) {
+        // 应用标题覆盖（如果用户勾了 title 任务）
+        if (aiResp.enhanced.title) {
+          pageTitle = aiResp.enhanced.title;
+        }
+        // 合并 AI 标签（去重）
+        if (aiResp.enhanced.tags && aiResp.enhanced.tags.length) {
+          const set = new Set(tags.map((t) => t.toLowerCase()));
+          for (const t of aiResp.enhanced.tags) {
+            if (!set.has(t.toLowerCase())) {
+              tags.push(t);
+              set.add(t.toLowerCase());
+            }
+          }
+        }
+        // 生成 AI 块（用于 prepend / append / replace）
+        aiBlock = composeAIBlock(aiResp.enhanced, cfg.outputFormat);
+        aiInfo = { ok: true };
+      } else {
+        const err = aiResp.error || "AI 返回失败";
+        console.warn("[nowen-clipper] AI 优化失败:", err);
+        aiInfo = { ok: false, error: err };
+        if (cfg.aiFailureStrategy === "fail") {
+          notify("AI 优化失败", err);
+          return { ok: false, error: `AI 优化失败：${err}` };
+        }
+        // fallback：继续走原文路径
+      }
+    } catch (e: any) {
+      const msg = describeError(e);
+      console.warn("[nowen-clipper] AI 优化异常:", msg);
+      aiInfo = { ok: false, error: msg };
+      if (cfg.aiFailureStrategy === "fail") {
+        notify("AI 优化失败", msg);
+        return { ok: false, error: `AI 优化失败：${msg}` };
+      }
+      // fallback：继续走原文路径
+    }
+  }
+  // ========== /AI 优化 ==========
+
+  const { content: baseContent, contentText: baseContentText } = buildContentBundle({
+    title: pageTitle,
     html,
     sourceUrl: data.url,
     siteName: data.siteName,
@@ -257,12 +329,49 @@ async function runClip(req: ClipRequest): Promise<ClipResult> {
     comment: req.comment,
   });
 
+  // 把 AI 块按 mode 拼回 content
+  let content = baseContent;
+  let contentText = baseContentText;
+  if (aiBlock) {
+    if (aiMode === "replace") {
+      // 只保留 AI 产物（仍保留 title/来源/标签作为附录）—— 用 baseContent 的首尾框架
+      // 简单实现：用 aiBlock 替换正文 html 转过来的中段不可行（没有可靠分隔符），
+      // 折中：直接用 "标题 + AI 块 + 来源/标签" 重新构建
+      const rebuilt = buildContentBundle({
+        title: pageTitle,
+        html: cfg.outputFormat === "html" ? aiBlock : `<pre data-nowen-md>${escapeHtml(aiBlock)}</pre>`,
+        sourceUrl: data.url,
+        siteName: data.siteName,
+        format: cfg.outputFormat,
+        includeSource: cfg.includeSource,
+        tags,
+        comment: req.comment,
+      });
+      // markdown 模式下，buildContentBundle 会把 <pre data-nowen-md> 转成代码块——
+      // 这不是我们要的；改成直接拼字符串。
+      if (cfg.outputFormat === "markdown") {
+        content = `# ${pageTitle}\n\n${aiBlock}\n\n${buildFooterMd(cfg.includeSource, data.url, data.siteName, tags)}`;
+        contentText = content.replace(/[#*`>\-|_\[\]()]/g, "").replace(/\s+/g, " ").trim();
+      } else {
+        content = rebuilt.content;
+        contentText = rebuilt.contentText;
+      }
+    } else if (aiMode === "prepend") {
+      content = injectAIBlock(baseContent, aiBlock, "prepend", cfg.outputFormat);
+      contentText = aiBlock.replace(/[#*`>\-|_\[\]()]/g, " ") + " " + baseContentText;
+    } else {
+      // append
+      content = injectAIBlock(baseContent, aiBlock, "append", cfg.outputFormat);
+      contentText = baseContentText + " " + aiBlock.replace(/[#*`>\-|_\[\]()]/g, " ");
+    }
+  }
+
   // 上传
   sendProgress({ type: "CLIP_PROGRESS", phase: "upload", message: "正在上传到 Nowen Note..." });
   const notebookName = (req.overrideNotebook ?? cfg.defaultNotebook).trim() || "Web 剪藏";
   try {
     const resp = await importNote(cfg, {
-      title: data.title,
+      title: pageTitle,
       content,
       contentText,
       notebookName,
@@ -274,12 +383,18 @@ async function runClip(req: ClipRequest): Promise<ClipResult> {
       message: `已保存到「${notebookName}」`,
       noteId,
       images,
+      aiInfo,
     });
+    const aiTip = aiInfo
+      ? aiInfo.ok
+        ? "（已 AI 优化）"
+        : `（AI 失败：${(aiInfo.error || "").slice(0, 60)}，已保存原文）`
+      : "";
     notify(
       "剪藏成功",
-      `已保存到「${notebookName}」${images.failed ? `（${images.failed} 张图片下载失败）` : ""}`,
+      `已保存到「${notebookName}」${images.failed ? `（${images.failed} 张图片下载失败）` : ""}${aiTip}`,
     );
-    return { ok: true, noteId, noteTitle: data.title, images };
+    return { ok: true, noteId, noteTitle: pageTitle, images };
   } catch (e) {
     const msg = describeError(e);
     sendProgress({ type: "CLIP_PROGRESS", phase: "error", message: msg });
@@ -833,6 +948,130 @@ function escapeHtml(s: string): string {
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;");
+}
+
+// ========== AI 优化辅助 ==========
+
+function hasAnyTask(t: AIEnhanceTasks): boolean {
+  return !!(t.summary || t.outline || t.tags || t.title || t.highlight || t.translation);
+}
+
+/**
+ * 把后端返回的 enhanced 字段组合成"AI 优化块"（Markdown 或 HTML 片段）。
+ * 注意：title / tags 已经在调用处单独处理，不出现在这里。
+ */
+function composeAIBlock(
+  enhanced: NonNullable<AIEnhanceResult["enhanced"]>,
+  format: "markdown" | "html",
+): string {
+  if (format === "markdown") {
+    const parts: string[] = [];
+    if (enhanced.summary) {
+      parts.push(`> [!summary] **AI 摘要**\n> ${enhanced.summary.replace(/\n/g, "\n> ")}`);
+    }
+    if (enhanced.highlights && enhanced.highlights.length) {
+      parts.push(
+        `**🔑 重点**\n` + enhanced.highlights.map((h) => `- ${h}`).join("\n"),
+      );
+    }
+    if (enhanced.outline) {
+      parts.push(`**📋 大纲**\n\n${enhanced.outline}`);
+    }
+    if (enhanced.translation) {
+      parts.push(`**🌐 中文翻译**\n\n${enhanced.translation}`);
+    }
+    if (parts.length === 0) return "";
+    return parts.join("\n\n");
+  }
+
+  // html
+  const parts: string[] = [];
+  if (enhanced.summary) {
+    parts.push(
+      `<blockquote><p><strong>AI 摘要</strong></p><p>${escapeHtml(enhanced.summary)}</p></blockquote>`,
+    );
+  }
+  if (enhanced.highlights && enhanced.highlights.length) {
+    parts.push(
+      `<p><strong>🔑 重点</strong></p><ul>${enhanced.highlights.map((h) => `<li>${escapeHtml(h)}</li>`).join("")}</ul>`,
+    );
+  }
+  if (enhanced.outline) {
+    // outline 是 markdown 列表，简单转 <pre> 以保留结构（前端 Tiptap 不会渲染 MD 嵌套，但
+    // /export/import 会把它当作 HTML 文档，能保留可读性。复杂情况下用户可在前端重渲染）。
+    parts.push(
+      `<p><strong>📋 大纲</strong></p><pre>${escapeHtml(enhanced.outline)}</pre>`,
+    );
+  }
+  if (enhanced.translation) {
+    parts.push(
+      `<p><strong>🌐 中文翻译</strong></p><pre>${escapeHtml(enhanced.translation)}</pre>`,
+    );
+  }
+  return parts.join("\n");
+}
+
+/**
+ * 把 AI 块注入到 buildContentBundle 的产物里：
+ *   - prepend: 紧跟在 H1 标题（# 或 <h1>）之后插入
+ *   - append:  在末尾"来源/标签"之前插入；找不到则直接追加到最后
+ */
+function injectAIBlock(
+  base: string,
+  block: string,
+  pos: "prepend" | "append",
+  format: "markdown" | "html",
+): string {
+  if (pos === "prepend") {
+    if (format === "markdown") {
+      // 在第一个 H1 行（# Title）之后插入
+      const m = base.match(/^(#\s+[^\n]+\n)/);
+      if (m) {
+        return base.slice(0, m[0].length) + "\n" + block + "\n\n---\n\n" + base.slice(m[0].length);
+      }
+      return block + "\n\n---\n\n" + base;
+    } else {
+      // html: 在 </h1> 之后插入
+      const m = base.match(/<\/h1>/i);
+      if (m && typeof m.index === "number") {
+        const insertAt = m.index + m[0].length;
+        return base.slice(0, insertAt) + "\n" + block + "\n<hr/>\n" + base.slice(insertAt);
+      }
+      return block + "\n<hr/>\n" + base;
+    }
+  }
+
+  // append：尽量插在"来源"附录之前
+  if (format === "markdown") {
+    const m = base.match(/\n---\n[^\n]*📎\s*来源/);
+    if (m && typeof m.index === "number") {
+      return base.slice(0, m.index) + "\n\n---\n\n" + block + base.slice(m.index);
+    }
+    return base + "\n\n---\n\n" + block;
+  } else {
+    const m = base.match(/<hr\s*\/?>\s*<p><small>📎\s*来源/i);
+    if (m && typeof m.index === "number") {
+      return base.slice(0, m.index) + "\n<hr/>\n" + block + "\n" + base.slice(m.index);
+    }
+    return base + "\n<hr/>\n" + block;
+  }
+}
+
+/** replace 模式重建笔记尾部（来源 + 标签） */
+function buildFooterMd(
+  includeSource: boolean,
+  url: string,
+  siteName: string,
+  tags: string[],
+): string {
+  const parts: string[] = [];
+  if (includeSource) {
+    parts.push(`---\n\n📎 来源：[${siteName || url}](${url})`);
+  }
+  if (tags.length) {
+    parts.push(tags.map((t) => `#${t}`).join(" "));
+  }
+  return parts.join("\n\n");
 }
 
 // ========== keepalive：避免剪藏中途 service worker 被回收 ==========

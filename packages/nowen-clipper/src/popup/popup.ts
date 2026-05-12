@@ -9,7 +9,7 @@
  */
 
 import { getConfig, isConfigured, setConfig, normalizeBaseUrl } from "../lib/storage";
-import type { ClipMode, ClipProgress, ClipRequest } from "../lib/protocol";
+import type { AIEnhanceMode, AIEnhanceTasks, ClipMode, ClipProgress, ClipRequest } from "../lib/protocol";
 
 async function init() {
   const cfg = await getConfig();
@@ -30,6 +30,26 @@ async function init() {
   (document.getElementById("notebook") as HTMLInputElement).value = cfg.defaultNotebook || "";
   (document.getElementById("tags") as HTMLInputElement).value = cfg.defaultTags || "";
   (document.getElementById("quick-capture") as HTMLInputElement).checked = cfg.quickCapture || false;
+
+  // AI 优化区初始化
+  (document.getElementById("ai-enhance") as HTMLInputElement).checked = cfg.aiEnhanceEnabled;
+  (document.getElementById("ai-mode") as HTMLSelectElement).value = cfg.aiEnhanceMode;
+  document.querySelectorAll<HTMLInputElement>("#ai-details input[data-task]").forEach((el) => {
+    const k = el.dataset.task as keyof AIEnhanceTasks;
+    el.checked = !!cfg.aiEnhanceTasks[k];
+  });
+  // 默认展开/收起 AI 详情：勾选 AI 时展开
+  const aiDetails = document.getElementById("ai-details")!;
+  if (cfg.aiEnhanceEnabled) aiDetails.classList.remove("hidden");
+  document.getElementById("ai-toggle-details")!.addEventListener("click", (e) => {
+    e.preventDefault();
+    aiDetails.classList.toggle("hidden");
+  });
+  document.getElementById("ai-enhance")!.addEventListener("change", (e) => {
+    if ((e.target as HTMLInputElement).checked) {
+      aiDetails.classList.remove("hidden");
+    }
+  });
 
   // 获取当前页面标题
   try {
@@ -56,6 +76,16 @@ async function init() {
   });
 }
 
+/** 从 popup UI 收集 AI 任务勾选 */
+function collectAITasks(): AIEnhanceTasks {
+  const tasks: AIEnhanceTasks = {};
+  document.querySelectorAll<HTMLInputElement>("#ai-details input[data-task]").forEach((el) => {
+    const k = el.dataset.task as keyof AIEnhanceTasks;
+    if (el.checked) tasks[k] = true;
+  });
+  return tasks;
+}
+
 async function clip() {
   const btn = document.getElementById("clip") as HTMLButtonElement;
   const progress = document.getElementById("progress")!;
@@ -77,9 +107,25 @@ async function clip() {
 
   const mode = (document.getElementById("clip-mode") as HTMLSelectElement).value as ClipMode;
   const comment = (document.getElementById("comment") as HTMLTextAreaElement).value.trim();
+  const aiEnhance = (document.getElementById("ai-enhance") as HTMLInputElement).checked;
+  const aiMode = (document.getElementById("ai-mode") as HTMLSelectElement).value as AIEnhanceMode;
+  const aiTasks = collectAITasks();
 
-  console.log("[nowen-clipper popup] 选择的模式:", mode);
+  // 持久化最新的 AI 偏好（让下次打开 popup 保持上次的选择）
+  try {
+    await setConfig({
+      aiEnhanceEnabled: aiEnhance,
+      aiEnhanceMode: aiMode,
+      aiEnhanceTasks: aiTasks,
+    });
+  } catch {
+    /* 持久化失败不阻断剪藏 */
+  }
 
+  console.log("[nowen-clipper popup] 选择的模式:", mode, "AI:", aiEnhance, aiTasks);
+
+  // AI 优化仅在 article / selection / simplified 模式有意义
+  const aiApplicable = mode === "article" || mode === "selection" || mode === "simplified";
   const req: ClipRequest = {
     type: "CLIP_REQUEST",
     mode,
@@ -87,6 +133,9 @@ async function clip() {
     overrideNotebook: (document.getElementById("notebook") as HTMLInputElement).value.trim(),
     overrideTags: (document.getElementById("tags") as HTMLInputElement).value.trim(),
     comment: comment || undefined,
+    aiEnhance: aiApplicable ? aiEnhance : false,
+    aiTasks: aiApplicable && aiEnhance ? aiTasks : undefined,
+    aiMode: aiApplicable && aiEnhance ? aiMode : undefined,
   };
 
   // 截图模式：popup 必须先关闭，否则 captureVisibleTab 会截到 popup 且触发 quota 限制

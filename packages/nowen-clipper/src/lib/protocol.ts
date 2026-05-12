@@ -15,6 +15,32 @@ import type { ExtractResult } from "./extractor";
  */
 export type ClipMode = "simplified" | "article" | "fullpage" | "selection" | "screenshot" | "fullScreenshot";
 
+/**
+ * AI 优化任务勾选项（多选）：
+ *   - summary:     TL;DR 摘要
+ *   - outline:     结构化大纲
+ *   - tags:        自动标签（会写入笔记标签）
+ *   - title:       重写标题（覆盖原 <title>，适合标题党）
+ *   - highlight:   重点高亮（提取 3-5 句关键句，正文里渲染为 == 高亮 ==）
+ *   - translation: 翻译为中文（追加在原文之后）
+ */
+export interface AIEnhanceTasks {
+  summary?: boolean;
+  outline?: boolean;
+  tags?: boolean;
+  title?: boolean;
+  highlight?: boolean;
+  translation?: boolean;
+}
+
+/**
+ * AI 产物如何拼回笔记：
+ *   - append:  原文 + 末尾追加 AI 产物（推荐，零信息损失）
+ *   - prepend: AI 摘要置顶 + 原文（推荐，先看结论再看细节）
+ *   - replace: 只保留 AI 产物（适合极长文章只要总结）
+ */
+export type AIEnhanceMode = "append" | "prepend" | "replace";
+
 /** popup → background: 执行一次剪藏 */
 export interface ClipRequest {
   type: "CLIP_REQUEST";
@@ -25,17 +51,33 @@ export interface ClipRequest {
   overrideTags?: string;
   /** 用户附加的评论 */
   comment?: string;
+  /** 是否使用 AI 优化（覆盖默认配置） */
+  aiEnhance?: boolean;
+  /** AI 任务勾选（仅当 aiEnhance=true 生效；不传则用默认） */
+  aiTasks?: AIEnhanceTasks;
+  /** AI 拼接模式（仅当 aiEnhance=true 生效；不传则用默认） */
+  aiMode?: AIEnhanceMode;
 }
 
 /** background → popup: 进度回执 */
 export interface ClipProgress {
   type: "CLIP_PROGRESS";
-  phase: "extract" | "screenshot" | "download-images" | "transform" | "upload" | "done" | "error";
+  phase:
+    | "extract"
+    | "screenshot"
+    | "download-images"
+    | "transform"
+    | "ai-enhance"
+    | "upload"
+    | "done"
+    | "error";
   message: string;
   /** done 时返回后端 noteId */
   noteId?: string;
   /** 图片下载成功/失败数 */
   images?: { ok: number; failed: number; skipped: number };
+  /** AI 优化的结果摘要（仅 done 阶段且做过 AI 时填） */
+  aiInfo?: { ok: boolean; error?: string };
 }
 
 /** background → content: 请求抽取 */

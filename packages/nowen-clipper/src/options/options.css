@@ -32,7 +32,7 @@ label > span {
   color: #374151;
   margin-bottom: 4px;
 }
-input[type="text"], input[type="url"], input[type="password"], select {
+input[type="text"], input[type="url"], input[type="password"], input[type="number"], select, textarea {
   width: 100%;
   padding: 8px 10px;
   border: 1px solid #d1d5db;
@@ -41,8 +41,10 @@ input[type="text"], input[type="url"], input[type="password"], select {
   background: #fff;
   outline: none;
   transition: border-color .15s;
+  font-family: inherit;
 }
-input:focus, select:focus { border-color: #3b82f6; }
+textarea { resize: vertical; min-height: 40px; line-height: 1.5; }
+input:focus, select:focus, textarea:focus { border-color: #3b82f6; }
 .input-with-toggle {
   position: relative;
   display: flex;
@@ -120,3 +122,27 @@ input:focus, select:focus { border-color: #3b82f6; }
   font-weight: 500;
 }
 .status-badge.ok { color: #166534; }
+
+/* AI 优化任务网格 */
+.ai-tasks-fieldset {
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  padding: 10px 14px 6px;
+  margin-bottom: 12px;
+  background: #fafafa;
+}
+.ai-tasks-fieldset legend {
+  font-size: 12px;
+  color: #6b7280;
+  padding: 0 6px;
+}
+.ai-tasks-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px 14px;
+}
+.ai-tasks-grid label.checkbox {
+  margin-bottom: 4px;
+  font-size: 12.5px;
+}
+.ai-tasks-grid label.checkbox input { width: 14px; height: 14px; accent-color: #7c3aed; }

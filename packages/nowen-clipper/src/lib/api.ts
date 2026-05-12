@@ -144,8 +144,7 @@ export async function listNotebooks(
   return (await res.json()) as Array<{ id: string; name: string; parentId: string | null }>;
 }
 
-/**
- * 导入一条笔记。
+/** 导入一条笔记。
  *
  * 关键点：我们提交的 content 是 HTML；后端 `export/import` 路由会自动调用
  * `extractInlineBase64Images` 把 <img src="data:image/..."> 抽成 /api/attachments/<id>，
@@ -181,4 +180,63 @@ export async function importNote(
   });
   if (!res.ok) throw await parseErr(res);
   return (await res.json()) as ImportResponse;
+}
+
+// ============================================================
+// AI 优化：剪藏正文 → LLM 增强 → 返回结构化结果
+// ------------------------------------------------------------
+//
+// 对应后端 POST /api/ai/clip-enhance（非流式）。
+// 注意失败语义：后端把"AI 服务调用失败"包装成 HTTP 200 + ok:false，
+// 这样客户端可以根据 cfg.aiFailureStrategy 决定是降级保存原文还是整体失败，
+// 而不是触发 fetch 的异常路径。HTTP 4xx/5xx 仍走异常抛出。
+// ============================================================
+
+export interface AIEnhanceRequest {
+  title?: string;
+  url?: string;
+  siteName?: string;
+  contentText: string;
+  tasks: {
+    summary?: boolean;
+    outline?: boolean;
+    tags?: boolean;
+    title?: boolean;
+    highlight?: boolean;
+    translation?: boolean;
+  };
+  language?: "zh-CN" | "en";
+  customInstruction?: string;
+  maxInputChars?: number;
+}
+
+export interface AIEnhanceResult {
+  ok: boolean;
+  error?: string;
+  enhanced?: {
+    title?: string;
+    summary?: string;
+    outline?: string;
+    tags?: string[];
+    highlights?: string[];
+    translation?: string;
+  };
+  model?: string;
+  truncated?: boolean;
+}
+
+export async function enhanceClip(
+  cfg: NowenClipperConfig,
+  payload: AIEnhanceRequest,
+): Promise<AIEnhanceResult> {
+  const base = normalizeBaseUrl(cfg.serverUrl);
+  const res = await fetch(`${base}/api/ai/clip-enhance`, {
+    method: "POST",
+    headers: authHeaders(cfg),
+    body: JSON.stringify(payload),
+  });
+  // 4xx / 5xx 走异常路径
+  if (!res.ok) throw await parseErr(res);
+  // 200 同时可能携带 ok:false（AI 服务自身的逻辑失败，例如超时、JSON 解析失败）
+  return (await res.json()) as AIEnhanceResult;
 }

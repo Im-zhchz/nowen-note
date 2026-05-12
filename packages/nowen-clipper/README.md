@@ -12,6 +12,15 @@
 - 右键菜单 + 弹窗 + 快捷键三种入口
   - `Alt+Shift+S`：剪藏整页
   - `Alt+Shift+A`：剪藏选区
+- ✨ **AI 优化**：剪藏后调用 nowen-note 主站的 AI 服务自动整理，单次请求多任务（摘要 / 大纲 / 标签 / 重写标题 / 重点高亮 / 翻译），按"prepend / append / replace"三种方式拼回笔记，默认保留原文不丢信息。API Key 由后端集中托管，扩展零持有。
+
+### AI 优化的设计要点
+
+- **复用主站 AI 设置**：扩展不持有 Provider/Key，调用 `POST /api/ai/clip-enhance`（非流式，避免 MV3 service worker 30s 回收）
+- **失败降级**：默认 AI 失败时降级保存原文，剪藏不中断；可在 Options 切换为"整体失败"
+- **单次请求多任务**：用 OpenAI JSON mode 让 LLM 一次返回 `{title?, summary?, outline?, tags?, highlights?, translation?}`
+- **输入截断**：默认 6000 字，超长取头 2/3 + 尾 1/3（标题党正文头部最关键，结尾常有总结）
+- **截图/完全克隆模式自动跳过 AI**（无文本可优化 / 自包含 HTML 不适合处理）
 
 ## 前置条件
 

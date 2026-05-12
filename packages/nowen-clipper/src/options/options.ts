@@ -3,6 +3,7 @@
  */
 import { getConfig, setConfig, normalizeBaseUrl, type NowenClipperConfig } from "../lib/storage";
 import { login, verify2FA, ping } from "../lib/api";
+import type { AIEnhanceTasks } from "../lib/protocol";
 
 /** 暂存 2FA ticket（登录第一步返回 requires2FA 时保存） */
 let pending2FATicket = "";
@@ -19,6 +20,20 @@ async function init() {
   (document.getElementById("imageMode") as HTMLSelectElement).value = cfg.imageMode;
   (document.getElementById("outputFormat") as HTMLSelectElement).value = cfg.outputFormat;
   (document.getElementById("includeSource") as HTMLInputElement).checked = cfg.includeSource;
+
+  // AI 优化字段
+  (document.getElementById("aiEnhanceEnabled") as HTMLInputElement).checked = cfg.aiEnhanceEnabled;
+  (document.getElementById("aiEnhanceMode") as HTMLSelectElement).value = cfg.aiEnhanceMode;
+  (document.getElementById("aiEnhanceLanguage") as HTMLSelectElement).value = cfg.aiEnhanceLanguage;
+  (document.getElementById("aiMaxInputChars") as HTMLInputElement).value = String(cfg.aiMaxInputChars);
+  (document.getElementById("aiFailureStrategy") as HTMLSelectElement).value = cfg.aiFailureStrategy;
+  (document.getElementById("aiCustomInstruction") as HTMLTextAreaElement).value = cfg.aiCustomInstruction;
+  document
+    .querySelectorAll<HTMLInputElement>('.ai-tasks-grid input[data-task]')
+    .forEach((el) => {
+      const k = el.dataset.task as keyof AIEnhanceTasks;
+      el.checked = !!cfg.aiEnhanceTasks[k];
+    });
 
   // 密码切换
   document.getElementById("toggle-password")!.addEventListener("click", () => {
@@ -161,6 +176,18 @@ function onRelogin() {
 }
 
 function readForm(): Partial<NowenClipperConfig> {
+  // 读取 AI 任务勾选
+  const aiTasks: AIEnhanceTasks = {};
+  document
+    .querySelectorAll<HTMLInputElement>('.ai-tasks-grid input[data-task]')
+    .forEach((el) => {
+      const k = el.dataset.task as keyof AIEnhanceTasks;
+      if (el.checked) aiTasks[k] = true;
+    });
+
+  const maxInputRaw = (document.getElementById("aiMaxInputChars") as HTMLInputElement).value.trim();
+  const maxInputChars = Math.min(Math.max(parseInt(maxInputRaw, 10) || 6000, 1000), 12000);
+
   return {
     serverUrl: normalizeBaseUrl(
       (document.getElementById("serverUrl") as HTMLInputElement).value,
@@ -170,6 +197,14 @@ function readForm(): Partial<NowenClipperConfig> {
     imageMode: (document.getElementById("imageMode") as HTMLSelectElement).value as any,
     outputFormat: (document.getElementById("outputFormat") as HTMLSelectElement).value as any,
     includeSource: (document.getElementById("includeSource") as HTMLInputElement).checked,
+
+    aiEnhanceEnabled: (document.getElementById("aiEnhanceEnabled") as HTMLInputElement).checked,
+    aiEnhanceTasks: aiTasks,
+    aiEnhanceMode: (document.getElementById("aiEnhanceMode") as HTMLSelectElement).value as any,
+    aiEnhanceLanguage: (document.getElementById("aiEnhanceLanguage") as HTMLSelectElement).value as any,
+    aiMaxInputChars: maxInputChars,
+    aiFailureStrategy: (document.getElementById("aiFailureStrategy") as HTMLSelectElement).value as any,
+    aiCustomInstruction: (document.getElementById("aiCustomInstruction") as HTMLTextAreaElement).value.trim(),
   };
 }
 

@@ -70,6 +70,34 @@
           </div>
         </div>
 
+        <!-- AI 优化 -->
+        <div class="ai-row">
+          <label class="ai-toggle-label">
+            <input type="checkbox" id="ai-enhance" />
+            <svg viewBox="0 0 20 20" fill="currentColor" width="14" height="14" class="ai-icon">
+              <path d="M10 2a1 1 0 01.894.553l1.382 2.764 3.05.443a1 1 0 01.554 1.706l-2.207 2.151.521 3.038a1 1 0 01-1.451 1.054L10 12.347l-2.728 1.434a1 1 0 01-1.451-1.054l.52-3.038-2.206-2.15a1 1 0 01.554-1.707l3.05-.443L9.106 2.553A1 1 0 0110 2z"/>
+            </svg>
+            <span>使用 AI 优化（剪藏后自动整理）</span>
+            <button type="button" id="ai-toggle-details" class="ai-details-btn" title="任务勾选">⋯</button>
+          </label>
+          <div id="ai-details" class="ai-details hidden">
+            <label class="ai-task"><input type="checkbox" data-task="summary" /><span>TL;DR 摘要</span></label>
+            <label class="ai-task"><input type="checkbox" data-task="tags" /><span>自动标签</span></label>
+            <label class="ai-task"><input type="checkbox" data-task="outline" /><span>结构化大纲</span></label>
+            <label class="ai-task"><input type="checkbox" data-task="title" /><span>重写标题</span></label>
+            <label class="ai-task"><input type="checkbox" data-task="highlight" /><span>重点高亮</span></label>
+            <label class="ai-task"><input type="checkbox" data-task="translation" /><span>翻译为中文</span></label>
+            <div class="ai-mode-row">
+              <span class="ai-mode-label">拼接方式</span>
+              <select id="ai-mode" class="ai-mode-select">
+                <option value="prepend">摘要置顶 + 原文</option>
+                <option value="append">原文 + 摘要末尾</option>
+                <option value="replace">只保留 AI 产物</option>
+              </select>
+            </div>
+          </div>
+        </div>
+
         <!-- 剪藏按钮 -->
         <button id="clip" class="btn primary large">剪藏到 Nowen Note</button>
 

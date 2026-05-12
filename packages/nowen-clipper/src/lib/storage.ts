@@ -6,7 +6,7 @@
  *   - 临时状态（最近剪藏历史）放 local，不上传到云
  */
 
-import type { ClipMode } from "./protocol";
+import type { AIEnhanceMode, AIEnhanceTasks, ClipMode } from "./protocol";
 
 export interface NowenClipperConfig {
   /** 后端地址，例如 https://note.example.com 或 http://localhost:3001 */
@@ -31,6 +31,23 @@ export interface NowenClipperConfig {
   quickCapture: boolean;
   /** 快速捕捉的默认模式 */
   quickCaptureMode: ClipMode;
+
+  // ========== AI 优化（剪藏后通过 LLM 增强再保存） ==========
+
+  /** 是否默认启用 AI 优化（在 popup 里可临时反向覆盖） */
+  aiEnhanceEnabled: boolean;
+  /** 默认的 AI 任务勾选 */
+  aiEnhanceTasks: AIEnhanceTasks;
+  /** AI 产物如何拼回笔记（默认 prepend：摘要置顶 + 原文） */
+  aiEnhanceMode: AIEnhanceMode;
+  /** AI 优化的输出语言（影响后端 prompt） */
+  aiEnhanceLanguage: "zh-CN" | "en";
+  /** 用户可自定义补充指令（拼到 system prompt 末尾），留空则不用 */
+  aiCustomInstruction: string;
+  /** 正文截断字数上限（超出取头+尾） */
+  aiMaxInputChars: number;
+  /** AI 失败时的策略：fallback=降级保存原文（默认），fail=整体失败 */
+  aiFailureStrategy: "fallback" | "fail";
 }
 
 const DEFAULTS: NowenClipperConfig = {
@@ -45,6 +62,22 @@ const DEFAULTS: NowenClipperConfig = {
   outputFormat: "markdown",
   quickCapture: false,
   quickCaptureMode: "article",
+
+  // AI 默认行为：默认关闭，主动开启；开启后默认做"摘要 + 标签"两项最稳的
+  aiEnhanceEnabled: false,
+  aiEnhanceTasks: {
+    summary: true,
+    tags: true,
+    outline: false,
+    title: false,
+    highlight: false,
+    translation: false,
+  },
+  aiEnhanceMode: "prepend",
+  aiEnhanceLanguage: "zh-CN",
+  aiCustomInstruction: "",
+  aiMaxInputChars: 6000,
+  aiFailureStrategy: "fallback",
 };
 
 const CONFIG_KEY = "nowenClipperConfig";
@@ -54,7 +87,12 @@ export async function getConfig(): Promise<NowenClipperConfig> {
   const store = chrome.storage.sync || chrome.storage.local;
   const data = (await store.get(CONFIG_KEY)) as Record<string, unknown>;
   const raw = (data[CONFIG_KEY] || {}) as Partial<NowenClipperConfig>;
-  return { ...DEFAULTS, ...raw };
+  const merged = { ...DEFAULTS, ...raw } as NowenClipperConfig;
+  // aiEnhanceTasks 是嵌套对象，浅合并会丢字段——单独深合并
+  if (raw.aiEnhanceTasks) {
+    merged.aiEnhanceTasks = { ...DEFAULTS.aiEnhanceTasks, ...raw.aiEnhanceTasks };
+  }
+  return merged;
 }
 
 /** 写入配置（浅合并，传入 null 会覆盖为默认） */
