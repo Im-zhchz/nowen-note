@@ -1,6 +1,11 @@
 {
-  "generatedAt": "2026-05-11T09:30:53.247Z",
+  "generatedAt": "2026-05-12T04:43:19.973Z",
   "entries": [
+    {
+      "version": "1.0.36",
+      "date": "2026-05-12",
+      "body": "### ✨ 新增\n\n- **clipper**: AI optimize clipped content via nowen-note backend (fbc1249)\n- **frontend**: wire FileManager/TiptapEditor with new attachment refs + i18n (0376a01)\n- **backend**: add AI clip-enhance API and attachment/share infra (bb91576)\n- **rag**: support xlsx/xlsm/xltx attachment indexing for AI Q&A (d184942)\n\n### 🐛 修复\n\n- **release**: prevent cross-platform native module mismatch in Win installer (5d73e19)\n\n### 🔧 其他\n\n- **clipper**: support Chrome/Edge/Firefox packaging + release v0.1.1 artifacts (10b36d2)"
+    },
     {
       "version": "1.0.35",
       "date": "2026-05-11",
