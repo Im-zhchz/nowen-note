@@ -123,6 +123,16 @@ If this project helps you, feel free to scan the QR code and buy the author a co
 
 > 最近 5 个版本的更新内容，完整历史见 [CHANGELOG.md](./CHANGELOG.md)。
 
+### v1.0.37 - 2026-05-12
+
+### ✨ 新增
+
+- AI 批量归类加确认面板；剪藏来源用完整 URL；版本提示按版本号去重 (d6b30bd)
+
+### 🐛 修复
+
+- **android**: 修复键盘弹起后输入框下方一大片白色空白 (35cfb74)
+
 ### v1.0.36 - 2026-05-12
 
 ### ✨ 新增
@@ -179,26 +189,5 @@ If this project helps you, feel free to scan the QR code and buy the author a co
 - **ai**: AI 写作助手 markdown 格式化丢失链接和图片 (91e42e4)
 - **electron**: 修复 main.js 第 702 行非法字符串导致主进程启动崩溃 (e851eeb)
 - **release**: 仅上传当前版本产物到 GitHub Release，避免历史包混入 (91edab8)
-
-### v1.0.32 - 2026-05-09
-
-### ✨ 新增
-
-- **release**: wire NOWEN_BUILD_TIME/APP_VERSION into Docker, add lite/clipper targets (d3ab15f)
-- **update**: tighten cross-platform update flow (8b56551)
-- **update**: in-app update notifier & clipper pack tweaks (1ba6730)
-- **about**: add sponsor QR card in Settings -> About (9f78cd3)
-
-### 🐛 修复
-
-- bug (de5b1dc)
-- **update**: suppress banner when appVersion already matches (127c1ee)
-- **notes**: enforce workspace isolation on note move (a783d31)
-- **clipper**: derive firefox manifest from chrome manifest (bef9e82)
-- **attachments**: inherit workspaceId from note on upload (65a71cd)
-
-### 📝 文档
-
-- document fpk one-click install for fnOS (6d7c588)
 
 <!-- CHANGELOG:END -->
