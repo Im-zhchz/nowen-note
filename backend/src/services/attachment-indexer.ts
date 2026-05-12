@@ -75,12 +75,30 @@ function isXmlMime(mime: string): boolean {
   return m === "application/xml" || m === "text/xml";
 }
 
+/** xlsx / xlsm / xltx — Office Open XML 电子表格 */
+function isXlsxMime(mime: string): boolean {
+  const m = (mime || "").toLowerCase();
+  return (
+    m === "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" ||
+    m === "application/vnd.ms-excel.sheet.macroenabled.12" ||
+    m === "application/vnd.openxmlformats-officedocument.spreadsheetml.template" ||
+    // 部分浏览器 / OS 上传时把 xlsx 标成通用 zip / octet-stream，
+    // 后续 guessByExt 兜底；这里只识别"声明明确就是 spreadsheet"的 mime。
+    false
+  );
+}
+
 /** 按扩展名兜底识别（MIME 不准确时） */
-function guessByExt(filename: string): "pdf" | "docx" | "text" | "json" | "xml" | null {
+function guessByExt(
+  filename: string,
+): "pdf" | "docx" | "text" | "json" | "xml" | "xlsx" | null {
   const ext = (path.extname(filename || "").replace(/^\./, "") || "").toLowerCase();
   if (!ext) return null;
   if (ext === "pdf") return "pdf";
   if (ext === "docx" || ext === "odt") return "docx";
+  // xlsx / xlsm 走 OOXML 解析；xltx 模板格式一样能读。
+  // .xls（旧版 BIFF 二进制）这里不支持，让它走 unsupported。
+  if (ext === "xlsx" || ext === "xlsm" || ext === "xltx") return "xlsx";
   if (ext === "json") return "json";
   if (ext === "xml") return "xml";
   if ([
@@ -209,6 +227,161 @@ async function parseDocx(buf: Buffer): Promise<string> {
   return (value || "").slice(0, MAX_TEXT_CHARS);
 }
 
+/**
+ * xlsx / xlsm / xltx：OOXML 电子表格。
+ *
+ * 不引第三方依赖，复用已有的 jszip：
+ *   1. 读 `xl/sharedStrings.xml`（共享字符串池）→ 数组
+ *   2. 遍历 `xl/worksheets/sheet*.xml`：
+ *      - <c t="s"><v>{idx}</v></c>          → 字符串池里取
+ *      - <c t="str"|"inlineStr"><is><t>...   → 内联字符串
+ *      - <c><v>{number}</v></c>              → 数字字面量
+ *   3. 一个 <row> 内的单元格用 " | " 分隔，行用 "\n" 分隔；多 sheet 用
+ *      `=== Sheet: <name> ===\n` 分块——这样向量检索时既能命中具体单元格内容，
+ *      也能命中所在工作表名。
+ *
+ * 取舍：
+ *   - 不解析公式（=SUM(A1:A10)），值已经被 Excel 保存到 <v>，向量检索拿值即可；
+ *   - 不解析样式 / 合并单元格 / 图表；
+ *   - 文本上限沿用 MAX_TEXT_CHARS（200KB），超大表会被截断——能覆盖单表
+ *     一两万行普通文本，对账型超大表 RAG 召回价值本来就有限。
+ */
+async function parseXlsx(buf: Buffer): Promise<string> {
+  const JSZip = (await import("jszip")).default;
+  const zip = await JSZip.loadAsync(buf);
+
+  // ---- 1. sharedStrings.xml ----
+  // 路径在标准 OOXML 里固定是 xl/sharedStrings.xml；存在性不保证（全数字表会没有）
+  const sharedStrings: string[] = [];
+  const ssFile = zip.file("xl/sharedStrings.xml");
+  if (ssFile) {
+    const ssXml = await ssFile.async("string");
+    // <si>…</si> 是每一个字符串项；内部可能有多个 <t>（带富文本时）需要拼接
+    const siRe = /<si\b[^>]*>([\s\S]*?)<\/si>/g;
+    const tRe = /<t[^>]*>([\s\S]*?)<\/t>/g;
+    let m: RegExpExecArray | null;
+    while ((m = siRe.exec(ssXml)) !== null) {
+      const inner = m[1];
+      let text = "";
+      let tm: RegExpExecArray | null;
+      while ((tm = tRe.exec(inner)) !== null) {
+        text += decodeXmlEntities(tm[1]);
+      }
+      sharedStrings.push(text);
+      tRe.lastIndex = 0;
+    }
+  }
+
+  // ---- 2. workbook.xml：sheet 顺序 + 名称 ----
+  // <sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets>
+  const sheetNames = new Map<number, string>(); // 1-based index → display name
+  const wbFile = zip.file("xl/workbook.xml");
+  if (wbFile) {
+    const wbXml = await wbFile.async("string");
+    const sheetRe = /<sheet\b[^>]*\bname="([^"]+)"[^>]*\bsheetId="(\d+)"[^>]*\/>/g;
+    let m: RegExpExecArray | null;
+    let order = 1;
+    while ((m = sheetRe.exec(wbXml)) !== null) {
+      // OOXML 里 worksheets/sheet{N}.xml 的 N 与 sheets 中出现顺序对应，
+      // sheetId 不一定与文件名 N 相同。这里以"出现顺序"为索引，能稳定对到
+      // worksheets/sheet{order}.xml 文件。
+      sheetNames.set(order++, decodeXmlEntities(m[1]));
+    }
+  }
+
+  // ---- 3. 遍历 worksheets/sheet*.xml ----
+  const parts: string[] = [];
+  let used = 0;
+
+  // 按文件名后缀数字升序遍历，保证 sheet1, sheet2, ... 的顺序
+  const sheetEntries = Object.keys(zip.files)
+    .filter((p) => /^xl\/worksheets\/sheet(\d+)\.xml$/.test(p))
+    .map((p) => ({
+      path: p,
+      n: parseInt(p.replace(/^.*sheet(\d+)\.xml$/, "$1"), 10),
+    }))
+    .sort((a, b) => a.n - b.n);
+
+  for (const ent of sheetEntries) {
+    if (used >= MAX_TEXT_CHARS) break;
+    const f = zip.file(ent.path);
+    if (!f) continue;
+    const xml = await f.async("string");
+
+    const sheetTitle = sheetNames.get(ent.n) || `Sheet${ent.n}`;
+    const header = `=== Sheet: ${sheetTitle} ===\n`;
+    parts.push(header);
+    used += header.length;
+
+    // 逐行解析：<row>…</row> 内若干 <c>…</c>
+    const rowRe = /<row\b[^>]*>([\s\S]*?)<\/row>/g;
+    const cellRe = /<c\b([^>]*)>([\s\S]*?)<\/c>/g;
+    const attrTypeRe = /\bt="([^"]+)"/;
+    let rm: RegExpExecArray | null;
+    while ((rm = rowRe.exec(xml)) !== null) {
+      if (used >= MAX_TEXT_CHARS) break;
+      const rowInner = rm[1];
+      const cells: string[] = [];
+      let cm: RegExpExecArray | null;
+      cellRe.lastIndex = 0;
+      while ((cm = cellRe.exec(rowInner)) !== null) {
+        const attrs = cm[1] || "";
+        const inner = cm[2] || "";
+        const tm = attrTypeRe.exec(attrs);
+        const t = tm ? tm[1] : "";
+        let val = "";
+        if (t === "s") {
+          // sharedStrings 索引
+          const vMatch = /<v[^>]*>([\s\S]*?)<\/v>/.exec(inner);
+          if (vMatch) {
+            const idx = parseInt(vMatch[1], 10);
+            if (Number.isFinite(idx) && idx >= 0 && idx < sharedStrings.length) {
+              val = sharedStrings[idx];
+            }
+          }
+        } else if (t === "inlineStr") {
+          // <c t="inlineStr"><is><t>...</t></is></c>
+          const tMatch = /<t[^>]*>([\s\S]*?)<\/t>/.exec(inner);
+          if (tMatch) val = decodeXmlEntities(tMatch[1]);
+        } else if (t === "str") {
+          // 公式返回的字符串：<v>...</v>
+          const vMatch = /<v[^>]*>([\s\S]*?)<\/v>/.exec(inner);
+          if (vMatch) val = decodeXmlEntities(vMatch[1]);
+        } else {
+          // 无 t 属性 / "n"（数字）/ "b"（布尔）：直接取 <v>
+          const vMatch = /<v[^>]*>([\s\S]*?)<\/v>/.exec(inner);
+          if (vMatch) val = decodeXmlEntities(vMatch[1]);
+        }
+        if (val) cells.push(val);
+      }
+      if (cells.length > 0) {
+        const line = cells.join(" | ") + "\n";
+        // 截断保护：如果一行就把上限撑爆，截到剩余空间
+        if (used + line.length > MAX_TEXT_CHARS) {
+          parts.push(line.slice(0, MAX_TEXT_CHARS - used));
+          used = MAX_TEXT_CHARS;
+          break;
+        }
+        parts.push(line);
+        used += line.length;
+      }
+    }
+  }
+
+  return parts.join("");
+}
+
+/** 标准 XML 实体反转义（共用） */
+function decodeXmlEntities(s: string): string {
+  return s
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&#(\d+);/g, (_m, d) => String.fromCharCode(parseInt(d, 10)));
+}
+
 // ============================================================
 // 主入口
 // ============================================================
@@ -252,9 +425,10 @@ export async function extractAttachmentText(att: {
 
   const mime = (att.mimeType || "").toLowerCase();
   // 先按 MIME 判断，再退到扩展名
-  const kind: "text" | "json" | "xml" | "pdf" | "docx" | null =
+  const kind: "text" | "json" | "xml" | "pdf" | "docx" | "xlsx" | null =
     isPdfMime(mime) ? "pdf"
     : isDocxMime(mime) ? "docx"
+    : isXlsxMime(mime) ? "xlsx"
     : isXmlMime(mime) ? "xml"
     : mime === "application/json" ? "json"
     : isTextLikeMime(mime) ? "text"
@@ -282,6 +456,9 @@ export async function extractAttachmentText(att: {
       break;
     case "docx":
       text = await parseDocx(buf);
+      break;
+    case "xlsx":
+      text = await parseXlsx(buf);
       break;
   }
 
