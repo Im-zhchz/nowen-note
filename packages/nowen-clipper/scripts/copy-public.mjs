@@ -49,10 +49,16 @@ const srcDir = join(root, "public");
 const dstDir = join(root, "dist");
 
 // 解析 --browser=xxx 参数
+// 支持的目标：
+//   - chrome  ：Chrome Web Store
+//   - edge    ：Microsoft Edge Add-ons（与 Chrome 同为 Chromium，manifest 完全一致，
+//               这里独立出来只是为了让 pack 脚本能产出 -edge 后缀的 zip，方便上传到
+//               Edge 商店时不与 Chrome 包混淆）
+//   - firefox ：Firefox Add-ons（AMO），需要派生 manifest，见 deriveFirefoxManifest
 const browserArg = process.argv.find((a) => a.startsWith("--browser="));
 const browser = browserArg ? browserArg.slice("--browser=".length) : "chrome";
-if (!["chrome", "firefox"].includes(browser)) {
-  console.error(`[copy-public] 未知的 --browser=${browser}，只支持 chrome | firefox`);
+if (!["chrome", "edge", "firefox"].includes(browser)) {
+  console.error(`[copy-public] 未知的 --browser=${browser}，只支持 chrome | edge | firefox`);
   process.exit(1);
 }
 

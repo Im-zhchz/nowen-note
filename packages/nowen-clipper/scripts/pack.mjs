@@ -24,7 +24,36 @@ if (!existsSync(dist)) {
 if (!existsSync(out)) mkdirSync(out, { recursive: true });
 
 const pkg = JSON.parse(readFileSync(join(root, "package.json"), "utf-8"));
-const zipName = `nowen-clipper-${pkg.version}.zip`;
+
+// 包名后缀策略：
+//   优先看 --browser=xxx CLI 参数（chrome/edge/firefox），允许显式覆盖。
+//   - chrome  → 无后缀          nowen-clipper-<v>.zip
+//   - edge    → -edge 后缀      nowen-clipper-<v>-edge.zip
+//   - firefox → -firefox 后缀   nowen-clipper-<v>-firefox.zip
+// 若没显式传 --browser，则回退到看 dist/manifest.json 的特征：
+//   有 browser_specific_settings.gecko 视作 firefox 包；否则当作 chrome。
+//   （edge 与 chrome 的 manifest 完全一致，无法靠 manifest 区分，这种情况下
+//    只能靠 CLI 参数明确，否则会归类成 chrome。）
+const browserArg = process.argv.find((a) => a.startsWith("--browser="));
+const browser = browserArg ? browserArg.slice("--browser=".length) : "";
+let suffix = "";
+if (browser === "firefox") suffix = "-firefox";
+else if (browser === "edge") suffix = "-edge";
+else if (browser === "chrome") suffix = "";
+else {
+  // 未显式指定：靠 manifest 推断
+  try {
+    const distManifest = JSON.parse(
+      readFileSync(join(dist, "manifest.json"), "utf-8"),
+    );
+    if (distManifest?.browser_specific_settings?.gecko) {
+      suffix = "-firefox";
+    }
+  } catch {
+    // dist/manifest.json 不存在时，前面 dist 存在性检查已经处理过，这里忽略解析失败，按 Chrome 包名走。
+  }
+}
+const zipName = `nowen-clipper-${pkg.version}${suffix}.zip`;
 const zipPath = join(out, zipName);
 
 const zip = new JSZip();

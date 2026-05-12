@@ -11,9 +11,14 @@
     "prebuild": "npm run gen-icons",
     "dev": "vite build --watch --mode development",
     "build": "vite build && npm run flatten-html && npm run copy-public",
+    "build:chrome": "vite build && npm run flatten-html && node scripts/copy-public.mjs --browser=chrome",
+    "build:edge": "vite build && npm run flatten-html && node scripts/copy-public.mjs --browser=edge",
     "build:firefox": "vite build && npm run flatten-html && node scripts/copy-public.mjs --browser=firefox",
-    "pack": "npm run build && node scripts/pack.mjs",
-    "pack:firefox": "npm run build:firefox && node scripts/pack.mjs",
+    "pack": "npm run build:chrome && node scripts/pack.mjs --browser=chrome",
+    "pack:chrome": "npm run build:chrome && node scripts/pack.mjs --browser=chrome",
+    "pack:edge": "npm run build:edge && node scripts/pack.mjs --browser=edge",
+    "pack:firefox": "npm run build:firefox && node scripts/pack.mjs --browser=firefox",
+    "pack:all": "npm run pack:chrome && npm run pack:edge && npm run pack:firefox",
     "lint": "tsc --noEmit"
   },
   "dependencies": {
