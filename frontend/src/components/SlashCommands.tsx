@@ -4,10 +4,12 @@ import { Plugin, PluginKey } from "@tiptap/pm/state";
 import {
   Heading1, Heading2, Heading3, List, ListOrdered, CheckSquare,
   Quote, FileCode, Minus, ImagePlus, Sparkles,
-  Bold, Italic, Highlighter, Table2
+  Bold, Italic, Highlighter, Table2,
+  Strikethrough, Code, Link as LinkIcon
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useTranslation } from "react-i18next";
+import { prompt as promptDialog } from "@/components/ui/confirm";
 
 export interface SlashCommandItem {
   id: string;
@@ -271,6 +273,88 @@ export function getDefaultSlashCommands(t: (key: string) => string, onImageUploa
       category: t("slash.catInline"),
       keywords: ["highlight", "mark", "高亮", "标记"],
       action: (editor) => editor.chain().focus().toggleHighlight().run(),
+    },
+    {
+      id: "strike",
+      label: t("slash.strike"),
+      description: t("slash.strikeDesc"),
+      icon: <Strikethrough size={16} />,
+      category: t("slash.catInline"),
+      keywords: ["strike", "strikethrough", "del", "删除", "删除线", "横线"],
+      action: (editor) => editor.chain().focus().toggleStrike().run(),
+    },
+    {
+      id: "inlineCode",
+      label: t("slash.inlineCode"),
+      description: t("slash.inlineCodeDesc"),
+      icon: <Code size={16} />,
+      category: t("slash.catInline"),
+      keywords: ["code", "inline", "monospace", "行内", "代码"],
+      action: (editor) => editor.chain().focus().toggleCode().run(),
+    },
+    {
+      id: "link",
+      label: t("slash.link"),
+      description: t("slash.linkDesc"),
+      icon: <LinkIcon size={16} />,
+      category: t("slash.catInline"),
+      keywords: ["link", "url", "hyperlink", "链接", "超链接"],
+      action: (editor) => {
+        // 已有选区：把选中文本变成链接；无选区：弹输入框获取 URL，
+        // 然后以 URL 作为可见文本插入并应用 link mark。
+        // 输入框支持 markdown.com.cn 标准的带标题写法 `https://x.com "标题"`，
+        // 解析时把空格后的 "..." 部分作为 link 的 title 属性，鼠标悬停显示。
+        const { from, to, empty } = editor.state.selection;
+        const previousAttrs = editor.getAttributes("link") as { href?: string; title?: string | null };
+        const previous = previousAttrs?.href ?? "";
+        const previousTitle = previousAttrs?.title ?? "";
+        const defaultValue = previous
+          ? previousTitle
+            ? `${previous} "${previousTitle}"`
+            : previous
+          : "https://";
+
+        // action 类型签名是同步 void，这里 fire-and-forget 一个 async IIFE，
+        // 让弹窗在菜单关闭后再异步弹出，互不打扰。
+        void (async () => {
+          const url = await promptDialog({
+            title: t("slash.link"),
+            placeholder: 'https://example.com  或  https://example.com "标题"',
+            defaultValue,
+            confirmText: t("common.confirm"),
+            cancelText: t("common.cancel"),
+            allowEmpty: true,
+          });
+          if (url == null) return; // 用户取消
+
+          const trimmed = url.trim();
+          if (!trimmed) {
+            editor.chain().focus().extendMarkRange("link").unsetLink().run();
+            return;
+          }
+
+          const match = trimmed.match(/^(\S+)(?:\s+"([^"]*)")?$/);
+          const rawHref = (match?.[1] ?? trimmed).trim();
+          const linkTitle = match?.[2] ?? null;
+
+          const safe = /^(https?:|mailto:|tel:|\/|#)/i.test(rawHref)
+            ? rawHref
+            : `https://${rawHref}`;
+
+          const attrs: { href: string; title?: string | null } = { href: safe };
+          if (linkTitle) attrs.title = linkTitle;
+
+          if (empty) {
+            editor
+              .chain()
+              .focus()
+              .insertContent({ type: "text", text: rawHref, marks: [{ type: "link", attrs }] })
+              .run();
+          } else {
+            editor.chain().focus().setTextSelection({ from, to }).extendMarkRange("link").setLink(attrs).run();
+          }
+        })();
+      },
     },
     // 插入
     {
