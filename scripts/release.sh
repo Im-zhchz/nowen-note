@@ -1556,9 +1556,12 @@ if [ "$HAS_PC" = "1" ]; then
             #   - @aparajita/capacitor-secure-storage / @aparajita/capacitor-biometric-auth
             #     / @mhaberler/capacitor-zeroconf-nsd：带 scope 的 Capacitor 插件，
             #     新机器 / 切分支时常缺
+            #   - mermaid / katex / rehype-raw：编辑器后期新增的块级扩展依赖（Mermaid 图、
+            #     数学公式、Markdown 渲染），CI 旧 node_modules 不会有，必须体检触发 install
             for _dep in \
                 react vite typescript \
                 marked html2canvas jspdf \
+                mermaid katex rehype-raw \
                 "@aparajita/capacitor-secure-storage" \
                 "@aparajita/capacitor-biometric-auth" \
                 "@mhaberler/capacitor-zeroconf-nsd"; do
