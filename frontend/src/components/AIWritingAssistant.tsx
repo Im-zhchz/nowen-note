@@ -7,6 +7,7 @@ import {
   BookmarkPlus, Trash2, Pencil
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
+import { confirm as confirmDialog } from "@/components/ui/confirm";
 import { api } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
@@ -179,7 +180,16 @@ export default function AIWritingAssistant({
 
   const handleDeleteSavedPrompt = useCallback(async (p: SavedPrompt, e: React.MouseEvent) => {
     e.stopPropagation();
-    if (!window.confirm(t("ai.customDeleteConfirm"))) return;
+    // 用项目统一 confirm 弹窗替代 window.confirm；danger 模式 + 默认聚焦取消，
+    // 避免误删自定义指令
+    const ok = await confirmDialog({
+      title: t("common.delete"),
+      description: t("ai.customDeleteConfirm"),
+      confirmText: t("common.delete"),
+      cancelText: t("common.cancel"),
+      danger: true,
+    });
+    if (!ok) return;
     try {
       await api.aiPrompts.remove(p.id);
       setSavedPrompts((list) => list.filter((x) => x.id !== p.id));

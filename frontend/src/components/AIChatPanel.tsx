@@ -6,6 +6,7 @@ import {
   Paperclip, Plus, MessageSquare, Menu, Pencil
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
+import { confirm as confirmDialog } from "@/components/ui/confirm";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { api } from "@/lib/api";
@@ -221,8 +222,16 @@ export default function AIChatPanel({ onClose, onNavigateToNote }: {
 
   const handleDeleteConversation = useCallback(async (convId: string) => {
     if (isLoading) return;
-    // 用浏览器 confirm 保持与 AIWritingAssistant 删除指令的 UX 一致
-    if (!window.confirm(t("aiChat.deleteConversationConfirm"))) return;
+    // 项目统一的命令式 confirm 弹窗，与设置/孤儿附件清理等模块同款；
+    // danger:true → 红色确认按钮 + 默认聚焦取消按钮，避免误删
+    const ok = await confirmDialog({
+      title: t("common.delete"),
+      description: t("aiChat.deleteConversationConfirm"),
+      confirmText: t("common.delete"),
+      cancelText: t("common.cancel"),
+      danger: true,
+    });
+    if (!ok) return;
     try {
       await api.aiConversations.remove(convId);
     } catch {
