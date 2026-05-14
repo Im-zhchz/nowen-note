@@ -1417,6 +1417,431 @@ html[data-code-theme="solarized-light"] {
 }
 
 /* ============================================================================
+ * Mermaid 流程图样式
+ * ----------------------------------------------------------------------------
+ * 编辑器内（CodeBlockView 预览态）和分享页两处共用大部分外观，差异由各自
+ * 容器类驱动。
+ * ========================================================================= */
+
+/* 编辑器内 mermaid 预览：把 SVG 居中，浅色背景与代码区拉开层次 */
+.ProseMirror .code-block-wrapper .mermaid-preview-host {
+  background: var(--app-bg, #fafafa);
+  border-radius: 0 0 12px 12px;
+  min-height: 80px;
+}
+.dark .ProseMirror .code-block-wrapper .mermaid-preview-host {
+  background: rgba(255, 255, 255, 0.02);
+}
+.mermaid-view svg {
+  max-width: 100%;
+  height: auto;
+}
+
+/* 分享页 mermaid 块占位与加载/错误态 */
+.shared-note-content .shared-mermaid-block {
+  margin: 1rem 0;
+  padding: 16px;
+  border: 1px solid rgba(0, 0, 0, 0.06);
+  border-radius: 12px;
+  background: #fafafa;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  overflow: auto;
+}
+.dark .shared-note-content .shared-mermaid-block {
+  background: rgba(255, 255, 255, 0.03);
+  border-color: rgba(255, 255, 255, 0.08);
+}
+.shared-note-content .shared-mermaid-block svg {
+  max-width: 100%;
+  height: auto;
+}
+.shared-note-content .shared-mermaid-loading {
+  color: #888;
+  font-size: 12px;
+  padding: 24px 0;
+}
+.shared-note-content .shared-mermaid-error {
+  color: #c0392b;
+  background: rgba(192, 57, 43, 0.06);
+  border: 1px solid rgba(192, 57, 43, 0.25);
+  border-radius: 8px;
+  padding: 12px 14px;
+  width: 100%;
+  font-size: 12px;
+}
+.shared-note-content .shared-mermaid-error-title {
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+.shared-note-content .shared-mermaid-error-msg {
+  white-space: pre-wrap;
+  word-break: break-word;
+  opacity: 0.9;
+}
+.dark .shared-note-content .shared-mermaid-error {
+  color: #ff8a80;
+  background: rgba(255, 110, 110, 0.08);
+  border-color: rgba(255, 110, 110, 0.3);
+}
+
+/* ============================================================================
+ * LaTeX 数学公式样式（KaTeX）
+ * ----------------------------------------------------------------------------
+ * 三个使用场景：
+ *   1) 编辑器内的 MathInline / MathBlock NodeView（`.math-node-*`、`.math-view-*`）
+ *   2) 编辑器内编辑态的源码 + 实时预览（`.math-edit-*`）
+ *   3) 分享页 MD / PM 路径的占位与异步注入（`.shared-math-*`）
+ * KaTeX 自带的 CSS 在 lib 里按需 inject，这里只补 nowen 自定义的容器。
+ * ========================================================================= */
+
+/* —— 编辑器内：math 节点视觉 —— */
+.math-node-inline {
+  display: inline-block;
+  vertical-align: middle;
+  cursor: pointer;
+  padding: 0 2px;
+  border-radius: 3px;
+  transition: background-color 0.15s;
+}
+.math-node-inline:hover {
+  background: rgba(99, 102, 241, 0.08);
+}
+.math-node-block {
+  display: block;
+  margin: 0.5em 0;
+  cursor: pointer;
+  padding: 6px 8px;
+  border-radius: 6px;
+  transition: background-color 0.15s;
+}
+.math-node-block:hover {
+  background: rgba(99, 102, 241, 0.05);
+}
+.math-node.math-selected {
+  outline: 2px solid rgba(99, 102, 241, 0.45);
+  background: rgba(99, 102, 241, 0.06);
+}
+
+/* 编辑态的源码框 */
+.math-edit-box {
+  min-width: 180px;
+}
+.math-edit-textarea {
+  font-family: ui-monospace, SFMono-Regular, "Menlo", monospace;
+  line-height: 1.4;
+}
+.math-edit-preview {
+  font-size: 13px;
+}
+
+/* —— 分享页：math 占位 / 错误 —— */
+.shared-note-content .shared-math-block {
+  display: block;
+  margin: 1rem 0;
+  padding: 12px;
+  border: 1px solid rgba(0, 0, 0, 0.04);
+  border-radius: 8px;
+  background: #fafafa;
+  overflow-x: auto;
+  text-align: center;
+}
+.dark .shared-note-content .shared-math-block {
+  background: rgba(255, 255, 255, 0.03);
+  border-color: rgba(255, 255, 255, 0.06);
+}
+.shared-note-content .shared-math-inline {
+  /* 行内：不加背景色避免视觉噪音；KaTeX 自己的样式接管 */
+  display: inline;
+}
+.shared-note-content .shared-math-loading {
+  color: #888;
+  font-size: 12px;
+  font-family: ui-monospace, SFMono-Regular, "Menlo", monospace;
+  opacity: 0.7;
+}
+.shared-note-content .shared-math-error {
+  display: inline-flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px 8px;
+  border: 1px solid rgba(192, 57, 43, 0.25);
+  background: rgba(192, 57, 43, 0.06);
+  border-radius: 6px;
+  font-size: 11px;
+  color: #c0392b;
+  max-width: 100%;
+  text-align: left;
+}
+.shared-note-content .shared-math-error-title {
+  font-weight: 600;
+}
+.shared-note-content .shared-math-error-src {
+  font-family: ui-monospace, SFMono-Regular, "Menlo", monospace;
+  color: rgba(0, 0, 0, 0.65);
+  background: rgba(0, 0, 0, 0.04);
+  padding: 2px 4px;
+  border-radius: 3px;
+  word-break: break-all;
+}
+.shared-note-content .shared-math-error-msg {
+  opacity: 0.85;
+  word-break: break-word;
+}
+.dark .shared-note-content .shared-math-error {
+  color: #ff8a80;
+  background: rgba(255, 110, 110, 0.08);
+  border-color: rgba(255, 110, 110, 0.3);
+}
+.dark .shared-note-content .shared-math-error-src {
+  color: rgba(255, 255, 255, 0.75);
+  background: rgba(255, 255, 255, 0.06);
+}
+
+/* KaTeX 自身在分享页/编辑器里的对齐与字号细节调整。
+ * KaTeX 默认行内字号略小于正文，块级居中。在 prose 样式作用下
+ * 字号会被压缩，这里给一个略大的字号让公式更易读。 */
+.shared-note-content .katex,
+.ProseMirror .katex {
+  font-size: 1.05em;
+}
+.shared-note-content .katex-display,
+.ProseMirror .katex-display {
+  margin: 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+
+/* ============================================================================
+ * 脚注（Footnote）样式
+ * ----------------------------------------------------------------------------
+ * 三个场景：
+ *   1) 编辑器内：FootnoteReference (`.footnote-ref`) + FootnoteDefinition (`.footnote-def`)
+ *   2) 分享页 PM 路径占位：`.shared-footnote-ref` + `.shared-footnote-def`
+ *   3) 分享页 MD 路径占位：同上（preprocessMarkdownFootnotes 生成相同 class）
+ * ========================================================================= */
+
+/* —— 编辑器内：引用 —— */
+.footnote-ref {
+  display: inline;
+  cursor: pointer;
+  user-select: none;
+  vertical-align: baseline;
+}
+.footnote-ref-sup {
+  display: inline-block;
+  font-size: 0.72em;
+  line-height: 1;
+  padding: 1px 3px;
+  margin: 0 1px;
+  border-radius: 3px;
+  color: #6366f1;
+  background: rgba(99, 102, 241, 0.1);
+  font-weight: 600;
+  vertical-align: super;
+  transition: background-color 0.15s;
+}
+.footnote-ref:hover .footnote-ref-sup {
+  background: rgba(99, 102, 241, 0.2);
+}
+.footnote-ref-selected .footnote-ref-sup {
+  outline: 2px solid rgba(99, 102, 241, 0.45);
+  outline-offset: 1px;
+}
+.dark .footnote-ref-sup {
+  color: #a5b4fc;
+  background: rgba(165, 180, 252, 0.15);
+}
+.dark .footnote-ref:hover .footnote-ref-sup {
+  background: rgba(165, 180, 252, 0.25);
+}
+
+/* —— 编辑器内：定义 —— */
+.footnote-def {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 6px 0;
+  padding: 8px 10px;
+  border-left: 3px solid rgba(99, 102, 241, 0.4);
+  background: rgba(99, 102, 241, 0.04);
+  border-radius: 4px;
+  font-size: 0.9em;
+  line-height: 1.5;
+  cursor: pointer;
+  transition: background-color 0.15s;
+}
+.footnote-def:hover {
+  background: rgba(99, 102, 241, 0.08);
+}
+.footnote-def-selected {
+  outline: 2px solid rgba(99, 102, 241, 0.45);
+}
+.footnote-def-marker {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+  color: #6366f1;
+  font-weight: 600;
+}
+.footnote-def-back {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 3px;
+  border: none;
+  background: transparent;
+  color: #6366f1;
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1;
+  padding: 0;
+}
+.footnote-def-back:hover {
+  background: rgba(99, 102, 241, 0.18);
+}
+.footnote-def-index {
+  min-width: 18px;
+}
+.footnote-def-content {
+  flex: 1;
+  color: var(--tx-primary, #1f2937);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.footnote-def-empty {
+  color: #94a3b8;
+  font-style: italic;
+}
+.footnote-def-id {
+  flex-shrink: 0;
+  font-family: ui-monospace, SFMono-Regular, "Menlo", monospace;
+  font-size: 11px;
+  color: #94a3b8;
+  opacity: 0.7;
+  align-self: center;
+}
+.dark .footnote-def {
+  border-left-color: rgba(165, 180, 252, 0.5);
+  background: rgba(165, 180, 252, 0.06);
+}
+.dark .footnote-def:hover {
+  background: rgba(165, 180, 252, 0.1);
+}
+.dark .footnote-def-marker,
+.dark .footnote-def-back {
+  color: #a5b4fc;
+}
+.dark .footnote-def-content {
+  color: rgba(229, 231, 235, 0.92);
+}
+.dark .footnote-def-id {
+  color: rgba(229, 231, 235, 0.4);
+}
+
+/* —— 分享页：引用（上标小数字） —— */
+.shared-note-content .shared-footnote-ref {
+  display: inline;
+  vertical-align: super;
+  font-size: 0.72em;
+  line-height: 1;
+}
+.shared-note-content .shared-footnote-ref a {
+  display: inline-block;
+  padding: 1px 3px;
+  margin: 0 1px;
+  border-radius: 3px;
+  color: #6366f1;
+  background: rgba(99, 102, 241, 0.1);
+  font-weight: 600;
+  text-decoration: none;
+  transition: background-color 0.15s;
+}
+.shared-note-content .shared-footnote-ref a:hover {
+  background: rgba(99, 102, 241, 0.22);
+}
+.dark .shared-note-content .shared-footnote-ref a {
+  color: #a5b4fc;
+  background: rgba(165, 180, 252, 0.15);
+}
+.dark .shared-note-content .shared-footnote-ref a:hover {
+  background: rgba(165, 180, 252, 0.28);
+}
+
+/* —— 分享页：定义 —— */
+.shared-note-content .shared-footnote-def {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 6px 0;
+  padding: 8px 10px;
+  border-left: 3px solid rgba(99, 102, 241, 0.4);
+  background: rgba(99, 102, 241, 0.04);
+  border-radius: 4px;
+  font-size: 0.9em;
+  line-height: 1.55;
+}
+.shared-note-content .shared-footnote-def-marker {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+  color: #6366f1;
+  font-weight: 600;
+}
+.shared-note-content .shared-footnote-back {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 3px;
+  color: #6366f1;
+  text-decoration: none;
+  font-size: 12px;
+  line-height: 1;
+}
+.shared-note-content .shared-footnote-back:hover {
+  background: rgba(99, 102, 241, 0.18);
+}
+.shared-note-content .shared-footnote-def-index {
+  min-width: 18px;
+}
+.shared-note-content .shared-footnote-def-content {
+  flex: 1;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: inherit;
+}
+.dark .shared-note-content .shared-footnote-def {
+  border-left-color: rgba(165, 180, 252, 0.5);
+  background: rgba(165, 180, 252, 0.06);
+}
+.dark .shared-note-content .shared-footnote-def-marker,
+.dark .shared-note-content .shared-footnote-back {
+  color: #a5b4fc;
+}
+
+/* —— 跳转高亮闪烁（点击 ref → def 或 def → ref 时短暂高亮目标） —— */
+@keyframes shared-footnote-flash {
+  0%   { background-color: rgba(250, 204, 21, 0.35); }
+  100% { background-color: transparent; }
+}
+.shared-footnote-flash,
+.footnote-flash {
+  animation: shared-footnote-flash 1.1s ease-out;
+  border-radius: 4px;
+}
+
+
+
+
+
+/* ============================================================================
  * macOS 外观风格（Skin）
  * ----------------------------------------------------------------------------
  * 设计来源：Apple Human Interface Guidelines（color / materials / typography）。

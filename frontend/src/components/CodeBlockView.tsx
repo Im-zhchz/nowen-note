@@ -1,7 +1,7 @@
 import React, { useCallback, useMemo, useState, useEffect, useRef } from "react";
 import { createPortal } from "react-dom";
 import { NodeViewWrapper, NodeViewContent, NodeViewProps } from "@tiptap/react";
-import { Copy, Check, ChevronDown, Palette } from "lucide-react";
+import { Copy, Check, ChevronDown, Palette, Eye, Code2 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import {
   CODE_BLOCK_THEMES,
@@ -9,6 +9,8 @@ import {
   getSavedCodeBlockTheme,
   setCodeBlockTheme,
 } from "@/lib/codeBlockTheme";
+import MermaidView from "@/components/MermaidView";
+import { isMermaidLang } from "@/lib/mermaidRenderer";
 
 /**
  * 自定义代码块视图：
@@ -18,6 +20,8 @@ import {
  */
 
 // 常用语言列表（超集由 lowlight.common 决定）
+// 注：mermaid 不在 lowlight 注册，是 nowen 自己识别的特殊语言（用于流程图渲染），
+// 把它放进常用列表是为了在语言下拉里可以一键切换到 mermaid，触发 MermaidView。
 const POPULAR_LANGUAGES = [
   "auto", "plaintext",
   "javascript", "typescript", "tsx", "jsx",
@@ -26,6 +30,7 @@ const POPULAR_LANGUAGES = [
   "go", "rust", "php", "ruby", "kotlin", "swift",
   "bash", "shell", "powershell",
   "sql", "yaml", "markdown", "diff", "dockerfile",
+  "mermaid",
 ];
 
 function formatLanguageLabel(raw: string | null | undefined): string {
@@ -40,11 +45,19 @@ export function CodeBlockView(props: NodeViewProps) {
   const lowlight = (extension.options as any)?.lowlight;
 
   const currentLang: string = node.attrs.language || "auto";
+  const isMermaid = isMermaidLang(currentLang);
   const [copied, setCopied] = useState(false);
   const [showLangPicker, setShowLangPicker] = useState(false);
   const [langFilter, setLangFilter] = useState("");
   const [showThemePicker, setShowThemePicker] = useState(false);
   const [activeTheme, setActiveTheme] = useState<CodeBlockThemeId>(getSavedCodeBlockTheme);
+  // mermaid 块的"源码 / 预览"切换：默认进入时显示预览，方便阅读
+  // 编辑时切到源码（用户主动点按钮），保存后再切回预览
+  const [mermaidPreview, setMermaidPreview] = useState<boolean>(true);
+  // 切换到非 mermaid 时把预览状态清掉，避免下次再切回 mermaid 时残留状态混乱
+  useEffect(() => {
+    if (!isMermaid) setMermaidPreview(true);
+  }, [isMermaid]);
 
   // 下拉面板锚点按钮 ref，用于计算 fixed 弹出位置（避免被代码块容器 overflow-hidden 裁剪）
   const langBtnRef = useRef<HTMLButtonElement | null>(null);
@@ -238,6 +251,8 @@ export function CodeBlockView(props: NodeViewProps) {
   return (
     <NodeViewWrapper
       className="code-block-wrapper group relative my-4 rounded-xl overflow-hidden border shadow-sm"
+      // 预览态时把隐藏的 NodeViewContent 用绝对定位藏起来，依赖外层 relative
+      style={{ position: "relative" }}
     >
       {/* 顶部工具栏（不可编辑） */}
       <div
@@ -315,8 +330,21 @@ export function CodeBlockView(props: NodeViewProps) {
           </div>
         </div>
 
-        {/* 右侧：主题切换 + 复制按钮 */}
+        {/* 右侧：mermaid 切换 + 主题切换 + 复制按钮 */}
         <div className="flex items-center gap-1">
+          {/* 仅 mermaid 语言显示：源码 / 预览 切换。预览时按钮显示"代码"图标
+              （提示点击会切回源码视图），源码时显示"眼睛"图标（提示切回预览） */}
+          {isMermaid && (
+            <button
+              type="button"
+              onClick={() => setMermaidPreview((v) => !v)}
+              className="code-block-tool-btn flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-medium transition-colors"
+              title={mermaidPreview ? "切换到源码" : "切换到预览"}
+            >
+              {mermaidPreview ? <Code2 size={12} /> : <Eye size={12} />}
+              <span className="hidden sm:inline">{mermaidPreview ? "源码" : "预览"}</span>
+            </button>
+          )}
           <div className="relative" data-codeblock-themepicker>
             <button
               ref={themeBtnRef}
@@ -399,19 +427,43 @@ export function CodeBlockView(props: NodeViewProps) {
         </div>
       </div>
 
-      {/* 代码内容区 */}
-      <pre className="code-block-pre">
-        <NodeViewContent
-          // NodeViewContent 的类型声明把 as 限制为 "div"，但 Tiptap 运行时实际支持任意 tag；
-          // 这里我们就是要 <code> 以便让 highlight.js / 复制按钮的语义正确。断言绕过类型窄化。
-          as={"code" as "div"}
-          className={cn(
-            "code-block-content hljs",
-            currentLang && currentLang !== "auto" && `language-${currentLang}`,
-          )}
-          style={{ whiteSpace: "pre" }}
-        />
-      </pre>
+      {/* 代码内容区
+          - mermaid + 预览态：渲染 SVG 流程图；同时把 NodeViewContent 用零高
+            容器藏起来（不能直接不渲染，否则 ProseMirror 找不到节点内容会报错），
+            保留可编辑节点的引用同时让用户看到预览。
+          - 其它情况：正常显示代码 + lowlight 高亮。 */}
+      {isMermaid && mermaidPreview ? (
+        <>
+          <div className="mermaid-preview-host px-3 py-2" contentEditable={false}>
+            <MermaidView source={node.textContent} debounceMs={250} />
+          </div>
+          {/* 隐藏但保留的可编辑内容承载节点；ProseMirror 需要它存在 */}
+          <pre
+            className="code-block-pre"
+            style={{ position: "absolute", width: 1, height: 1, overflow: "hidden", clip: "rect(0 0 0 0)", pointerEvents: "none" }}
+            aria-hidden="true"
+          >
+            <NodeViewContent
+              as={"code" as "div"}
+              className="code-block-content"
+              style={{ whiteSpace: "pre" }}
+            />
+          </pre>
+        </>
+      ) : (
+        <pre className="code-block-pre">
+          <NodeViewContent
+            // NodeViewContent 的类型声明把 as 限制为 "div"，但 Tiptap 运行时实际支持任意 tag；
+            // 这里我们就是要 <code> 以便让 highlight.js / 复制按钮的语义正确。断言绕过类型窄化。
+            as={"code" as "div"}
+            className={cn(
+              "code-block-content hljs",
+              currentLang && currentLang !== "auto" && `language-${currentLang}`,
+            )}
+            style={{ whiteSpace: "pre" }}
+          />
+        </pre>
+      )}
     </NodeViewWrapper>
   );
 }

@@ -5,10 +5,11 @@ import {
   Heading1, Heading2, Heading3, List, ListOrdered, CheckSquare,
   Quote, FileCode, Minus, ImagePlus, Sparkles,
   Bold, Italic, Highlighter, Table2,
-  Strikethrough, Code, Link as LinkIcon
+  Strikethrough, Code, Link as LinkIcon, Workflow, Sigma, BookOpen
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useTranslation } from "react-i18next";
+import { nextFootnoteIdentifier } from "@/components/FootnoteExtensions";
 import { prompt as promptDialog } from "@/components/ui/confirm";
 
 export interface SlashCommandItem {
@@ -236,6 +237,83 @@ export function getDefaultSlashCommands(t: (key: string) => string, onImageUploa
       category: t("slash.catFormat"),
       keywords: ["code", "codeblock", "代码", "代码块"],
       action: (editor) => editor.chain().focus().toggleCodeBlock().run(),
+    },
+    {
+      // mermaid 流程图：本质是 codeBlock + language=mermaid，CodeBlockView
+      // 识别该 language 后会切换到流程图渲染模式。这里塞一段最小可渲染示例，
+      // 让用户一插入就能看到结果，再按需修改。
+      id: "mermaid",
+      label: t("slash.mermaid"),
+      description: t("slash.mermaidDesc"),
+      icon: <Workflow size={16} />,
+      category: t("slash.catFormat"),
+      keywords: ["mermaid", "flowchart", "diagram", "graph", "流程", "流程图", "图表"],
+      action: (editor) => {
+        const sample = "graph TD\n  A[开始] --> B{判断}\n  B -->|是| C[继续]\n  B -->|否| D[结束]";
+        editor
+          .chain()
+          .focus()
+          .insertContent({
+            type: "codeBlock",
+            attrs: { language: "mermaid" },
+            content: [{ type: "text", text: sample }],
+          })
+          .run();
+      },
+    },
+    {
+      // LaTeX 数学公式（块级）：插入一个空的 mathBlock 节点，自动进入编辑态
+      // 让用户立即输入公式源码。行内公式由 input rule `$..$ ` 触发，不在
+      // slash 菜单里另开命令避免冗余。
+      id: "math",
+      label: t("slash.math"),
+      description: t("slash.mathDesc"),
+      icon: <Sigma size={16} />,
+      category: t("slash.catFormat"),
+      keywords: ["math", "latex", "katex", "formula", "equation", "公式", "数学", "方程"],
+      action: (editor) => {
+        editor
+          .chain()
+          .focus()
+          .insertContent({
+            type: "mathBlock",
+            attrs: { latex: "" },
+          })
+          .run();
+      },
+    },
+    {
+      // 脚注：在光标处插入 ref，并在文档末尾追加配对的 def。
+      // identifier 自动取下一个未占用的数字，用户后续可双击 ref / def 改名。
+      id: "footnote",
+      label: t("slash.footnote"),
+      description: t("slash.footnoteDesc"),
+      icon: <BookOpen size={16} />,
+      category: t("slash.catFormat"),
+      keywords: ["footnote", "fn", "脚注", "注释", "注解"],
+      action: (editor) => {
+        const id = nextFootnoteIdentifier(editor);
+        // 在光标处插入引用
+        editor
+          .chain()
+          .focus()
+          .insertContent({
+            type: "footnoteReference",
+            attrs: { identifier: id },
+          })
+          .run();
+        // 在文档末尾追加定义（避免插在光标处打断阅读流）。
+        // 注意：上一步的 editor.state 已被 chain 更新，重新取最新 state。
+        const docEnd = editor.state.doc.content.size;
+        editor
+          .chain()
+          .focus()
+          .insertContentAt(docEnd, {
+            type: "footnoteDefinition",
+            attrs: { identifier: id, content: "" },
+          })
+          .run();
+      },
     },
     {
       id: "horizontalRule",

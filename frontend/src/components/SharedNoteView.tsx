@@ -8,9 +8,13 @@ import { toast } from "@/lib/toast";
 import { common, createLowlight } from "lowlight";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import rehypeRaw from "rehype-raw";
 import TiptapEditor from "@/components/TiptapEditor";
 import type { NoteEditorUpdatePayload } from "@/components/editors/types";
 import { detectFormat } from "@/lib/contentFormat";
+import MermaidView from "@/components/MermaidView";
+import { isMermaidLang, renderMermaid } from "@/lib/mermaidRenderer";
+import { renderKatex } from "@/lib/katexRenderer";
 
 // 分享页独立的 lowlight 实例（与编辑器保持一致的 common 语法集合）
 const sharedLowlight = createLowlight(common);
@@ -66,10 +70,124 @@ export default function SharedNoteView({ shareToken }: SharedNoteViewProps) {
   const guestNameRef = useRef<string>(guestName);
   const saveTimerRef = useRef<NodeJS.Timeout | null>(null);
   const savedIdleTimerRef = useRef<NodeJS.Timeout | null>(null);
+  // PM HTML 渲染容器 ref：用于在内容注入后扫描 .shared-mermaid-block 占位，
+  // 异步把每个占位替换为 mermaid 渲染出的 SVG（避开 dangerouslySetInnerHTML
+  // 无法挂载 React 子树的限制）
+  const pmRenderRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => { guestNameRef.current = guestName; }, [guestName]);
   useEffect(() => { accessTokenRef.current = accessToken; }, [accessToken]);
   useEffect(() => { latestVersionRef.current = currentVersion; }, [currentVersion]);
+
+  /**
+   * 分享页 PM 路径下 mermaid 块的异步渲染。
+   *
+   * 流程：
+   *   1. `renderCodeBlock` 把 mermaid 代码块输出为带 `data-mermaid-source`
+   *      的占位 div，源码 base64 编码塞在 attr 里。
+   *   2. 内容 mount 后，这个 effect 扫描容器内所有占位，逐个解码源码、调
+   *      `renderMermaid` 拿 SVG，再注入 innerHTML。
+   *   3. 已渲染过的占位会被打上 `data-rendered`，避免重复工作。
+   *
+   * 失败处理：单个块出错只显示该块的错误条，不影响其它内容。
+   */
+  useEffect(() => {
+    const host = pmRenderRef.current;
+    if (!host || !content?.content) return;
+    // detectFormat 是 md 或编辑模式时，这个容器不存在/不会渲染 mermaid 占位
+    const blocks = host.querySelectorAll<HTMLDivElement>(".shared-mermaid-block:not([data-rendered])");
+    if (blocks.length === 0) return;
+
+    let cancelled = false;
+    blocks.forEach((block) => {
+      const encoded = block.getAttribute("data-mermaid-source") || "";
+      let source = "";
+      try {
+        source = decodeURIComponent(escape(atob(encoded)));
+      } catch {
+        source = "";
+      }
+      block.setAttribute("data-rendered", "1");
+      renderMermaid(source).then((res) => {
+        if (cancelled) return;
+        if (res.error) {
+          block.innerHTML = `
+            <div class="shared-mermaid-error">
+              <div class="shared-mermaid-error-title">Mermaid 语法错误</div>
+              <div class="shared-mermaid-error-msg">${escapeHtml(res.error)}</div>
+            </div>
+          `;
+        } else {
+          block.innerHTML = res.svg;
+        }
+      });
+    });
+
+    return () => {
+      cancelled = true;
+    };
+    // content?.content 变化时重新扫描；isEditing 切换时容器会被卸载，自然清空
+  }, [content?.content, isEditing]);
+
+  /**
+   * 分享页 LaTeX 公式的异步渲染（PM 路径 + MD 路径共用）。
+   *
+   * 两条路径都把 math 输出为占位元素：
+   *   - PM 路径：`.shared-math-block / .shared-math-inline` + `data-math-source`
+   *     （base64 编码的 LaTeX 源码） + `data-math-display`
+   *   - MD 路径：同样类名，但属性名 `data-math-source-md`（防止冲突 / 区分来源）
+   *
+   * 这里统一扫描，调 renderKatex 拿 HTML 注入。已渲染过的打 `data-rendered`。
+   *
+   * 失败处理：单个公式出错只显示该处的错误条，不影响其它内容。
+   */
+  useEffect(() => {
+    const host = pmRenderRef.current;
+    if (!host || !content?.content) return;
+    const blocks = host.querySelectorAll<HTMLElement>(
+      ".shared-math-block:not([data-rendered]), .shared-math-inline:not([data-rendered])"
+    );
+    if (blocks.length === 0) return;
+
+    let cancelled = false;
+    blocks.forEach((block) => {
+      const encoded =
+        block.getAttribute("data-math-source") ||
+        block.getAttribute("data-math-source-md") ||
+        "";
+      const display = block.getAttribute("data-math-display") === "1";
+      let source = "";
+      try {
+        source = decodeURIComponent(escape(atob(encoded)));
+      } catch {
+        source = "";
+      }
+      block.setAttribute("data-rendered", "1");
+      renderKatex(source, { displayMode: display }).then((res) => {
+        if (cancelled) return;
+        if (res.error) {
+          // 错误展示：行内/块级共用同一类名，由 CSS 控制差异
+          block.innerHTML = `
+            <span class="shared-math-error">
+              <span class="shared-math-error-title">LaTeX 错误</span>
+              <code class="shared-math-error-src">${escapeHtml(source)}</code>
+              <span class="shared-math-error-msg">${escapeHtml(res.error)}</span>
+            </span>
+          `;
+        } else {
+          block.innerHTML = res.html;
+        }
+      });
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [content?.content, isEditing]);
+
+
+
+
 
   // 修复分享页面滚动问题：覆盖 #root 和 html/body 的 overflow:hidden
   useEffect(() => {
@@ -368,6 +486,28 @@ export default function SharedNoteView({ shareToken }: SharedNoteViewProps) {
     if (anchor) {
       const href = anchor.getAttribute("href") || "";
       const lower = href.toLowerCase();
+      // ---- 1a. 脚注跳转：`<a href="#fn-id" data-footnote-jump>` 或
+      //          `<a href="#fnref-id" data-footnote-back>` ----
+      // 阻止默认的 hash 跳转（会刷新 URL 且无平滑动画），改为手动滚动 + 高亮
+      const fnJump = anchor.getAttribute("data-footnote-jump");
+      const fnBack = anchor.getAttribute("data-footnote-back");
+      if (fnJump || fnBack) {
+        e.preventDefault();
+        const id = fnJump || fnBack || "";
+        const targetId = fnJump ? `fn-${id}` : `fnref-${id}`;
+        // 使用 getElementById 比 querySelector + CSS.escape 更稳，identifier
+        // 在生成 HTML 时已经过 escapeHtml 但作为 id 选择器仍可能不合法
+        const dest = document.getElementById(targetId);
+        if (dest) {
+          dest.scrollIntoView({ behavior: "smooth", block: "center" });
+          dest.classList.add("shared-footnote-flash");
+          window.setTimeout(
+            () => dest.classList.remove("shared-footnote-flash"),
+            1200
+          );
+        }
+        return;
+      }
       if (lower.startsWith("mailto:") || lower.startsWith("tel:") || lower.startsWith("sms:")) {
         e.preventDefault();
         // 去掉协议头展示更友好的明文
@@ -625,6 +765,7 @@ export default function SharedNoteView({ shareToken }: SharedNoteViewProps) {
         ) : detectFormat(content.content) === "md" ? (
           // 新编辑器保存的 Markdown：用 react-markdown 渲染
           <div
+            ref={pmRenderRef}
             className="shared-note-content prose prose-sm dark:prose-invert max-w-none
               prose-headings:text-zinc-800 dark:prose-headings:text-zinc-200
               prose-p:text-zinc-600 dark:prose-p:text-zinc-300
@@ -635,12 +776,41 @@ export default function SharedNoteView({ shareToken }: SharedNoteViewProps) {
               prose-img:rounded-lg prose-img:border prose-img:border-zinc-200 dark:prose-img:border-zinc-800"
             onClick={handleSharedContentClick}
           >
-            <ReactMarkdown remarkPlugins={[remarkGfm]}>
-              {content.content}
+            <ReactMarkdown
+              remarkPlugins={[remarkGfm]}
+              // rehype-raw 让 raw HTML（math 占位）能透传过 mdast→hast 阶段，
+              // 否则 ReactMarkdown 默认会丢弃 raw HTML 节点。
+              rehypePlugins={[rehypeRaw]}
+              components={{
+                // 拦截 mermaid 围栏代码块：react-markdown 把 ```mermaid 渲染成
+                // <pre><code class="language-mermaid">...</code></pre>。我们识别
+                // 出 language-mermaid 后用 MermaidView 直接出 SVG，其它语言保持
+                // 默认行为（依赖 prose 样式）。
+                code({ inline, className, children, ...props }: any) {
+                  const langMatch = /language-([\w-]+)/.exec(className || "");
+                  const lang = langMatch?.[1] || "";
+                  if (!inline && isMermaidLang(lang)) {
+                    return <MermaidView source={String(children).replace(/\n$/, "")} debounceMs={0} />;
+                  }
+                  return (
+                    <code className={className} {...props}>
+                      {children}
+                    </code>
+                  );
+                },
+              }}
+            >
+              {preprocessMarkdownMath(
+                preprocessMarkdownFootnotes(
+                  content.content,
+                  computeFootnoteOrderFromMarkdown(content.content)
+                )
+              )}
             </ReactMarkdown>
           </div>
         ) : (
           <div
+            ref={pmRenderRef}
             className="shared-note-content prose prose-sm dark:prose-invert max-w-none
               prose-headings:text-zinc-800 dark:prose-headings:text-zinc-200
               prose-p:text-zinc-600 dark:prose-p:text-zinc-300
@@ -812,6 +982,8 @@ function renderContent(content: string): string {
 /** 简单的 Tiptap JSON → HTML 渲染器 */
 function renderTiptapJSON(doc: any): string {
   if (!doc.content) return "";
+  // 预扫文档：建立 footnote identifier → 显示序号映射，供 renderNode 同步读取
+  _footnoteOrderMap = computeFootnoteOrderFromTiptap(doc);
   // 顶层：把紧邻的 codeBlock 节点合并为一个，兼容历史笔记里被粘贴 bug 拆散的数据
   const merged: any[] = [];
   for (const node of doc.content) {
@@ -832,8 +1004,207 @@ function renderTiptapJSON(doc: any): string {
   return merged.map((node: any) => renderNode(node)).join("");
 }
 
+/**
+ * 分享页 MD 路径专用：把 Markdown 文本里的 `$...$` / `$$...$$` 数学公式
+ * 在交给 ReactMarkdown 之前替换成 raw HTML 占位（`<span data-math-source-md=...>`
+ * / `<div data-math-source-md=...>`）。配合 rehype-raw 让 ReactMarkdown 透传
+ * 这些 HTML 元素，最后由统一的 useEffect 扫描并异步注入 KaTeX。
+ *
+ * 与 contentFormat.ts 里的 `extractMathPlaceholders` 思路一致，但这里直接
+ * 输出 raw HTML（而不是 NUL 占位），因为 ReactMarkdown 不接受非标准占位符。
+ *
+ * 启发式与编辑器侧一致：
+ *   - 先抽块级 `$$...$$`（允许跨行）
+ *   - 再抽行内 `$...$`（不允许换行，且前一字符非 `\`，避免 `\$` 转义）
+ *   - 在围栏代码块（```...```）内部不处理，避免代码示例里的 `$ ` 被误识别
+ */
+function preprocessMarkdownMath(md: string): string {
+  if (!md) return md;
+  // 把 fenced code 段抠出来用占位先保存，处理完 math 再还原。
+  // 这一步必须，否则代码示例（如 shell 提示符 `$ ls`）会被吞。
+  const codeStash: string[] = [];
+  let text = md.replace(/```[\s\S]*?```|~~~[\s\S]*?~~~/g, (m) => {
+    const idx = codeStash.push(m) - 1;
+    return `\u0000CODE${idx}\u0000`;
+  });
+
+  // 块级公式
+  text = text.replace(/\$\$([\s\S]+?)\$\$/g, (_m, body) => {
+    let encoded = "";
+    try {
+      encoded = window.btoa(unescape(encodeURIComponent(String(body).trim())));
+    } catch {
+      encoded = "";
+    }
+    // 注意：data-math-source-md 与 PM 路径的 data-math-source 区分，避免 useEffect
+    // 同时扫到两套占位（PM 路径生成的占位用 data-math-source）。
+    // 用 `<div>` 块级 + 前后空行确保被 markdown 当独立块级 HTML。
+    return `\n\n<div class="shared-math-block" data-math-source-md="${encoded}" data-math-display="1"></div>\n\n`;
+  });
+
+  // 行内公式
+  text = text.replace(
+    /(^|[^\\$\w])\$([^\s$][^$\n]*?[^\s$]|[^\s$])\$(?=$|[^\w$])/g,
+    (_m, pre, body) => {
+      let encoded = "";
+      try {
+        encoded = window.btoa(unescape(encodeURIComponent(String(body))));
+      } catch {
+        encoded = "";
+      }
+      return `${pre}<span class="shared-math-inline" data-math-source-md="${encoded}" data-math-display="0"></span>`;
+    }
+  );
+
+  // 还原代码段
+  text = text.replace(/\u0000CODE(\d+)\u0000/g, (_m, idx) => codeStash[Number(idx)] || "");
+  return text;
+}
+
+/**
+ * 分享页 MD 路径专用：把 Markdown 文本里的脚注引用 `[^id]` 与定义 `[^id]: ...`
+ * 替换成 raw HTML 占位（`<sup data-footnote-ref>` / `<div data-footnote-def>`），
+ * 配合 rehype-raw 让 ReactMarkdown 透传。renderContent 时还要先扫一遍 markdown
+ * 决定 identifier → 显示序号映射（按引用出现顺序），随后的 useEffect 再做点击
+ * 跳转交互。
+ *
+ * 与编辑器侧的 `extractFootnotePlaceholders` 思路一致，但这里直接输出 raw HTML
+ * （ReactMarkdown 不接受非标准占位符）。
+ *
+ * 调用方需要先调用 `computeFootnoteOrderFromMarkdown` 拿到序号 map，然后传进来。
+ */
+function preprocessMarkdownFootnotes(
+  md: string,
+  orderMap: Record<string, number>
+): string {
+  if (!md) return md;
+  // 保护围栏代码块
+  const codeStash: string[] = [];
+  let text = md.replace(/```[\s\S]*?```|~~~[\s\S]*?~~~/g, (m) => {
+    const idx = codeStash.push(m) - 1;
+    return `\u0000FNMDCODE${idx}\u0000`;
+  });
+
+  // 抽脚注定义（行首），按行扫
+  const lines = text.split("\n");
+  const outLines: string[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const m = line.match(/^\[\^([A-Za-z0-9_-]+)\]:\s?(.*)$/);
+    if (m) {
+      const id = m[1];
+      const parts: string[] = [m[2] || ""];
+      let j = i + 1;
+      while (j < lines.length) {
+        const nxt = lines[j];
+        if (/^(\s{4}|\t)/.test(nxt)) {
+          parts.push(nxt.replace(/^(\s{4}|\t)/, ""));
+          j++;
+        } else if (nxt.trim() === "") {
+          if (j + 1 < lines.length && /^(\s{4}|\t)/.test(lines[j + 1])) {
+            parts.push("");
+            j++;
+          } else {
+            break;
+          }
+        } else {
+          break;
+        }
+      }
+      const content = parts.join("\n").trim();
+      const order = orderMap[id] || 0;
+      const encId = String(id).replace(/"/g, "&quot;");
+      const encContent = escapeHtml(content);
+      // 用 raw HTML 块表示一个脚注定义。前后空行确保 ReactMarkdown 当独立块。
+      outLines.push(
+        `\n<div class="shared-footnote-def" data-footnote-def="${encId}" data-footnote-order="${order}"><span class="shared-footnote-def-marker"><a href="#fnref-${encId}" class="shared-footnote-back" data-footnote-back="${encId}" title="跳回">↩</a><span class="shared-footnote-def-index">${order || "?"}.</span></span><span class="shared-footnote-def-content">${encContent}</span></div>\n`
+      );
+      i = j - 1;
+    } else {
+      outLines.push(line);
+    }
+  }
+  text = outLines.join("\n");
+
+  // 抽脚注引用 `[^id]`（保护行内代码）
+  const inlineCodeStash: string[] = [];
+  text = text.replace(/`[^`\n]+`/g, (m) => {
+    const idx = inlineCodeStash.push(m) - 1;
+    return `\u0000FNMDICODE${idx}\u0000`;
+  });
+  text = text.replace(/\[\^([A-Za-z0-9_-]+)\]/g, (_m, id) => {
+    const order = orderMap[id] || 0;
+    const encId = String(id).replace(/"/g, "&quot;");
+    return `<sup class="shared-footnote-ref" id="fnref-${encId}" data-footnote-ref="${encId}" data-footnote-order="${order}"><a href="#fn-${encId}" data-footnote-jump="${encId}">[${order || "?"}]</a></sup>`;
+  });
+  text = text.replace(/\u0000FNMDICODE(\d+)\u0000/g, (_m, idx) => inlineCodeStash[Number(idx)] || "");
+  text = text.replace(/\u0000FNMDCODE(\d+)\u0000/g, (_m, idx) => codeStash[Number(idx)] || "");
+
+  return text;
+}
+
+/**
+ * 扫描 markdown 文本，按 `[^id]` 引用首次出现顺序生成 identifier → 序号 map。
+ * 同步扫描定义里被引用但未在正文显示的脚注（仍然按其在 markdown 中第一次
+ * 见到的顺序编号，与 Pandoc 保持一致）。
+ */
+function computeFootnoteOrderFromMarkdown(md: string): Record<string, number> {
+  if (!md) return {};
+  // 移除围栏代码块再扫
+  const stripped = md.replace(/```[\s\S]*?```|~~~[\s\S]*?~~~/g, "");
+  const order: string[] = [];
+  // 先扫引用
+  const refRe = /\[\^([A-Za-z0-9_-]+)\](?!:)/g;
+  let m: RegExpExecArray | null;
+  while ((m = refRe.exec(stripped)) !== null) {
+    if (!order.includes(m[1])) order.push(m[1]);
+  }
+  // 再扫定义（兜底：只有定义无引用的也给序号）
+  const defRe = /^\[\^([A-Za-z0-9_-]+)\]:/gm;
+  while ((m = defRe.exec(stripped)) !== null) {
+    if (!order.includes(m[1])) order.push(m[1]);
+  }
+  const out: Record<string, number> = {};
+  order.forEach((id, idx) => (out[id] = idx + 1));
+  return out;
+}
+
+/**
+ * 扫描 Tiptap PM 文档，按 footnoteReference 出现顺序生成序号 map。
+ * 用于 PM 路径 renderNode 时统一编号。
+ */
+function computeFootnoteOrderFromTiptap(doc: any): Record<string, number> {
+  const order: string[] = [];
+  const walk = (node: any) => {
+    if (!node) return;
+    if (node.type === "footnoteReference") {
+      const id = node.attrs?.identifier || "";
+      if (id && !order.includes(id)) order.push(id);
+    }
+    if (Array.isArray(node.content)) node.content.forEach(walk);
+  };
+  walk(doc);
+  // 兜底：扫一遍 def，让无引用的 def 也有序号
+  const walkDefs = (node: any) => {
+    if (!node) return;
+    if (node.type === "footnoteDefinition") {
+      const id = node.attrs?.identifier || "";
+      if (id && !order.includes(id)) order.push(id);
+    }
+    if (Array.isArray(node.content)) node.content.forEach(walkDefs);
+  };
+  walkDefs(doc);
+  const out: Record<string, number> = {};
+  order.forEach((id, idx) => (out[id] = idx + 1));
+  return out;
+}
+
+// 模块级：renderTiptapJSON 入口时填好的序号 map，供 renderNode 同步读取
+let _footnoteOrderMap: Record<string, number> = {};
+
 function renderNode(node: any): string {
   if (!node) return "";
+
 
   switch (node.type) {
     case "paragraph": {
@@ -859,6 +1230,39 @@ function renderNode(node: any): string {
     }
     case "codeBlock":
       return renderCodeBlock(node);
+    case "mathInline":
+    case "mathBlock": {
+      // 数学公式：与 mermaid 同套路——renderNode 是同步 string 输出，没法在这
+      // 里直接 await katex 渲染，所以先吐占位 + base64 编码的源码，外面的
+      // useEffect 扫描后异步注入 KaTeX HTML。
+      const latex = node.attrs?.latex || "";
+      const display = node.type === "mathBlock";
+      let encoded = "";
+      try {
+        encoded =
+          typeof window !== "undefined"
+            ? window.btoa(unescape(encodeURIComponent(latex)))
+            : Buffer.from(latex, "utf-8").toString("base64");
+      } catch {
+        encoded = "";
+      }
+      const tag = display ? "div" : "span";
+      const cls = display ? "shared-math-block" : "shared-math-inline";
+      return `<${tag} class="${cls}" data-math-source="${encoded}" data-math-display="${display ? "1" : "0"}"><${tag} class="shared-math-loading">$${display ? "$" : ""}${escapeHtml(latex)}$${display ? "$" : ""}</${tag}></${tag}>`;
+    }
+    case "footnoteReference": {
+      const id = node.attrs?.identifier || "";
+      const order = _footnoteOrderMap[id] || 0;
+      const encId = escapeHtml(id);
+      return `<sup class="shared-footnote-ref" id="fnref-${encId}" data-footnote-ref="${encId}" data-footnote-order="${order}"><a href="#fn-${encId}" data-footnote-jump="${encId}">[${order || "?"}]</a></sup>`;
+    }
+    case "footnoteDefinition": {
+      const id = node.attrs?.identifier || "";
+      const content = node.attrs?.content || "";
+      const order = _footnoteOrderMap[id] || 0;
+      const encId = escapeHtml(id);
+      return `<div class="shared-footnote-def" id="fn-${encId}" data-footnote-def="${encId}" data-footnote-order="${order}"><span class="shared-footnote-def-marker"><a href="#fnref-${encId}" class="shared-footnote-back" data-footnote-back="${encId}" title="跳回">↩</a><span class="shared-footnote-def-index">${order || "?"}.</span></span><span class="shared-footnote-def-content">${escapeHtml(content)}</span></div>`;
+    }
     case "blockquote":
       return `<blockquote>${renderChildren(node)}</blockquote>`;
     case "horizontalRule":
@@ -921,11 +1325,36 @@ function renderChildren(node: any): string {
  *   - mac 风格三色小圆点 + 语言徽章
  *   - 右上角复制按钮（由 onClick 事件委托处理）
  *   - 暗色代码区 + 等宽字体
+ *
+ * 特殊处理 mermaid：分享页 PM 路径整段是 dangerouslySetInnerHTML 输出，
+ * 没法直接渲染 React 子树，所以这里只输出一个带 `data-mermaid-source`
+ * 的占位 div + 原始源码（base64 编码避免 HTML 注入冲突）。
+ * 真正的 SVG 由 useEffect 扫描后用 renderMermaid 注入。
  */
 function renderCodeBlock(node: any): string {
   const rawLang = node.attrs?.language;
   const langLabel = !rawLang || rawLang === "auto" ? "auto" : String(rawLang).toLowerCase();
   const codeText = (node.content || []).map((c: any) => c.text || "").join("");
+
+  // mermaid 分支：输出占位让外层异步注入 SVG
+  if (isMermaidLang(langLabel)) {
+    // base64 编码源码，避免双引号、& 等字符破坏属性
+    let encoded = "";
+    try {
+      encoded =
+        typeof window !== "undefined"
+          ? window.btoa(unescape(encodeURIComponent(codeText)))
+          : Buffer.from(codeText, "utf-8").toString("base64");
+    } catch {
+      encoded = "";
+    }
+    return `
+<div class="shared-mermaid-block" data-mermaid-source="${encoded}">
+  <div class="shared-mermaid-loading">渲染流程图...</div>
+</div>
+`.trim();
+  }
+
   const languageClass = langLabel && langLabel !== "auto" ? ` language-${escapeHtml(langLabel)}` : "";
 
   // 用 lowlight 生成带 hljs token 的 hast，再序列化为 HTML 注入 <code>

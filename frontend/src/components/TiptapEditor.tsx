@@ -40,6 +40,8 @@ import type { FormatMenuPayload } from "@/lib/desktopBridge";
 import { sendFormatState } from "@/lib/desktopBridge";
 import { SlashCommandsMenu, getDefaultSlashCommands, createSlashExtension, createSlashEventHandlers } from "@/components/SlashCommands";
 import { MarkdownEnhancements } from "@/components/MarkdownEnhancements";
+import { MathExtensions } from "@/components/MathExtensions";
+import { FootnoteExtensions } from "@/components/FootnoteExtensions";
 import CodeBlockView from "@/components/CodeBlockView";
 import MobileFloatingToolbar, { MobileToolbarItem } from "@/components/MobileFloatingToolbar";
 import { useKeyboardVisible } from "@/hooks/useKeyboardVisible";
@@ -993,6 +995,10 @@ export default forwardRef<NoteEditorHandle, TiptapEditorProps>(function TiptapEd
       slashExtension.current,
       // Markdown 语法增强：~~删除线~~ / ==高亮== input rule + 智能粘贴 markdown
       ...MarkdownEnhancements,
+      // 数学公式：行内 $...$ 与块级 $$...$$（KaTeX 渲染，懒加载）
+      ...MathExtensions,
+      // 脚注：行内 [^id] 引用 + 块级 [^id]: content 定义
+      ...FootnoteExtensions,
     ],
     content: parseContent(note.content),
     editable,

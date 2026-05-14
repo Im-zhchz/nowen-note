@@ -37,6 +37,8 @@ import TurndownService from "turndown";
 import { parser as baseMdParser } from "@lezer/markdown";
 import { GFM } from "@lezer/markdown";
 import type { SyntaxNode } from "@lezer/common";
+import { MathInline, MathBlock } from "@/components/MathExtensions";
+import { FootnoteReference, FootnoteDefinition } from "@/components/FootnoteExtensions";
 
 // ---------- 格式识别 ----------
 
@@ -125,6 +127,13 @@ function getTiptapExtensions() {
     // `textAlign` 属性会被 Tiptap schema 过滤掉 → Turndown 拿不到 style
     // → RTE→MD 时段落对齐被静默丢失。markdownToTiptapJSON 反向也靠它识别 align 属性。
     TextAlign.configure({ types: ["heading", "paragraph"] }),
+    // 数学公式：与 TiptapEditor 保持一致，避免 generateHTML 时 math 节点被 schema
+    // 过滤掉。MathInline / MathBlock 都是 atom 节点，仅用属性 `latex` 携带源码。
+    MathInline,
+    MathBlock,
+    // 脚注：与 TiptapEditor 对齐，generateHTML 时不能让 footnote 节点被过滤
+    FootnoteReference,
+    FootnoteDefinition,
   ];
   return _extensions;
 }
@@ -221,6 +230,85 @@ function getTurndown(): TurndownService {
       const tag = node.nodeName.toLowerCase();
       const inner = content.replace(/^\n+|\n+$/g, "");
       return `\n\n<${tag} style="text-align:${align}">${inner}</${tag}>\n\n`;
+    },
+  });
+
+  /**
+   * 数学公式：把 Tiptap 输出的 `<span data-math-inline data-latex="x^2">` 和
+   * `<div data-math-block data-latex="\int_0^1 x\\,dx">` 转回 Markdown 的
+   * `$x^2$` / `$$\int_0^1 x\,dx$$`。
+   *
+   * 关键点：
+   *   - Turndown 默认会把这两种节点当成 inline/block HTML 处理，丢内容；
+   *     必须显式 filter 它们，从 data-latex 属性取源码并按 MD 语法吐出。
+   *   - 块级公式前后包两个换行确保被 MD 解析器当独立块（避免被并到上一段）。
+   *   - 行内公式两侧加单空格防止被前后字符黏住影响识别；如果前后已经是空白
+   *     字符 Turndown 在拼接时不会重复加。
+   */
+  td.addRule("mathInline", {
+    filter: (node) =>
+      node.nodeName === "SPAN" &&
+      (node as Element).getAttribute("data-math-inline") != null,
+    replacement: (_content, node) => {
+      const latex = (node as Element).getAttribute("data-latex") || "";
+      if (!latex) return "";
+      return `$${latex}$`;
+    },
+  });
+
+  td.addRule("mathBlock", {
+    filter: (node) =>
+      node.nodeName === "DIV" &&
+      (node as Element).getAttribute("data-math-block") != null,
+    replacement: (_content, node) => {
+      const latex = (node as Element).getAttribute("data-latex") || "";
+      if (!latex) return "";
+      return `\n\n$$\n${latex}\n$$\n\n`;
+    },
+  });
+
+  /**
+   * 脚注引用：Tiptap 输出 `<sup data-footnote-ref="id" data-footnote-identifier="id">[^id]</sup>`
+   * 反向为 `[^id]`。注意：renderHTML 已经把 `[^id]` 写进 textContent，所以
+   * Turndown 默认会把这段文字原样输出（外面再加一层 sup 标签的话也会被默认
+   * 规则处理）。这里显式 filter 接管，避免出双重 `[^id]` 或残留 `<sup>` 包装。
+   */
+  td.addRule("footnoteRef", {
+    filter: (node) => {
+      if (node.nodeName !== "SUP" && node.nodeName !== "SPAN") return false;
+      return (node as Element).getAttribute("data-footnote-ref") != null;
+    },
+    replacement: (_content, node) => {
+      const el = node as Element;
+      const id =
+        el.getAttribute("data-footnote-identifier") ||
+        el.getAttribute("data-footnote-ref") ||
+        "";
+      if (!id) return "";
+      return `[^${id}]`;
+    },
+  });
+
+  /**
+   * 脚注定义：Tiptap 输出 `<div data-footnote-def="id" data-footnote-identifier="id"
+   * data-footnote-content="...">[^id]: content</div>`。反向为 `[^id]: content`。
+   * 块级输出，前后空行保证被 MD 当作独立块。
+   */
+  td.addRule("footnoteDef", {
+    filter: (node) =>
+      node.nodeName === "DIV" &&
+      (node as Element).getAttribute("data-footnote-def") != null,
+    replacement: (_content, node) => {
+      const el = node as Element;
+      const id =
+        el.getAttribute("data-footnote-identifier") ||
+        el.getAttribute("data-footnote-def") ||
+        "";
+      const content = el.getAttribute("data-footnote-content") || "";
+      if (!id) return "";
+      // content 中的换行折成 markdown 的「续行缩进」（4 空格），符合 Pandoc 写法
+      const escapedContent = content.replace(/\n/g, "\n    ");
+      return `\n\n[^${id}]: ${escapedContent}\n\n`;
     },
   });
 
@@ -324,6 +412,10 @@ export function markdownToPlainText(md: string): string {
   text = text.replace(/^\s*([-*_])\1{2,}\s*$/gm, "");
   // 表格分隔
   text = text.replace(/^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)+\|?\s*$/gm, "");
+  // 脚注：定义行 `[^id]: 内容` → 保留内容文本；引用 `[^id]` → 去掉
+  // 全文搜索语义化更合理（脚注内容应该可被搜到，引用标记本身不重要）
+  text = text.replace(/^\[\^[A-Za-z0-9_-]+\]:\s?/gm, "");
+  text = text.replace(/\[\^[A-Za-z0-9_-]+\]/g, "");
   // 合并多余空白
   text = text.replace(/[ \t]+\n/g, "\n");
   text = text.replace(/\n{3,}/g, "\n\n");
@@ -791,20 +883,226 @@ function renderTable(src: string, node: SyntaxNode): string {
  *
  * 依赖 @lezer/markdown + GFM，覆盖所有 StarterKit 支持的语法。
  * 出现任意异常时兜底为 `<p>…</p>`，保证不会整段丢内容。
+ *
+ * 数学公式处理：lezer/markdown 不识别 `$...$` / `$$...$$`，会把它们当成
+ * 普通文本，导致下游 generateJSON 时丢失公式语义。这里在解析前先把所有
+ * 公式段提取出来用占位符替换，渲染完 HTML 再回填为 `<span data-math-inline>`
+ * 或 `<div data-math-block>`，让 Tiptap 的 MathInline/MathBlock parseHTML
+ * 能识别。占位符用 NUL 字符 + 自增 id，保证不会与正文冲突。
  */
+function extractMathPlaceholders(md: string): {
+  text: string;
+  blocks: string[];
+  inlines: string[];
+} {
+  const blocks: string[] = [];
+  const inlines: string[] = [];
+
+  // 先抽块级 `$$...$$`（支持跨行；非贪婪；要求两侧都是 `$$`）
+  // 注意：必须先于 inline，否则 `$$x$$` 会被 inline 规则错切。
+  let text = md.replace(/\$\$([\s\S]+?)\$\$/g, (_m, body) => {
+    const idx = blocks.push(body.trim()) - 1;
+    return `\u0000MATHBLOCK${idx}\u0000`;
+  });
+
+  // 再抽行内 `$...$`：
+  //   - 内部不能含 `$` 或换行
+  //   - 前一个字符不是 `\`（避免 `\$` 转义美元符）
+  //   - 前后边界：左侧不是数字或字母（避免 `a$b$c` 这种货币写法误判过宽，但
+  //     公式场景里通常会有空白；放宽则可能误伤金额，权衡下选择保守边界）
+  //   - 这种正则不能 100% 完美（KaTeX 自己的判断同样基于启发式），覆盖绝大多
+  //     数日常场景即可
+  text = text.replace(
+    /(^|[^\\$\w])\$([^\s$][^$\n]*?[^\s$]|[^\s$])\$(?=$|[^\w$])/g,
+    (_m, pre, body) => {
+      const idx = inlines.push(body) - 1;
+      return `${pre}\u0000MATHINLINE${idx}\u0000`;
+    }
+  );
+
+  return { text, blocks, inlines };
+}
+
+function restoreMathPlaceholders(
+  html: string,
+  blocks: string[],
+  inlines: string[]
+): string {
+  // 行内：放到 <span data-math-inline data-latex="...">，文本内容不重要，
+  // Tiptap parseHTML 会优先读 data-latex
+  let out = html.replace(/\u0000MATHINLINE(\d+)\u0000/g, (_m, idx) => {
+    const latex = inlines[Number(idx)] || "";
+    const enc = escapeAttr(latex);
+    return `<span data-math-inline="true" data-latex="${enc}">$${escapeHtml(latex)}$</span>`;
+  });
+  // 块级：放到 <div data-math-block>，外面通常被 renderBlock 包了 <p>，
+  // 这里需要把"包着公式占位的段落"剥掉 <p>，否则 Tiptap parseHTML 会把
+  // mathBlock 嵌进段落（block-in-inline）而被丢弃。
+  out = out.replace(
+    /<p>\s*\u0000MATHBLOCK(\d+)\u0000\s*<\/p>/g,
+    (_m, idx) => {
+      const latex = blocks[Number(idx)] || "";
+      const enc = escapeAttr(latex);
+      return `<div data-math-block="true" data-latex="${enc}">$$${escapeHtml(latex)}$$</div>`;
+    }
+  );
+  // 兜底：如果块级占位没被段落包住（例如出现在表格里）
+  out = out.replace(/\u0000MATHBLOCK(\d+)\u0000/g, (_m, idx) => {
+    const latex = blocks[Number(idx)] || "";
+    const enc = escapeAttr(latex);
+    return `<div data-math-block="true" data-latex="${enc}">$$${escapeHtml(latex)}$$</div>`;
+  });
+  return out;
+}
+
+/**
+ * 脚注预处理：lezer/markdown 不识别 GFM/Pandoc 风格的 `[^id]` 引用与
+ * `[^id]: ...` 定义，会把它们整段当普通文本。我们在 lezer 解析前先把：
+ *   - 行首 `[^id]: 内容` 抽走（支持续行缩进），放到 defs 数组
+ *   - 行内 `[^id]` 换成占位符，放到 refs 数组
+ *
+ * 占位策略：与 math 一致，用 NUL + 自增 id，避免与正文冲突。最后再把占位
+ * 还原成 `<sup data-footnote-ref>` / `<div data-footnote-def>` HTML。
+ *
+ * 兼容性：在围栏代码块 / 行内代码内不识别脚注，避免代码示例里的 `[^x]`
+ * 被误识别（lezer 解析 fenced code 时会把整段当 code，但我们这里在解析前
+ * 做替换，无法依赖 lezer 的边界，需要手动跳过 fenced code）。
+ */
+function extractFootnotePlaceholders(md: string): {
+  text: string;
+  refs: string[];
+  defs: Array<{ id: string; content: string }>;
+} {
+  const refs: string[] = [];
+  const defs: Array<{ id: string; content: string }> = [];
+
+  // Step 1: 把围栏代码块抠出来用占位保存，处理完脚注再还原。
+  // 避免代码示例里的 `[^x]` 被误识别。
+  const codeStash: string[] = [];
+  let text = md.replace(/```[\s\S]*?```|~~~[\s\S]*?~~~/g, (m) => {
+    const idx = codeStash.push(m) - 1;
+    return `\u0000FNCODE${idx}\u0000`;
+  });
+
+  // Step 2: 抽脚注 *定义*。
+  // 格式：`[^id]: 内容`（行首），后续以 4 空格缩进的行属于同一脚注内容。
+  // 我们按行扫描，发现一行匹配 `^\[\^id\]:` 就开始收集后续缩进续行。
+  const lines = text.split("\n");
+  const outLines: string[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const m = line.match(/^\[\^([A-Za-z0-9_-]+)\]:\s?(.*)$/);
+    if (m) {
+      const id = m[1];
+      const parts: string[] = [m[2] || ""];
+      // 收集续行：以 4 空格 / 1 tab 开头的非空行视为续行
+      let j = i + 1;
+      while (j < lines.length) {
+        const nxt = lines[j];
+        if (/^(\s{4}|\t)/.test(nxt)) {
+          parts.push(nxt.replace(/^(\s{4}|\t)/, ""));
+          j++;
+        } else if (nxt.trim() === "") {
+          // 空行不算结束，下一行如果还是缩进就继续；否则结束
+          if (j + 1 < lines.length && /^(\s{4}|\t)/.test(lines[j + 1])) {
+            parts.push("");
+            j++;
+          } else {
+            break;
+          }
+        } else {
+          break;
+        }
+      }
+      const content = parts.join("\n").trim();
+      const idx = defs.push({ id, content }) - 1;
+      // 用块级占位符占一整行，避免被合到上下文段落里
+      outLines.push(`\u0000FNDEF${idx}\u0000`);
+      i = j - 1;
+    } else {
+      outLines.push(line);
+    }
+  }
+  text = outLines.join("\n");
+
+  // Step 3: 抽脚注 *引用* `[^id]`。
+  // 行内代码块也要避开：先用占位把行内代码段保护起来
+  const inlineCodeStash: string[] = [];
+  text = text.replace(/`[^`\n]+`/g, (m) => {
+    const idx = inlineCodeStash.push(m) - 1;
+    return `\u0000FNICODE${idx}\u0000`;
+  });
+
+  text = text.replace(/\[\^([A-Za-z0-9_-]+)\]/g, (_m, id) => {
+    const idx = refs.push(id) - 1;
+    return `\u0000FNREF${idx}\u0000`;
+  });
+
+  // 还原行内代码
+  text = text.replace(/\u0000FNICODE(\d+)\u0000/g, (_m, idx) => inlineCodeStash[Number(idx)] || "");
+
+  // 还原围栏代码块
+  text = text.replace(/\u0000FNCODE(\d+)\u0000/g, (_m, idx) => codeStash[Number(idx)] || "");
+
+  return { text, refs, defs };
+}
+
+function restoreFootnotePlaceholders(
+  html: string,
+  refs: string[],
+  defs: Array<{ id: string; content: string }>
+): string {
+  // 引用：换成 <sup data-footnote-ref="id" data-footnote-identifier="id">[^id]</sup>
+  let out = html.replace(/\u0000FNREF(\d+)\u0000/g, (_m, idx) => {
+    const id = refs[Number(idx)] || "";
+    if (!id) return "";
+    const enc = escapeAttr(id);
+    return `<sup data-footnote-ref="${enc}" data-footnote-identifier="${enc}">[^${escapeHtml(id)}]</sup>`;
+  });
+  // 定义：占位通常被 renderBlock 包了 <p>，需要剥掉 <p>，否则 Tiptap
+  // parseHTML 会把 footnoteDefinition 嵌进段落而被丢弃。
+  out = out.replace(/<p>\s*\u0000FNDEF(\d+)\u0000\s*<\/p>/g, (_m, idx) => {
+    const def = defs[Number(idx)];
+    if (!def) return "";
+    const encId = escapeAttr(def.id);
+    const encContent = escapeAttr(def.content);
+    return `<div data-footnote-def="${encId}" data-footnote-identifier="${encId}" data-footnote-content="${encContent}">[^${escapeHtml(def.id)}]: ${escapeHtml(def.content)}</div>`;
+  });
+  // 兜底：未被段落包住的情况
+  out = out.replace(/\u0000FNDEF(\d+)\u0000/g, (_m, idx) => {
+    const def = defs[Number(idx)];
+    if (!def) return "";
+    const encId = escapeAttr(def.id);
+    const encContent = escapeAttr(def.content);
+    return `<div data-footnote-def="${encId}" data-footnote-identifier="${encId}" data-footnote-content="${encContent}">[^${escapeHtml(def.id)}]: ${escapeHtml(def.content)}</div>`;
+  });
+  return out;
+}
+
 export function markdownToHtml(md: string): string {
   if (!md) return "";
   try {
-    const tree = getMdParser().parse(md);
+    // 第 1 步：抽离数学公式
+    const { text: afterMath, blocks, inlines } = extractMathPlaceholders(md);
+    // 第 2 步：抽离脚注（在 math 之后做，避免 `$..$` 内的 `[^x]` 被当成 ref）
+    const { text: preprocessed, refs, defs } = extractFootnotePlaceholders(afterMath);
+
+    const tree = getMdParser().parse(preprocessed);
     // Document 是根节点；它的直接子就是块级节点
     let out = "";
     const doc = tree.topNode;
     let c = doc.firstChild;
     while (c) {
-      out += renderBlock(md, c);
+      out += renderBlock(preprocessed, c);
       c = c.nextSibling;
     }
-    return out || `<p>${escapeHtml(md)}</p>`;
+    const html = out || `<p>${escapeHtml(preprocessed)}</p>`;
+    // 第 3 步：还原 math + footnote 占位
+    return restoreFootnotePlaceholders(
+      restoreMathPlaceholders(html, blocks, inlines),
+      refs,
+      defs
+    );
   } catch (err) {
     console.warn("[contentFormat] markdownToHtml failed:", err);
     return `<p>${escapeHtml(md)}</p>`;
