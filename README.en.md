@@ -123,6 +123,36 @@ If this project helps you, feel free to scan the QR code and buy the author a co
 
 > 最近 5 个版本的更新内容，完整历史见 [CHANGELOG.md](./CHANGELOG.md)。
 
+### v1.0.38 - 2026-05-14
+
+### ✨ 新增
+
+- **editor**: 顶栏新增 Mermaid / 数学公式 / 脚注 按钮，并让 Mermaid 块可双击编辑 (8970e9c)
+- **editor**: Mermaid 图表 / LaTeX 数学公式 / 脚注 三项块级扩展 (530240c)
+- **editor**: 链接气泡菜单 + 选区气泡补链接按钮 (ad8d8c8)
+- **editor**: markdown 语法与斜杠命令增强 (862047f)
+
+### 🐛 修复
+
+- **release**: frontend 依赖体检白名单补 mermaid/katex/rehype-raw (cbafdc0)
+- **backend**: reclaim disk space on note/notebook deletion (3d8e61b)
+
+### ♻️ 重构
+
+- **ai**: 用项目统一 confirmDialog 替代 window.confirm (5088414)
+
+### 💄 样式
+
+- **editor,share**: 编辑器链接醒目化 + 分享页排版自给自足 (e8d6e06)
+
+### 📦 构建
+
+- **clipper**: 0.1.2 多浏览器构建产物（chrome/edge/firefox） (1902bf7)
+
+### 🔧 其他
+
+- **clipper**: release v0.1.2 (01ebf0c)
+
 ### v1.0.37 - 2026-05-12
 
 ### ✨ 新增
@@ -165,29 +195,5 @@ If this project helps you, feel free to scan the QR code and buy the author a co
 - **electron**: 修复 Win 安装包启动报 ERR_DLOPEN_FAILED 的根因 (8d2da99)
 - **tasks**: 更新任务后同步刷新左侧分组计数（今天/未来7天/已逾期） (b39a825)
 - **tasks**: 修复待办按日期分组/展示的时区错位（今天/本周/逾期） (edcc285)
-
-### v1.0.33 - 2026-05-11
-
-### ✨ 新增
-
-- **ai**: 知识问答支持多会话（多聊天并行保存） (d10764c)
-- **ai**: 批量 AI 操作（标签/归类） (a11bdc2)
-- **ai**: 笔记归类建议（AI 自动目录归类） (313b200)
-- **ai**: 自定义指令模板可保存与复用 (2395a93)
-- **ai**: RAG 知识库支持附件内容索引（PDF/文本/docx 等） (afdc482)
-- **backup**: 自动备份支持每日定时/保留数量/邮件通知 (eded447)
-- **users**: 个人空间导出/导入开关下沉为 per-user 字段 (4769c7f)
-- **upload**: 附件上传支持拖拽 (beb74d8)
-- **ios**: 接入 Capacitor iOS 工程骨架与 GitHub Actions TestFlight 发版 (0320ba8)
-
-### 🐛 修复
-
-- **build**: unpdf 加入 esbuild external 名单，修复后端 bundle 失败 (bb46727)
-- **backend**: 修复 backup.ts 重载签名默认参数导致的 TS2371 编译错误 (b69d66a)
-- **security**: RAG 知识库索引按工作区/个人空间隔离 (5e5e899)
-- **ui**: 修复笔记列表长标题挤掉预览行 (2b9d4c9)
-- **ai**: AI 写作助手 markdown 格式化丢失链接和图片 (91e42e4)
-- **electron**: 修复 main.js 第 702 行非法字符串导致主进程启动崩溃 (e851eeb)
-- **release**: 仅上传当前版本产物到 GitHub Release，避免历史包混入 (91edab8)
 
 <!-- CHANGELOG:END -->

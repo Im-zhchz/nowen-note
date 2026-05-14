@@ -12,6 +12,37 @@
 
 <!-- ADD_NEW_HERE -->
 
+## v1.0.38 - 2026-05-14
+
+### ✨ 新增
+
+- **editor**: 顶栏新增 Mermaid / 数学公式 / 脚注 按钮，并让 Mermaid 块可双击编辑 (8970e9c)
+- **editor**: Mermaid 图表 / LaTeX 数学公式 / 脚注 三项块级扩展 (530240c)
+- **editor**: 链接气泡菜单 + 选区气泡补链接按钮 (ad8d8c8)
+- **editor**: markdown 语法与斜杠命令增强 (862047f)
+
+### 🐛 修复
+
+- **release**: frontend 依赖体检白名单补 mermaid/katex/rehype-raw (cbafdc0)
+- **backend**: reclaim disk space on note/notebook deletion (3d8e61b)
+
+### ♻️ 重构
+
+- **ai**: 用项目统一 confirmDialog 替代 window.confirm (5088414)
+
+### 💄 样式
+
+- **editor,share**: 编辑器链接醒目化 + 分享页排版自给自足 (e8d6e06)
+
+### 📦 构建
+
+- **clipper**: 0.1.2 多浏览器构建产物（chrome/edge/firefox） (1902bf7)
+
+### 🔧 其他
+
+- **clipper**: release v0.1.2 (01ebf0c)
+
+
 ## v1.0.37 - 2026-05-12
 
 ### ✨ 新增
