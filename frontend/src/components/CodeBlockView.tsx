@@ -51,9 +51,13 @@ export function CodeBlockView(props: NodeViewProps) {
   const [langFilter, setLangFilter] = useState("");
   const [showThemePicker, setShowThemePicker] = useState(false);
   const [activeTheme, setActiveTheme] = useState<CodeBlockThemeId>(getSavedCodeBlockTheme);
-  // mermaid 块的"源码 / 预览"切换：默认进入时显示预览，方便阅读
-  // 编辑时切到源码（用户主动点按钮），保存后再切回预览
-  const [mermaidPreview, setMermaidPreview] = useState<boolean>(true);
+  // mermaid 块的"源码 / 预览"切换：
+  //  - 已有内容（从文档加载、或用户已经输完）默认进入预览态，方便阅读
+  //  - 空内容（刚通过工具栏/slash 插入）默认进入源码态，让用户立刻能输入
+  //  另外双击预览区可随时切回源码（见下方 onDoubleClick）
+  const [mermaidPreview, setMermaidPreview] = useState<boolean>(
+    () => isMermaidLang(node.attrs.language || "") && node.textContent.trim().length > 0,
+  );
   // 切换到非 mermaid 时把预览状态清掉，避免下次再切回 mermaid 时残留状态混乱
   useEffect(() => {
     if (!isMermaid) setMermaidPreview(true);
@@ -434,7 +438,17 @@ export function CodeBlockView(props: NodeViewProps) {
           - 其它情况：正常显示代码 + lowlight 高亮。 */}
       {isMermaid && mermaidPreview ? (
         <>
-          <div className="mermaid-preview-host px-3 py-2" contentEditable={false}>
+          {/* 双击预览区进入源码态，便于直接编辑（与脚注/公式 NodeView 交互一致）；
+              单击不切换，避免阅读时误触把图变成代码。 */}
+          <div
+            className="mermaid-preview-host px-3 py-2 cursor-text"
+            contentEditable={false}
+            onDoubleClick={(e) => {
+              e.stopPropagation();
+              setMermaidPreview(false);
+            }}
+            title="双击进入源码编辑"
+          >
             <MermaidView source={node.textContent} debounceMs={250} />
           </div>
           {/* 隐藏但保留的可编辑内容承载节点；ProseMirror 需要它存在 */}

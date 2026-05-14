@@ -27,7 +27,7 @@ import {
   Code, FileCode, Sparkles, X, ZoomIn, ZoomOut, RotateCcw,
   Table2, Indent, Outdent, AlignLeft, AlignCenter, AlignRight, Trash2,
   FileType, Check, AlertCircle, Info, ArrowUp, Link as LinkIcon,
-  ExternalLink, Unlink2
+  ExternalLink, Unlink2, Workflow, Sigma, BookOpen
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { toast } from "@/lib/toast";
@@ -41,7 +41,7 @@ import { sendFormatState } from "@/lib/desktopBridge";
 import { SlashCommandsMenu, getDefaultSlashCommands, createSlashExtension, createSlashEventHandlers } from "@/components/SlashCommands";
 import { MarkdownEnhancements } from "@/components/MarkdownEnhancements";
 import { MathExtensions } from "@/components/MathExtensions";
-import { FootnoteExtensions } from "@/components/FootnoteExtensions";
+import { FootnoteExtensions, nextFootnoteIdentifier } from "@/components/FootnoteExtensions";
 import CodeBlockView from "@/components/CodeBlockView";
 import MobileFloatingToolbar, { MobileToolbarItem } from "@/components/MobileFloatingToolbar";
 import { useKeyboardVisible } from "@/hooks/useKeyboardVisible";
@@ -2711,6 +2711,65 @@ export default forwardRef<NoteEditorHandle, TiptapEditorProps>(function TiptapEd
           title={t('tiptap.insertTable')}
         >
           <Table2 size={iconSize} />
+        </ToolbarButton>
+        {/* Mermaid 图表：插入空的 mermaid 代码块（lang=mermaid 由 CodeBlockView 渲染图形） */}
+        <ToolbarButton
+          onClick={() => {
+            editor
+              .chain()
+              .focus()
+              .insertContent({
+                type: "codeBlock",
+                attrs: { language: "mermaid" },
+                content: [{ type: "text", text: "graph TD\n  A[开始] --> B[结束]" }],
+              })
+              .run();
+          }}
+          title={t('tiptap.insertMermaid')}
+        >
+          <Workflow size={iconSize} />
+        </ToolbarButton>
+        {/* LaTeX 数学公式：块级 mathBlock，空 latex 让 NodeView 自动进入编辑态 */}
+        <ToolbarButton
+          onClick={() => {
+            editor
+              .chain()
+              .focus()
+              .insertContent({
+                type: "mathBlock",
+                attrs: { latex: "" },
+              })
+              .run();
+          }}
+          title={t('tiptap.insertMath')}
+        >
+          <Sigma size={iconSize} />
+        </ToolbarButton>
+        {/* 脚注：光标处插 ref + 文档末尾追加配对 def，identifier 自动取下一个未占用数字 */}
+        <ToolbarButton
+          onClick={() => {
+            const id = nextFootnoteIdentifier(editor);
+            editor
+              .chain()
+              .focus()
+              .insertContent({
+                type: "footnoteReference",
+                attrs: { identifier: id },
+              })
+              .run();
+            const docEnd = editor.state.doc.content.size;
+            editor
+              .chain()
+              .focus()
+              .insertContentAt(docEnd, {
+                type: "footnoteDefinition",
+                attrs: { identifier: id, content: "" },
+              })
+              .run();
+          }}
+          title={t('tiptap.insertFootnote')}
+        >
+          <BookOpen size={iconSize} />
         </ToolbarButton>
 
         {/* 表格操作按钮（仅在光标在表格内时显示） */}
