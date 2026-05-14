@@ -50,6 +50,9 @@ import {
   CheckSquare,
   Square,
   Sparkles,
+  Link2,
+  ChevronDown,
+  Globe,
 } from "lucide-react";
 import { api, resolveAttachmentUrl } from "@/lib/api";
 import { FileItem, FileDetail, FileStats, FileSortKey, FileCategory } from "@/types";
@@ -60,6 +63,12 @@ import { cn } from "@/lib/utils";
 import { useApp, useAppActions } from "@/store/AppContext";
 import { toast } from "@/lib/toast";
 import { confirm as confirmDialog } from "@/components/ui/confirm";
+import { copyText } from "@/lib/clipboard";
+import {
+  formatImageHostSnippet,
+  imageHostFormatLabel,
+  type ImageHostFormat,
+} from "@/lib/imageHostFormats";
 
 // ---------------------------------------------------------------------------
 // 工具：文件大小可读化 / MIME → 图标 / 时间格式化
@@ -159,6 +168,17 @@ export default function FileManager() {
   // 视图模式：图片分类默认 grid；文件分类默认 list；"all" 跟随上次选择
   const [viewMode, setViewMode] = useState<"grid" | "list">("grid");
 
+  // 图床模式（Image Host）：
+  //   特化的 UI 子模式，专门服务于"把笔记附件当外链图床用"的场景。
+  //   开启后：
+  //     - 强制 category=image（隐藏其他分类 tab）
+  //     - 强制 viewMode=grid（图床的核心交互是看图复制链接）
+  //     - GridCard hover 工具条上的"复制链接"按钮变成"分裂下拉"——
+  //       左半快速复制 URL，右半弹出 Markdown / HTML 选项
+  //     - 详情抽屉头部新增"外链分享"区块，醒目展示完整直链 + 三种格式按钮
+  //   不持久化到 localStorage：当前作为临时操作模式，避免下次进来发现"图片之外的文件不见了"。
+  const [isImageHostMode, setIsImageHostMode] = useState(false);
+
   // 详情抽屉
   const [detailId, setDetailId] = useState<string | null>(null);
   const [detail, setDetail] = useState<FileDetail | null>(null);
@@ -237,15 +257,29 @@ export default function FileManager() {
         page,
         pageSize: PAGE_SIZE,
       });
-      setItems(res.items);
-      setTotal(res.total);
+      // 图床模式 + 未引用 tab：后端 filter=unreferenced 会把所有 MIME 的孤儿都返回，
+      // 前端把非 image 过滤掉，保持"图床里看到的全是图片"的体感一致。
+      // total 同步只算过滤后的——避免分页器显示一个大于实际可见项的"假总数"。
+      // 注意：因为是单页过滤，跨页计数可能小于真实未引用图片总数，但这是可接受的
+      //       近似，且 unreferenced 通常数量不大。
+      const filteredItems =
+        isImageHostMode && isOrphan
+          ? res.items.filter((it) => it.category === "image")
+          : res.items;
+      const filteredTotal =
+        isImageHostMode && isOrphan
+          ? // 估算：用过滤比例换算总数，避免分页器跳变
+            Math.round((filteredItems.length / Math.max(1, res.items.length)) * res.total)
+          : res.total;
+      setItems(filteredItems);
+      setTotal(filteredTotal);
     } catch (err: any) {
       console.error("[FileManager] list failed:", err);
       toast.error(err?.message || "加载文件列表失败");
     } finally {
       setLoading(false);
     }
-  }, [category, sort, searchQuery, page]);
+  }, [category, sort, searchQuery, page, isImageHostMode]);
 
   useEffect(() => {
     loadList();
@@ -364,17 +398,28 @@ export default function FileManager() {
         await api.files.remove(id);
         toast.success("已删除");
         closeDetail();
-        // 本地列表即时剔除 + 刷统计 + 刷可回收徽标
+        // 本地列表即时剔除（让 UI 立刻有反馈，不等接口往返）
         setItems((prev) => prev.filter((it) => it.id !== id));
         setTotal((t) => Math.max(0, t - 1));
         loadStats();
         loadReclaimable();
+        // 关键：删除后必须重新拉当前页，把"被删项后面的"那一项从第 N+1 项
+        // 顶上来，否则用户会看到当前页只剩 PAGE_SIZE-1 项，要切页才能看到
+        // 后面被顶上来的文件（issue: 删除文件应该展示剩下的文件）。
+        // 如果删完后当前页变空且不在第 1 页 → 回退一页（page 变化会自动触发
+        // useEffect → loadList，这里就不用再手动调）。
+        const willBeEmpty = items.length <= 1; // 当前页删完
+        if (willBeEmpty && page > 1) {
+          setPage((p) => Math.max(1, p - 1));
+        } else {
+          loadList();
+        }
       } catch (err: any) {
         console.error("[FileManager] delete failed:", err);
         toast.error(err?.message || "删除失败");
       }
     },
-    [closeDetail, loadStats, loadReclaimable],
+    [closeDetail, loadStats, loadReclaimable, loadList, items.length, page],
   );
 
   // ---- 重命名 ----
@@ -487,13 +532,22 @@ export default function FileManager() {
       }
       loadStats();
       loadReclaimable();
+      // 关键：与单删一致——删除后必须重新拉当前页，把后续页的项顶上来，
+      // 否则当前页会剩不足 PAGE_SIZE 项，要切页才能看到完整的剩余文件。
+      // 当前页全删空且不在第 1 页 → 回退一页（page 变化会触发 loadList）。
+      const remainingOnPage = items.length - succeededIds.size;
+      if (remainingOnPage <= 0 && page > 1) {
+        setPage((p) => Math.max(1, p - 1));
+      } else {
+        loadList();
+      }
     } catch (err: any) {
       console.error("[FileManager] batch delete failed:", err);
       toast.error(err?.message || "批量删除失败");
     } finally {
       setBatchDeleting(false);
     }
-  }, [selectedIds, detailId, closeDetail, loadStats, loadReclaimable]);
+  }, [selectedIds, detailId, closeDetail, loadStats, loadReclaimable, loadList, items.length, page]);
 
   // 切换分类 / 搜索 / 排序 / 翻页时，已勾选的 id 可能不再在当前 items 里，
   // 体验上保留集合也容易让用户产生"幽灵勾选"。统一在这些维度变化时清空。
@@ -534,6 +588,62 @@ export default function FileManager() {
 
   const onPickFiles = useCallback(() => {
     fileInputRef.current?.click();
+  }, []);
+
+  // ---- 粘贴板上传（图床高频用法：截图 → Ctrl+V）----
+  //
+  // 监听整个文档的 paste 事件，从 clipboardData.items 抓出文件类型条目。
+  // 限制：
+  //   - 只在 FileManager 处于焦点态时响应（用 isMounted ref 兜底）；
+  //   - 当焦点在 input/textarea/contenteditable 内时跳过，避免抢用户的粘贴文本。
+  //   - 粘贴的图片浏览器一般给 image/png + 文件名 "image.png"，无法保留原始名称——
+  //     交给后端按 hash + ext 自动生成 filename，前端无需介入。
+  useEffect(() => {
+    const handler = (e: ClipboardEvent) => {
+      const target = e.target as HTMLElement | null;
+      if (target) {
+        const tag = target.tagName;
+        const editable = (target as HTMLElement).isContentEditable;
+        if (tag === "INPUT" || tag === "TEXTAREA" || editable) return;
+      }
+      const items = e.clipboardData?.items;
+      if (!items || items.length === 0) return;
+      const files: File[] = [];
+      for (let i = 0; i < items.length; i++) {
+        const it = items[i];
+        if (it.kind === "file") {
+          const f = it.getAsFile();
+          if (f) files.push(f);
+        }
+      }
+      if (files.length > 0) {
+        e.preventDefault();
+        handleUpload(files);
+      }
+    };
+    window.addEventListener("paste", handler);
+    return () => window.removeEventListener("paste", handler);
+  }, [handleUpload]);
+
+  // ---- 图床模式开关 ----
+  //
+  // 进入：强制 category=image / viewMode=grid，回到第 1 页（避免在"文件"分页里残留页码）。
+  // 退出：回到 "all" 分类，view 由用户上次手动状态决定（保持 grid 不变）。
+  // 两个方向都清空多选，避免状态混乱。
+  const toggleImageHostMode = useCallback(() => {
+    setIsImageHostMode((prev) => {
+      const next = !prev;
+      setSelectedIds(new Set());
+      setSelectionMode(false);
+      setPage(1);
+      if (next) {
+        setCategory("image");
+        setViewMode("grid");
+      } else {
+        setCategory("all");
+      }
+      return next;
+    });
   }, []);
 
   const onFileInputChange = useCallback(
@@ -600,19 +710,37 @@ export default function FileManager() {
     [actions],
   );
 
-  // ---- 复制 URL ----
+  // ---- 复制 URL / Markdown / HTML ----
+  //
+  // copiedId 只是一个"乐观反馈"——卡片上的复制图标变 ✓ 1.2s 让用户知道点中了。
+  // 实际复制走 lib/clipboard.copyText（含 secureContext + textarea 双路降级），
+  // 比之前直接 navigator.clipboard.writeText 兼容性更好。
   const [copiedId, setCopiedId] = useState<string | null>(null);
-  const copyUrl = useCallback((item: FileItem) => {
-    const full = resolveAttachmentUrl(item.url);
-    try {
-      void navigator.clipboard.writeText(full);
-      setCopiedId(item.id);
-      toast.success("已复制链接");
-      setTimeout(() => setCopiedId((id) => (id === item.id ? null : id)), 1200);
-    } catch {
-      toast.error("复制失败");
-    }
-  }, []);
+
+  /** 把附件信息按指定格式（URL / Markdown / HTML）复制到剪贴板。 */
+  const copySnippet = useCallback(
+    async (item: { id: string; filename: string; url: string }, format: ImageHostFormat = "url") => {
+      const full = resolveAttachmentUrl(item.url);
+      const snippet = formatImageHostSnippet(format, full, item.filename);
+      const ok = await copyText(snippet);
+      if (ok) {
+        setCopiedId(item.id);
+        toast.success(`已复制 ${imageHostFormatLabel(format)}`);
+        setTimeout(() => setCopiedId((id) => (id === item.id ? null : id)), 1200);
+      } else {
+        toast.error("复制失败，请检查浏览器剪贴板权限");
+      }
+    },
+    [],
+  );
+
+  /** 旧 API 兼容：默认复制纯 URL（GridCard 主按钮 / ListView 都还在用这个名字）。 */
+  const copyUrl = useCallback(
+    (item: FileItem) => {
+      void copySnippet(item, "url");
+    },
+    [copySnippet],
+  );
 
   // ---- 下载 ----
   //
@@ -676,40 +804,73 @@ export default function FileManager() {
         style={{ paddingTop: "calc(var(--safe-area-top) + 12px)" }}
       >
         <div className="flex items-center gap-2 shrink-0">
-          <div className="w-8 h-8 rounded-lg bg-accent-primary/10 text-accent-primary flex items-center justify-center">
-            <Inbox size={18} />
+          <div
+            className={cn(
+              "w-8 h-8 rounded-lg flex items-center justify-center transition-colors",
+              isImageHostMode
+                ? "bg-indigo-500/15 text-indigo-500"
+                : "bg-accent-primary/10 text-accent-primary",
+            )}
+          >
+            {isImageHostMode ? <Globe size={18} /> : <Inbox size={18} />}
           </div>
           <div>
-            <h2 className="text-sm font-semibold text-tx-primary">文件管理</h2>
-            <p className="text-[11px] text-tx-tertiary leading-none mt-0.5">{statsLine || "\u00A0"}</p>
+            <h2 className="text-sm font-semibold text-tx-primary">
+              {isImageHostMode ? "图床" : "文件管理"}
+            </h2>
+            <p className="text-[11px] text-tx-tertiary leading-none mt-0.5">
+              {isImageHostMode
+                ? "上传图片即得直链 · 支持复制 URL / Markdown / HTML"
+                : statsLine || "\u00A0"}
+            </p>
           </div>
         </div>
 
         <div className="flex-1" />
 
-        {/* 视图切换 */}
-        <div className="hidden md:flex items-center rounded-lg border border-app-border bg-app-bg p-0.5">
-          <button
-            className={cn(
-              "px-2 py-1 rounded-md text-xs flex items-center gap-1 transition-colors",
-              viewMode === "grid" ? "bg-accent-primary/15 text-accent-primary" : "text-tx-secondary hover:bg-app-hover",
-            )}
-            onClick={() => setViewMode("grid")}
-            title="网格视图"
-          >
-            <LayoutGrid size={14} />
-          </button>
-          <button
-            className={cn(
-              "px-2 py-1 rounded-md text-xs flex items-center gap-1 transition-colors",
-              viewMode === "list" ? "bg-accent-primary/15 text-accent-primary" : "text-tx-secondary hover:bg-app-hover",
-            )}
-            onClick={() => setViewMode("list")}
-            title="列表视图"
-          >
-            <List size={14} />
-          </button>
-        </div>
+        {/* 图床模式开关：放在视图切换之前，让用户第一眼能找到。
+            图床本质是 FileManager 的"图片专区 + 直链复制"特化形态，
+            点亮后整页 UI 会切换为图床外观（标题 / 图标 / 卡片工具条）。 */}
+        <Button
+          size="sm"
+          variant={isImageHostMode ? "default" : "outline"}
+          onClick={toggleImageHostMode}
+          className={cn(
+            "shrink-0",
+            isImageHostMode &&
+              "bg-indigo-500 hover:bg-indigo-600 text-white border-indigo-500",
+          )}
+          title={isImageHostMode ? "退出图床" : "进入图床（图片专区 + 直链复制）"}
+        >
+          <Globe size={14} className="mr-1" />
+          {isImageHostMode ? "退出图床" : "图床"}
+        </Button>
+
+        {/* 视图切换：图床模式锁定网格视图，所以隐藏切换组 */}
+        {!isImageHostMode && (
+          <div className="hidden md:flex items-center rounded-lg border border-app-border bg-app-bg p-0.5">
+            <button
+              className={cn(
+                "px-2 py-1 rounded-md text-xs flex items-center gap-1 transition-colors",
+                viewMode === "grid" ? "bg-accent-primary/15 text-accent-primary" : "text-tx-secondary hover:bg-app-hover",
+              )}
+              onClick={() => setViewMode("grid")}
+              title="网格视图"
+            >
+              <LayoutGrid size={14} />
+            </button>
+            <button
+              className={cn(
+                "px-2 py-1 rounded-md text-xs flex items-center gap-1 transition-colors",
+                viewMode === "list" ? "bg-accent-primary/15 text-accent-primary" : "text-tx-secondary hover:bg-app-hover",
+              )}
+              onClick={() => setViewMode("list")}
+              title="列表视图"
+            >
+              <List size={14} />
+            </button>
+          </div>
+        )}
 
         <Button
           size="sm"
@@ -757,12 +918,16 @@ export default function FileManager() {
 
         <Button size="sm" onClick={onPickFiles} disabled={uploading} className="shrink-0">
           {uploading ? <Loader2 size={14} className="animate-spin mr-1" /> : <Upload size={14} className="mr-1" />}
-          {uploading ? "上传中" : "上传文件"}
+          {uploading ? "上传中" : isImageHostMode ? "上传图片" : "上传文件"}
         </Button>
         <input
           ref={fileInputRef}
           type="file"
           multiple
+          // 图床模式下点击文件选择器只允许选图片（限制 MIME，提示更明确）。
+          // 注意：accept 是"建议"而非强制——拖拽 / 粘贴板进来的非图片文件后端依旧会接收，
+          //        所以此处只是改善文件选择器体验，不依赖它做安全过滤。
+          accept={isImageHostMode ? "image/*" : undefined}
           className="hidden"
           onChange={onFileInputChange}
         />
@@ -770,21 +935,41 @@ export default function FileManager() {
 
       {/* 工具条：分类 / 搜索 / 排序 */}
       <div className="flex flex-wrap items-center gap-2 px-4 md:px-6 py-2 border-b border-app-border bg-app-surface/20">
-        {/* 分类 Tabs */}
+        {/* 分类 Tabs：
+            - 普通模式：4 个 tab（全部/图片/文件/孤儿）
+            - 图床模式：固定 category=image，原本的"全部/图片/文件"切换没意义，
+              只保留"全部图片 / 未引用图片"两个快捷过滤——后者复用孤儿 tab 的语义，
+              方便用户清理图床里没被任何笔记引用的"野图"。 */}
         <div className="flex items-center gap-1 text-xs">
-          {([
-            { key: "all", label: "全部", count: stats?.total ?? 0, icon: <Filter size={12} /> },
-            { key: "image", label: "图片", count: stats?.images.count ?? 0, icon: <ImageIcon size={12} /> },
-            { key: "file", label: "文件", count: stats?.files.count ?? 0, icon: <FileText size={12} /> },
-            // 孤儿（unreferenced）tab：高亮琥珀色，与顶栏"可回收"徽标视觉呼应；
-            // count 为 0 时也显示，方便用户确认"当前没有孤儿"。
-            {
-              key: "unreferenced",
-              label: "孤儿",
-              count: stats?.unreferenced?.count ?? 0,
-              icon: <Sparkles size={12} />,
-            },
-          ] as const).map((tab) => (
+          {(isImageHostMode
+            ? ([
+                {
+                  key: "image",
+                  label: "全部图片",
+                  count: stats?.images.count ?? 0,
+                  icon: <ImageIcon size={12} />,
+                },
+                {
+                  key: "unreferenced",
+                  label: "未引用",
+                  count: stats?.unreferenced?.count ?? 0,
+                  icon: <Sparkles size={12} />,
+                },
+              ] as const)
+            : ([
+                { key: "all", label: "全部", count: stats?.total ?? 0, icon: <Filter size={12} /> },
+                { key: "image", label: "图片", count: stats?.images.count ?? 0, icon: <ImageIcon size={12} /> },
+                { key: "file", label: "文件", count: stats?.files.count ?? 0, icon: <FileText size={12} /> },
+                // 孤儿（unreferenced）tab：高亮琥珀色，与顶栏"可回收"徽标视觉呼应；
+                // count 为 0 时也显示，方便用户确认"当前没有孤儿"。
+                {
+                  key: "unreferenced",
+                  label: "孤儿",
+                  count: stats?.unreferenced?.count ?? 0,
+                  icon: <Sparkles size={12} />,
+                },
+              ] as const)
+          ).map((tab) => (
             <button
               key={tab.key}
               onClick={() => handleCategoryChange(tab.key as CategoryFilter)}
@@ -930,12 +1115,14 @@ export default function FileManager() {
                 items={items}
                 onOpen={openDetail}
                 onCopyUrl={copyUrl}
+                onCopySnippet={copySnippet}
                 onDownload={downloadItem}
                 copiedId={copiedId}
                 downloadingId={downloadingId}
                 selectionMode={selectionMode}
                 selectedIds={selectedIds}
                 onToggleSelect={toggleSelect}
+                isImageHostMode={isImageHostMode}
               />
             ) : (
               <ListView
@@ -1000,6 +1187,8 @@ export default function FileManager() {
             onJumpToNote={jumpToNote}
             onDownload={downloadItem}
             downloadingId={downloadingId}
+            onCopySnippet={copySnippet}
+            isImageHostMode={isImageHostMode}
           />
         )}
       </AnimatePresence>
@@ -1040,22 +1229,26 @@ function GridView({
   items,
   onOpen,
   onCopyUrl,
+  onCopySnippet,
   onDownload,
   copiedId,
   downloadingId,
   selectionMode,
   selectedIds,
   onToggleSelect,
+  isImageHostMode,
 }: {
   items: FileItem[];
   onOpen: (id: string) => void;
   onCopyUrl: (item: FileItem) => void;
+  onCopySnippet: (item: FileItem, format: ImageHostFormat) => void;
   onDownload: (item: FileItem) => void;
   copiedId: string | null;
   downloadingId: string | null;
   selectionMode: boolean;
   selectedIds: Set<string>;
   onToggleSelect: (id: string) => void;
+  isImageHostMode: boolean;
 }) {
   return (
     <div
@@ -1068,12 +1261,14 @@ function GridView({
           item={it}
           onOpen={onOpen}
           onCopyUrl={onCopyUrl}
+          onCopySnippet={onCopySnippet}
           onDownload={onDownload}
           copiedId={copiedId}
           downloadingId={downloadingId}
           selectionMode={selectionMode}
           selected={selectedIds.has(it.id)}
           onToggleSelect={onToggleSelect}
+          isImageHostMode={isImageHostMode}
         />
       ))}
     </div>
@@ -1084,24 +1279,43 @@ function GridCard({
   item,
   onOpen,
   onCopyUrl,
+  onCopySnippet,
   onDownload,
   copiedId,
   downloadingId,
   selectionMode,
   selected,
   onToggleSelect,
+  isImageHostMode,
 }: {
   item: FileItem;
   onOpen: (id: string) => void;
   onCopyUrl: (item: FileItem) => void;
+  onCopySnippet: (item: FileItem, format: ImageHostFormat) => void;
   onDownload: (item: FileItem) => void;
   copiedId: string | null;
   downloadingId: string | null;
   selectionMode: boolean;
   selected: boolean;
   onToggleSelect: (id: string) => void;
+  isImageHostMode: boolean;
 }) {
   const isImage = item.category === "image";
+  // 图床的"复制格式"下拉菜单是否展开。每张卡独立维护——同时只能展开一个比较自然，
+  // 但实现上让外层点击就关掉即可，无需引入全局状态。
+  const [formatMenuOpen, setFormatMenuOpen] = useState(false);
+  // 点卡片其他位置时关掉菜单（避免菜单悬空残留）
+  useEffect(() => {
+    if (!formatMenuOpen) return;
+    const close = () => setFormatMenuOpen(false);
+    // 用 setTimeout 延后挂载，避免触发当前 click 立即被关
+    const t = setTimeout(() => window.addEventListener("click", close, { once: true }), 0);
+    return () => {
+      clearTimeout(t);
+      window.removeEventListener("click", close);
+    };
+  }, [formatMenuOpen]);
+
   const handleCardClick = () => {
     if (selectionMode) onToggleSelect(item.id);
     else onOpen(item.id);
@@ -1145,6 +1359,19 @@ function GridCard({
             <span className="text-[10px] mt-1">无法加载</span>
           </div>
         )}
+
+        {/* 图床模式：左下角的"公开直链"角标。
+            语义提示：当前图片有一条无需登录就能访问的 URL，
+            点击下面的复制按钮可拿到 URL/Markdown/HTML 任一形式。 */}
+        {isImageHostMode && isImage && (
+          <div
+            className="absolute bottom-1.5 left-1.5 px-1.5 py-0.5 rounded bg-indigo-500/85 text-white text-[9px] flex items-center gap-1 pointer-events-none"
+            title="此图片有公开直链，可对外引用"
+          >
+            <Link2 size={9} />
+            <span>直链</span>
+          </div>
+        )}
       </div>
       <div className="px-2 py-1.5">
         <div className="text-[11px] text-tx-primary truncate">{item.filename}</div>
@@ -1172,9 +1399,18 @@ function GridCard({
         </div>
       )}
 
-      {/* hover 工具条（选择模式下隐藏，避免误操作） */}
+      {/* hover 工具条（选择模式下隐藏，避免误操作）。
+          - 普通模式：下载 + 复制链接（单击直接复制 URL）
+          - 图床模式：下载 + 分裂式复制按钮（左半 URL，右半下拉 MD/HTML）
+          图床下让"复制链接"常驻可见而不是 hover 才出现——这是图床场景的核心交互，
+          手机端（无 hover）也得能点到。 */}
       {!selectionMode && (
-        <div className="absolute top-1.5 right-1.5 flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+        <div
+          className={cn(
+            "absolute top-1.5 right-1.5 flex gap-1 transition-opacity",
+            isImageHostMode ? "opacity-100" : "opacity-0 group-hover:opacity-100",
+          )}
+        >
           <button
             className="w-6 h-6 rounded-md bg-black/50 hover:bg-black/70 text-white flex items-center justify-center disabled:opacity-50"
             onClick={(e) => {
@@ -1186,16 +1422,64 @@ function GridCard({
           >
             {downloadingId === item.id ? <Loader2 size={12} className="animate-spin" /> : <Download size={12} />}
           </button>
-          <button
-            className="w-6 h-6 rounded-md bg-black/50 hover:bg-black/70 text-white flex items-center justify-center"
-            onClick={(e) => {
-              e.stopPropagation();
-              onCopyUrl(item);
-            }}
-            title="复制链接"
-          >
-            {copiedId === item.id ? <Check size={12} /> : <Copy size={12} />}
-          </button>
+
+          {isImageHostMode ? (
+            // 分裂按钮：左半 URL，右半下拉 MD/HTML
+            <div className="relative flex items-stretch rounded-md overflow-hidden">
+              <button
+                className="px-1.5 bg-black/50 hover:bg-black/70 text-white flex items-center"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onCopyUrl(item);
+                }}
+                title="复制 URL"
+              >
+                {copiedId === item.id ? <Check size={12} /> : <Copy size={12} />}
+              </button>
+              <button
+                className="px-0.5 bg-black/50 hover:bg-black/70 text-white flex items-center border-l border-white/15"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setFormatMenuOpen((v) => !v);
+                }}
+                title="选择复制格式"
+              >
+                <ChevronDown size={11} />
+              </button>
+              {formatMenuOpen && (
+                <div
+                  className="absolute right-0 top-full mt-1 z-20 min-w-[120px] rounded-md border border-app-border bg-app-surface shadow-md py-1 text-xs"
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  {(["url", "markdown", "html"] as ImageHostFormat[]).map((fmt) => (
+                    <button
+                      key={fmt}
+                      className="w-full px-2.5 py-1.5 text-left text-tx-primary hover:bg-app-hover flex items-center gap-2"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setFormatMenuOpen(false);
+                        onCopySnippet(item, fmt);
+                      }}
+                    >
+                      <Copy size={11} className="text-tx-tertiary" />
+                      <span>{imageHostFormatLabel(fmt)}</span>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          ) : (
+            <button
+              className="w-6 h-6 rounded-md bg-black/50 hover:bg-black/70 text-white flex items-center justify-center"
+              onClick={(e) => {
+                e.stopPropagation();
+                onCopyUrl(item);
+              }}
+              title="复制链接"
+            >
+              {copiedId === item.id ? <Check size={12} /> : <Copy size={12} />}
+            </button>
+          )}
         </div>
       )}
     </div>
@@ -1369,6 +1653,8 @@ function DetailDrawer({
   onJumpToNote,
   onDownload,
   downloadingId,
+  onCopySnippet,
+  isImageHostMode,
 }: {
   detail: FileDetail | null;
   loading: boolean;
@@ -1378,6 +1664,10 @@ function DetailDrawer({
   onJumpToNote: (noteId: string) => void;
   onDownload: (item: { id: string; filename: string; url: string }) => void;
   downloadingId: string | null;
+  /** 按指定格式复制（URL/Markdown/HTML）。新增于图床功能。 */
+  onCopySnippet: (item: { id: string; filename: string; url: string }, format: ImageHostFormat) => void;
+  /** 图床模式：显示更醒目的"外链分享"区块；非图床模式仍展示但更紧凑。 */
+  isImageHostMode: boolean;
 }) {
   // 文件名编辑态：仅在抽屉内本地维护，不上提（保存成功后父组件会刷新 detail.filename）
   const [renaming, setRenaming] = useState(false);
@@ -1475,6 +1765,69 @@ function DetailDrawer({
                 )}
               </div>
 
+              {/* 外链分享区块：
+                  对所有附件都展示（不止图片），因为 /api/attachments/<id> 本身就是
+                  无需 JWT 的公开下载/预览端点（鉴权靠 uuid 不可枚举），任何文件都可作直链使用。
+                  - 图床模式：醒目高亮（紫色卡片 + 标题加粗），图片场景的核心 CTA。
+                  - 非图床模式：折叠成一行小字，避免抢戏；点击复制按钮展开同样的功能。
+                  注意：完整 URL 用 readonly input 展示而非纯文本，方便用户手动选中。 */}
+              {(() => {
+                const fullUrl = resolveAttachmentUrl(detail.url);
+                const item = { id: detail.id, filename: detail.filename, url: detail.url };
+                return (
+                  <div
+                    className={cn(
+                      "rounded-lg border p-3 space-y-2",
+                      isImageHostMode
+                        ? "border-indigo-500/30 bg-indigo-500/5"
+                        : "border-app-border bg-app-bg",
+                    )}
+                  >
+                    <div className="flex items-center gap-1.5 text-xs">
+                      <Link2
+                        size={13}
+                        className={isImageHostMode ? "text-indigo-500" : "text-tx-tertiary"}
+                      />
+                      <span
+                        className={cn(
+                          "font-semibold",
+                          isImageHostMode ? "text-indigo-500" : "text-tx-secondary",
+                        )}
+                      >
+                        外链分享
+                      </span>
+                      <span className="text-[10px] text-tx-tertiary ml-auto">
+                        无需登录即可访问
+                      </span>
+                    </div>
+                    <input
+                      type="text"
+                      readOnly
+                      value={fullUrl}
+                      onFocus={(e) => e.currentTarget.select()}
+                      className="w-full px-2 py-1.5 rounded-md border border-app-border bg-app-surface text-[11px] text-tx-primary font-mono outline-none focus:border-accent-primary"
+                    />
+                    <div className="flex flex-wrap gap-1.5">
+                      {(["url", "markdown", "html"] as ImageHostFormat[]).map((fmt) => (
+                        <button
+                          key={fmt}
+                          onClick={() => onCopySnippet(item, fmt)}
+                          className={cn(
+                            "px-2.5 py-1 rounded-md text-[11px] flex items-center gap-1 transition-colors",
+                            isImageHostMode
+                              ? "bg-indigo-500 hover:bg-indigo-600 text-white"
+                              : "bg-app-surface border border-app-border hover:bg-app-hover text-tx-primary",
+                          )}
+                        >
+                          <Copy size={11} />
+                          复制 {imageHostFormatLabel(fmt)}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                );
+              })()}
+
               {/* 元信息 */}
               <div className="space-y-2 text-xs">
                 <MetaRow
@@ -1542,13 +1895,9 @@ function DetailDrawer({
                       <code
                         className="text-[10px] text-tx-tertiary break-all select-all cursor-pointer"
                         title="SHA-256；点击复制"
-                        onClick={() => {
-                          try {
-                            void navigator.clipboard.writeText(detail.hash || "");
-                            toast.success("已复制 hash");
-                          } catch {
-                            /* 忽略 */
-                          }
+                        onClick={async () => {
+                          const ok = await copyText(detail.hash || "");
+                          if (ok) toast.success("已复制 hash");
                         }}
                       >
                         {detail.hash}

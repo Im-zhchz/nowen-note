@@ -417,6 +417,12 @@ export interface SharedNoteContent {
   version?: number;
   /** 笔记是否被所有者锁定，锁定时即使 permission=edit 也禁止访客写入 */
   isLocked?: 0 | 1;
+  /**
+   * 笔记所有者（作者）id。前端拿来跟当前登录用户对比，
+   * 若访问者就是作者本人，则跳过"请填写访客昵称"弹窗，
+   * 直接进入编辑模式（自动以作者身份保存）。
+   */
+  ownerId?: string;
 }
 
 // 版本历史

@@ -264,7 +264,8 @@ sharedRouter.get("/:token/content", (c) => {
   const share = db.prepare(`
     SELECT s.id AS shareId, s.noteId, s.isActive, s.expiresAt, s.maxViews, s.viewCount, s.password, s.permission,
            n.title, n.content, n.contentText, n.updatedAt AS noteUpdatedAt, n.version AS noteVersion,
-           n.isLocked AS noteIsLocked
+           n.isLocked AS noteIsLocked,
+           n.userId AS noteOwnerId
     FROM shares s
     LEFT JOIN notes n ON s.noteId = n.id
     WHERE s.shareToken = ?
@@ -330,6 +331,10 @@ sharedRouter.get("/:token/content", (c) => {
     updatedAt: share.noteUpdatedAt,
     version: share.noteVersion,
     isLocked: share.noteIsLocked ? 1 : 0, // 用于前端判断是否允许进入编辑模式
+    // 笔记所有者 id：前端拿来跟当前登录用户对比，
+    // 如果访问者就是作者本人，则跳过"请填写访客昵称"弹窗，直接进入编辑模式。
+    // 这里只下发 id，不下发用户名/昵称等敏感信息。
+    ownerId: share.noteOwnerId,
   });
 });
 

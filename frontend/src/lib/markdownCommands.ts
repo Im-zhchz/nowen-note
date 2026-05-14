@@ -269,20 +269,30 @@ export function insertTable(view: EditorView, rows = 3, cols = 3): boolean {
 // 链接 / 图片
 // ---------------------------------------------------------------------------
 
-/** 插入链接（有选区则把选区作为链接文字） */
+/**
+ * 插入链接：
+ *   - 有选区 → 把选区文本作为 label
+ *   - 无选区 → label 留空，生成 `[](url)`
+ *
+ * 历史问题：之前无选区时硬塞了一个写死的 "链接" 两字作为 label，
+ * 用户每次插完都得自己删掉再敲名称。改成空 label 后：
+ *   - 鼠标点链接按钮 → 直接得到 `[](https://)`，光标默认落在 url 上方便粘贴；
+ *     用户粘完 url 自然会回到 [] 内补 label，或者干脆就保持空（多数 md
+ *     渲染器会用 url 当显示文字）。
+ *   - 显式传 text="xxx" 的调用方（如附件上传）行为不变。
+ */
 export function insertLink(view: EditorView, url = "https://", text?: string): boolean {
   const doc = view.state.doc;
   const range = view.state.selection.main;
   const selectedText = doc.sliceString(range.from, range.to);
-  const label = text ?? (selectedText || "链接");
+  // 关键：未提供 text 且无选区时，label 留空，避免硬塞"链接"两字
+  const label = text ?? selectedText;
   const insert = `[${label}](${url})`;
+  // 选中 url 部分，方便用户直接粘贴/替换
+  const urlStart = range.from + label.length + 2; // 跨过 "[label]("
   view.dispatch({
     changes: { from: range.from, to: range.to, insert },
-    // 光标落在 url 上，方便替换
-    selection: EditorSelection.range(
-      range.from + label.length + 3,
-      range.from + label.length + 3 + url.length,
-    ),
+    selection: EditorSelection.range(urlStart, urlStart + url.length),
   });
   focus(view);
   return true;

@@ -80,6 +80,39 @@ export default function SharedNoteView({ shareToken }: SharedNoteViewProps) {
   useEffect(() => { latestVersionRef.current = currentVersion; }, [currentVersion]);
 
   /**
+   * 当前登录用户 id（仅当浏览器有 nowen-token 时尝试获取）。
+   *
+   * 用途：判断访问者是否就是这条笔记的作者本人。如果是，则：
+   *   - 跳过"请填写访客昵称"弹窗
+   *   - 自动用作者的 displayName/username 作为 guestName 提交
+   *
+   * 实现要点：
+   *   - 只在 mount 时调一次 /api/me；未登录(没 token)直接 null，不发请求
+   *   - 失败（token 过期等）静默忽略，按访客流程处理
+   *   - 不依赖 AppContext（分享页是独立路由，外面没有 AppProvider）
+   */
+  const [viewerUserId, setViewerUserId] = useState<string | null>(null);
+  const [viewerDisplayName, setViewerDisplayName] = useState<string>("");
+  useEffect(() => {
+    let cancelled = false;
+    let hasToken = false;
+    try { hasToken = !!localStorage.getItem("nowen-token"); } catch { /* ignore */ }
+    if (!hasToken) return;
+    api.getMe()
+      .then((u) => {
+        if (cancelled || !u) return;
+        setViewerUserId(u.id);
+        // 作者身份提交时优先用 displayName，否则 username
+        setViewerDisplayName((u as any).displayName || u.username || "");
+      })
+      .catch(() => { /* 未登录 / token 失效都按游客处理 */ });
+    return () => { cancelled = true; };
+  }, []);
+
+  /** 当前访问者是否是这条笔记的作者本人 */
+  const isOwnerViewing = !!(viewerUserId && content?.ownerId && viewerUserId === content.ownerId);
+
+  /**
    * 分享页 PM 路径下 mermaid 块的异步渲染。
    *
    * 流程：
@@ -339,14 +372,29 @@ export default function SharedNoteView({ shareToken }: SharedNoteViewProps) {
 
   /**
    * 点击"开始编辑"按钮：
-   * - 如果没有昵称，弹昵称输入框；提交后才真正进入编辑模式
-   * - 如果已有昵称，直接进入编辑模式
+   * - 如果当前访问者就是笔记作者本人，**跳过昵称弹窗**直接进入编辑模式，
+   *   保存时会自动以作者的 displayName/username 作为 guestName 提交。
+   * - 否则：没有昵称弹昵称输入框；提交后才真正进入编辑模式
+   * - 已有昵称：直接进入编辑模式
    */
   const handleStartEditing = useCallback(() => {
     if (!content || content.permission !== "edit") return;
     if (content.isLocked) {
       setSaveError("笔记已被所有者锁定，暂不可编辑");
       setSaveStatus("error");
+      return;
+    }
+    // 作者本人访问自己的分享链接：免填昵称
+    if (isOwnerViewing) {
+      // 给 guestName 兜底一个值（用于审计 changeSummary）：
+      // 优先 displayName/username，否则给个固定 "作者" 字样，避免后端 GUEST_NAME_REQUIRED
+      const ownerLabel = viewerDisplayName.trim() || "作者";
+      if (!guestNameRef.current.trim()) {
+        // 注意：这里**不**写入 localStorage，避免污染同浏览器的访客昵称缓存
+        setGuestName(ownerLabel);
+        guestNameRef.current = ownerLabel;
+      }
+      setIsEditing(true);
       return;
     }
     if (!guestNameRef.current.trim()) {
@@ -356,7 +404,7 @@ export default function SharedNoteView({ shareToken }: SharedNoteViewProps) {
       return;
     }
     setIsEditing(true);
-  }, [content]);
+  }, [content, isOwnerViewing, viewerDisplayName]);
 
   /**
    * 昵称弹窗提交：
@@ -697,17 +745,26 @@ export default function SharedNoteView({ shareToken }: SharedNoteViewProps) {
               <>
                 {isEditing ? (
                   <>
-                    {/* 当前昵称小标签 */}
-                    {guestName && (
-                      <span className="hidden sm:flex items-center gap-1 px-2 py-1 text-[10px] rounded-md bg-zinc-100 dark:bg-zinc-800 text-zinc-500" title="点击可修改昵称">
+                    {/* 当前昵称小标签：
+                        - 作者本人：显示"作者"徽章，不可改（点也没意义）
+                        - 访客：可点击修改 */}
+                    {isOwnerViewing ? (
+                      <span className="hidden sm:flex items-center gap-1 px-2 py-1 text-[10px] rounded-md bg-indigo-500/10 text-indigo-500" title="你是这条笔记的作者">
                         <UserCircle2 size={11} />
-                        <button
-                          onClick={() => { setNicknameDraft(guestName); setNicknameError(""); setShowNicknameModal(true); }}
-                          className="hover:text-zinc-700 dark:hover:text-zinc-300"
-                        >
-                          {guestName}
-                        </button>
+                        <span>{viewerDisplayName || "作者"}（作者）</span>
                       </span>
+                    ) : (
+                      guestName && (
+                        <span className="hidden sm:flex items-center gap-1 px-2 py-1 text-[10px] rounded-md bg-zinc-100 dark:bg-zinc-800 text-zinc-500" title="点击可修改昵称">
+                          <UserCircle2 size={11} />
+                          <button
+                            onClick={() => { setNicknameDraft(guestName); setNicknameError(""); setShowNicknameModal(true); }}
+                            className="hover:text-zinc-700 dark:hover:text-zinc-300"
+                          >
+                            {guestName}
+                          </button>
+                        </span>
+                      )
                     )}
                     {/* 保存状态 */}
                     <span className={cn(
