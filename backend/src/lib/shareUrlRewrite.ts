@@ -42,15 +42,30 @@ export function resolvePublicOrigin(getHeader: (name: string) => string | undefi
 
   let proto = xfProto;
   if (!proto) {
-    // 没有反代头时按 host 猜协议：本地/明文场景退 http，其余默认 https
+    // 没有反代头时按 host 猜协议：
+    //   - 仅在"明显是公网默认 HTTPS 端口（443 / 无端口的标准域名）"时才用 https；
+    //   - 其余（带显式自定义端口、本地地址、纯 IP）一律退回 http。
+    //
+    // 历史教训：早期实现 "本地 → http；其余 → https"，导致用户用裸 IP+自定义端口
+    // （如 http://1.2.3.4:666/share/...）访问 http 服务时，把 <img src="/api/attachments/...">
+    // 改写成了 https://1.2.3.4:666/...，浏览器拉图全部 ERR_SSL_PROTOCOL_ERROR / 连不上。
+    // 真正运行在 HTTPS 上的部署一般都在反代后面（nginx / caddy / cdn），那条路径有
+    // X-Forwarded-Proto 兜底，不依赖这里的猜测，所以收紧这里更安全。
     const lowered = finalHost.toLowerCase();
+    const hasExplicitPort = /:\d+$/.test(lowered) && !lowered.endsWith(":443");
+    const isIpLiteral = /^\d{1,3}(\.\d{1,3}){3}(:\d+)?$/.test(lowered)
+      || lowered.startsWith("[");           // IPv6 字面量 [::1]:xxxx
     const isLocal = lowered === "localhost"
       || lowered.startsWith("localhost:")
       || lowered.startsWith("127.")
       || lowered.startsWith("0.0.0.0")
-      || lowered.startsWith("[::1]")
-      || lowered.endsWith(":80");
-    proto = isLocal ? "http" : "https";
+      || lowered.startsWith("[::1]");
+
+    if (isLocal || isIpLiteral || hasExplicitPort) {
+      proto = "http";
+    } else {
+      proto = "https";
+    }
   }
 
   // 基本合法性校验，避免拼出 "javascript://..." 之类的脏 origin
