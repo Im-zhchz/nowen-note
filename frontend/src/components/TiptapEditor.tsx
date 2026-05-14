@@ -26,10 +26,12 @@ import {
   Quote, ImagePlus, Paperclip, CheckSquare, Highlighter, Minus, Undo, Redo,
   Code, FileCode, Sparkles, X, ZoomIn, ZoomOut, RotateCcw,
   Table2, Indent, Outdent, AlignLeft, AlignCenter, AlignRight, Trash2,
-  FileType, Check, AlertCircle, Info, ArrowUp
+  FileType, Check, AlertCircle, Info, ArrowUp, Link as LinkIcon,
+  ExternalLink, Unlink2
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { toast } from "@/lib/toast";
+import { prompt as promptDialog } from "@/components/ui/confirm";
 import { Note, Tag } from "@/types";
 import TagInput from "@/components/TagInput";
 import AIWritingAssistant from "@/components/AIWritingAssistant";
@@ -37,6 +39,7 @@ import type { NoteEditorHandle, NoteEditorHeading, NoteEditorProps } from "@/com
 import type { FormatMenuPayload } from "@/lib/desktopBridge";
 import { sendFormatState } from "@/lib/desktopBridge";
 import { SlashCommandsMenu, getDefaultSlashCommands, createSlashExtension, createSlashEventHandlers } from "@/components/SlashCommands";
+import { MarkdownEnhancements } from "@/components/MarkdownEnhancements";
 import CodeBlockView from "@/components/CodeBlockView";
 import MobileFloatingToolbar, { MobileToolbarItem } from "@/components/MobileFloatingToolbar";
 import { useKeyboardVisible } from "@/hooks/useKeyboardVisible";
@@ -780,6 +783,13 @@ export default forwardRef<NoteEditorHandle, TiptapEditorProps>(function TiptapEd
   const [imageBubble, setImageBubble] = useState<{ open: boolean; top: number; left: number }>({
     open: false, top: 0, left: 0,
   });
+  // 光标停在链接内（且无选区）时浮出的链接气泡：打开 / 编辑 / 取消链接
+  // 与 bubble（文本选区格式化）互斥——选区有内容时优先显示文本气泡。
+  const [linkBubble, setLinkBubble] = useState<{
+    open: boolean; top: number; left: number; href: string;
+  }>({
+    open: false, top: 0, left: 0, href: "",
+  });
 
   // 斜杠命令事件处理器（稳定引用）
   const slashHandlers = useRef(createSlashEventHandlers());
@@ -981,6 +991,8 @@ export default forwardRef<NoteEditorHandle, TiptapEditorProps>(function TiptapEd
       IndentExtension,
       keyboardExtension.current,
       slashExtension.current,
+      // Markdown 语法增强：~~删除线~~ / ==高亮== input rule + 智能粘贴 markdown
+      ...MarkdownEnhancements,
     ],
     content: parseContent(note.content),
     editable,
@@ -1886,6 +1898,82 @@ export default forwardRef<NoteEditorHandle, TiptapEditorProps>(function TiptapEd
     };
   }, [editor]);
 
+  // ---------- 链接编辑：弹项目统一 prompt 弹窗，工具栏 & 链接气泡共用 ----------
+  // 抽成共享回调避免两处重复 ~40 行 prompt + 解析 + apply 逻辑。
+  // 输入框支持 markdown.com.cn 标准 `https://x.com "标题"` 写法，
+  // 解析时把空格后的 "..." 部分作为 link mark 的 title 属性。
+  const openLinkEditor = useCallback(async () => {
+    if (!editor) return;
+    const { from, to, empty } = editor.state.selection;
+    const previousAttrs = editor.getAttributes("link") as { href?: string; title?: string | null };
+    const previous = previousAttrs?.href ?? "";
+    const previousTitle = previousAttrs?.title ?? "";
+    const defaultValue = previous
+      ? previousTitle
+        ? `${previous} "${previousTitle}"`
+        : previous
+      : "https://";
+
+    const url = await promptDialog({
+      title: t("tiptap.link"),
+      placeholder: 'https://example.com  或  https://example.com "标题"',
+      defaultValue,
+      confirmText: t("common.confirm"),
+      cancelText: t("common.cancel"),
+      allowEmpty: true, // 空字符串 = 移除链接，必须开
+    });
+    if (url == null) return;
+
+    const trimmed = url.trim();
+    if (!trimmed) {
+      editor.chain().focus().extendMarkRange("link").unsetLink().run();
+      return;
+    }
+
+    const match = trimmed.match(/^(\S+)(?:\s+"([^"]*)")?$/);
+    const rawHref = (match?.[1] ?? trimmed).trim();
+    const linkTitle = match?.[2] ?? null;
+
+    const safe = /^(https?:|mailto:|tel:|\/|#)/i.test(rawHref)
+      ? rawHref
+      : `https://${rawHref}`;
+
+    const attrs: { href: string; title?: string | null } = { href: safe };
+    if (linkTitle) attrs.title = linkTitle;
+
+    if (empty) {
+      // 光标在已有链接里：先扩到整段链接再 setLink，覆盖现有 mark
+      // 完全空选区且不在链接上：直接插入 URL 文本并打 mark
+      if (editor.isActive("link")) {
+        editor.chain().focus().extendMarkRange("link").setLink(attrs).run();
+      } else {
+        editor
+          .chain()
+          .focus()
+          .insertContent({
+            type: "text",
+            text: rawHref,
+            marks: [{ type: "link", attrs }],
+          })
+          .run();
+      }
+    } else {
+      editor.chain().focus().setTextSelection({ from, to }).extendMarkRange("link").setLink(attrs).run();
+    }
+  }, [editor, t]);
+
+  // 取消链接：扩到 link mark 范围后 unsetLink
+  const removeLink = useCallback(() => {
+    if (!editor) return;
+    editor.chain().focus().extendMarkRange("link").unsetLink().run();
+  }, [editor]);
+
+  // 打开链接：在新窗口/新标签页里打开 href
+  const openLinkUrl = useCallback((href: string) => {
+    if (!href) return;
+    window.open(href, "_blank", "noopener,noreferrer");
+  }, []);
+
   // ---------- 手动选区气泡菜单定位 ----------
   // 监听 selectionUpdate / blur，计算浮动菜单坐标（fixed 定位，视口坐标）
   useEffect(() => {
@@ -1896,12 +1984,65 @@ export default forwardRef<NoteEditorHandle, TiptapEditorProps>(function TiptapEd
       const { selection } = state;
       const { from, to, empty } = selection;
 
-      // 编辑器失焦或空选区 → 关闭所有气泡
-      if (!view.hasFocus() || empty) {
+      // 编辑器失焦 → 关闭所有气泡
+      if (!view.hasFocus()) {
         setBubble(b => b.open ? { ...b, open: false } : b);
         setImageBubble(b => b.open ? { ...b, open: false } : b);
+        setLinkBubble(b => b.open ? { ...b, open: false } : b);
         return;
       }
+
+      // 空选区 → 文本/图片格式化气泡都关，但若光标停在链接里，显示链接气泡
+      if (empty) {
+        setBubble(b => b.open ? { ...b, open: false } : b);
+        setImageBubble(b => b.open ? { ...b, open: false } : b);
+
+        if (editor.isActive("link")) {
+          // 取整段 link mark 的范围用于定位（光标位置矩形是零宽，定位会偏）
+          const $pos = state.doc.resolve(from);
+          const linkType = state.schema.marks.link;
+          // resolvedPos.marks() 给当前位置的所有 mark；找 link 后用 mark.attrs.href
+          const linkMark = $pos.marks().find((m) => m.type === linkType);
+          const href = (linkMark?.attrs as { href?: string } | undefined)?.href ?? "";
+          // ProseMirror 没有 getMarkRange 在 Node 上，但 Tiptap 在选区方法里有；
+          // 这里用 textBetween 反查 + 从当前位置向左右扩展找 mark 边界，避免引入新依赖
+          let start = from;
+          let end = from;
+          // 向左扩
+          while (start > 0) {
+            const prevPos = state.doc.resolve(start - 1);
+            if (prevPos.marks().some((m) => m.type === linkType && m.eq(linkMark!))) {
+              start -= 1;
+            } else break;
+          }
+          // 向右扩
+          while (end < state.doc.content.size) {
+            const nextPos = state.doc.resolve(end);
+            if (nextPos.marks().some((m) => m.type === linkType && m.eq(linkMark!))) {
+              end += 1;
+            } else break;
+          }
+
+          // 定位策略：
+          //  - 垂直：用整段 link rect 的 top（首行上方），避免链接换行时气泡飘到末行
+          //  - 水平：以"光标位置 x"为锚点居中，而不是整段 rect 的几何中点
+          //    （对长链接独占一行的情况，rect.left+width/2 会跑到行中点，
+          //     用户点行首就会看到气泡飘在右半屏 → 严重脱节）
+          const linkRect = posToDOMRect(view, start, end);
+          const caretRect = posToDOMRect(view, from, from);
+          const top = Math.max(8, linkRect.top - 44);
+          const cx = caretRect.left; // 光标 x（零宽矩形，left===right）
+          // 气泡宽度约 280px，居中减半，并夹到视口内
+          const left = Math.max(8, Math.min(cx - 140, window.innerWidth - 290));
+          setLinkBubble({ open: true, top, left, href });
+        } else {
+          setLinkBubble(b => b.open ? { ...b, open: false } : b);
+        }
+        return;
+      }
+
+      // 有选区 → 链接气泡关闭，走原有文本/图片气泡逻辑
+      setLinkBubble(b => b.open ? { ...b, open: false } : b);
 
       const isImage = editor.isActive("image");
 
@@ -1936,6 +2077,7 @@ export default forwardRef<NoteEditorHandle, TiptapEditorProps>(function TiptapEd
         if (!editor.view.hasFocus()) {
           setBubble(b => b.open ? { ...b, open: false } : b);
           setImageBubble(b => b.open ? { ...b, open: false } : b);
+          setLinkBubble(b => b.open ? { ...b, open: false } : b);
         }
       });
     };
@@ -2492,6 +2634,13 @@ export default forwardRef<NoteEditorHandle, TiptapEditorProps>(function TiptapEd
           <Highlighter size={iconSize} />
         </ToolbarButton>
         <ToolbarButton
+          onClick={openLinkEditor}
+          isActive={editor.isActive("link")}
+          title={t('tiptap.link')}
+        >
+          <LinkIcon size={iconSize} />
+        </ToolbarButton>
+        <ToolbarButton
           onClick={() => editor.chain().focus().toggleCode().run()}
           isActive={editor.isActive("code")}
           title={t('tiptap.inlineCode')}
@@ -2743,6 +2892,14 @@ export default forwardRef<NoteEditorHandle, TiptapEditorProps>(function TiptapEd
           >
             <Code size={14} />
           </ToolbarButton>
+          {/* 链接：选区有内容时一键转链接（或编辑已有链接），省得跑顶部工具栏 */}
+          <ToolbarButton
+            onClick={openLinkEditor}
+            isActive={editor.isActive("link")}
+            title={t('tiptap.link')}
+          >
+            <LinkIcon size={14} />
+          </ToolbarButton>
           <ToolbarButton
             onClick={toggleCodeBlockStrict}
             isActive={editor.isActive("codeBlock")}
@@ -2758,6 +2915,45 @@ export default forwardRef<NoteEditorHandle, TiptapEditorProps>(function TiptapEd
               </ToolbarButton>
             </>
           )}
+        </div>
+      )}
+
+      {/* 链接气泡菜单：光标停在链接内（无选区）时浮出 — 打开 / 编辑 / 取消链接 */}
+      {editor && editable && linkBubble.open && (
+        <div
+          className="fixed z-50 flex items-center gap-1 bg-app-elevated border border-app-border rounded-lg shadow-lg px-2 py-1 max-w-[320px]"
+          style={{ top: linkBubble.top, left: linkBubble.left }}
+          onMouseDown={(e) => e.preventDefault()}
+        >
+          {/* href 预览：超长时截断，给足上下文 + tooltip 完整 */}
+          <a
+            href={linkBubble.href}
+            target="_blank"
+            rel="noopener noreferrer"
+            title={linkBubble.href}
+            className="text-xs text-app-muted hover:text-app-accent truncate max-w-[160px] underline-offset-2 hover:underline"
+          >
+            {linkBubble.href}
+          </a>
+          <div className="w-px h-4 bg-app-border mx-0.5" />
+          <ToolbarButton
+            onClick={() => openLinkUrl(linkBubble.href)}
+            title={t('tiptap.linkOpen')}
+          >
+            <ExternalLink size={14} />
+          </ToolbarButton>
+          <ToolbarButton
+            onClick={openLinkEditor}
+            title={t('tiptap.linkEdit')}
+          >
+            <LinkIcon size={14} />
+          </ToolbarButton>
+          <ToolbarButton
+            onClick={removeLink}
+            title={t('tiptap.linkRemove')}
+          >
+            <Unlink2 size={14} />
+          </ToolbarButton>
         </div>
       )}
 
