@@ -1,6 +1,6 @@
 {
   "name": "nowen-note-backend",
-  "version": "1.0.0",
+  "version": "1.0.37",
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "build": "node build.bundle.mjs",

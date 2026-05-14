@@ -1132,6 +1132,40 @@ if [ "$BUILD_ONLY" != "1" ]; then
     sync_root_pkg_version "$VERSION"
 fi
 
+# -------------------- 同步 backend/package.json 的 version --------------------
+# 动机：后端 /api/version 的 resolveAppVersion() 在以下场景会读到 backend/package.json：
+#   1) Docker 镜像里 /app/ 不含根 package.json，且 release.sh 没传 --build-arg APP_VERSION
+#      （历史构建模式 / 第三方人手 docker build）
+#   2) electron 打包后 backend bundle 在某些路径下 __dirname 指向 backend/
+# 一旦 backend/package.json 长期停在 1.0.0，前端关于页就会显示一个永远对不上的服务端版本号。
+# 这里跟根 package.json 同步 bump，作为镜像内的"真实兜底"。仅改 version 字段，依赖列表不动。
+# 注意：和 sync_root_pkg_version 一样只在"发布模式"执行（构建模式不该污染源码）。
+sync_backend_pkg_version() {
+    local target_version="$1"
+    local pkg_file
+    pkg_file="${REPO_ROOT:-.}/backend/package.json"
+    [ -f "$pkg_file" ] || pkg_file="backend/package.json"
+    [ -f "$pkg_file" ] || return 0
+
+    local current
+    current="$(grep -oE '"version"\s*:\s*"[^"]+"' "$pkg_file" | head -1 | sed -E 's/.*"([^"]+)"$/\1/')"
+    if [ "$current" = "$target_version" ]; then
+        info "backend/package.json version 已是 ${target_version}，无需改写"
+        return 0
+    fi
+
+    info "更新 backend/package.json version: ${current:-(空)} -> ${target_version}"
+    if sed --version >/dev/null 2>&1; then
+        sed -i -E "0,/\"version\"\s*:\s*\"[^\"]+\"/s//\"version\": \"${target_version}\"/" "$pkg_file"
+    else
+        sed -i '' -E "1,/\"version\"[[:space:]]*:[[:space:]]*\"[^\"]+\"/s//\"version\": \"${target_version}\"/" "$pkg_file"
+    fi
+}
+
+if [ "$BUILD_ONLY" != "1" ]; then
+    sync_backend_pkg_version "$VERSION"
+fi
+
 # -------------------- 生成 CHANGELOG / README 区块 / public/changelog.json --------------------
 # 解析自上一个 v* tag 至 HEAD 之间的 conventional commits（feat/fix/docs/...），
 # 按分组写入：
@@ -2205,11 +2239,15 @@ fi
 if [ "$DO_GIT_TAG" = "1" ]; then
     step "打 git tag 并推送到 GitHub"
 
-    # 若前面 sync_root_pkg_version / sync_android_version 修改了 package.json
-    # 或 android/build.gradle，一并 commit，这样 git tag 会落在"版本号已更新"的 commit 上。
+    # 若前面 sync_root_pkg_version / sync_backend_pkg_version / sync_android_version
+    # 修改了 package.json 或 android/build.gradle，一并 commit，这样 git tag 会落在
+    # "版本号已更新"的 commit 上。
     CHANGED_FILES=()
     if [ -n "$(git status --porcelain -- package.json 2>/dev/null)" ]; then
         CHANGED_FILES+=( "package.json" )
+    fi
+    if [ -n "$(git status --porcelain -- backend/package.json 2>/dev/null)" ]; then
+        CHANGED_FILES+=( "backend/package.json" )
     fi
     if [ -n "$(git status --porcelain -- frontend/android/app/build.gradle 2>/dev/null)" ]; then
         CHANGED_FILES+=( "frontend/android/app/build.gradle" )
