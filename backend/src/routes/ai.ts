@@ -1343,9 +1343,17 @@ ai.post("/batch-format", async (c) => {
 });
 
 // ===== ⑥ 知识库文档导入 =====
+//
+// scope 行为（与 /ai/knowledge-stats 保持一致）：
+//   - 个人空间（workspaceId=null）：按 (userId, workspaceId IS NULL) 维度复用/创建
+//     "知识库文档"笔记本，写入 notes 时 workspaceId=NULL；
+//   - 工作区（workspaceId=<uuid>）：按 workspaceId 维度共享一个"知识库文档"笔记本，
+//     不限作者（与 stats 的"工作区不限 userId"语义一致），创建时 owner 记当前用户。
 ai.post("/import-to-knowledge", async (c) => {
   const settings = getAISettings();
-  const userId = c.req.header("X-User-Id") || "demo";
+  const scope = resolveScope(c);
+  if ("error" in scope) return scope.error;
+  const { userId, workspaceId } = scope;
 
   try {
     const formData = await c.req.formData();
@@ -1363,20 +1371,46 @@ ai.post("/import-to-knowledge", async (c) => {
     const db = getDb();
     const { v4: uuidv4 } = (await import("uuid"));
 
-    // 如果没有指定 notebookId，自动创建一个"知识库文档"笔记本
+    // 如果没有指定 notebookId，自动查找/创建一个"知识库文档"笔记本（按 scope 隔离）
     let targetNotebookId = notebookId;
     if (!targetNotebookId) {
-      const existing = db.prepare(
-        "SELECT id FROM notebooks WHERE name = '知识库文档' AND userId = ?"
-      ).get(userId) as { id: string } | undefined;
+      let existing: { id: string } | undefined;
+      if (workspaceId === null) {
+        // 个人空间：按 (userId, workspaceId IS NULL) 匹配
+        existing = db.prepare(
+          "SELECT id FROM notebooks WHERE name = '知识库文档' AND userId = ? AND workspaceId IS NULL",
+        ).get(userId) as { id: string } | undefined;
+      } else {
+        // 工作区：按 workspaceId 共享，不限 userId
+        existing = db.prepare(
+          "SELECT id FROM notebooks WHERE name = '知识库文档' AND workspaceId = ? ORDER BY createdAt ASC LIMIT 1",
+        ).get(workspaceId) as { id: string } | undefined;
+      }
 
       if (existing) {
         targetNotebookId = existing.id;
       } else {
         targetNotebookId = uuidv4();
         db.prepare(
-          "INSERT INTO notebooks (id, name, icon, userId, parentId, createdAt, updatedAt) VALUES (?, '知识库文档', '📚', ?, NULL, datetime('now'), datetime('now'))"
-        ).run(targetNotebookId, userId);
+          "INSERT INTO notebooks (id, name, icon, userId, workspaceId, parentId, createdAt, updatedAt) VALUES (?, '知识库文档', '📚', ?, ?, NULL, datetime('now'), datetime('now'))",
+        ).run(targetNotebookId, userId, workspaceId);
+      }
+    } else {
+      // 用户显式传了 notebookId：必须确保它在当前 scope 内，避免把工作区文档塞到
+      // 个人空间笔记本（或反之），同时阻断越权写入。
+      const nb = db.prepare(
+        "SELECT id, userId, workspaceId FROM notebooks WHERE id = ?",
+      ).get(targetNotebookId) as { id: string; userId: string; workspaceId: string | null } | undefined;
+      if (!nb) {
+        return c.json({ error: "笔记本不存在" }, 404);
+      }
+      const nbWs = nb.workspaceId || null;
+      if (nbWs !== workspaceId) {
+        return c.json({ error: "笔记本不属于当前工作区" }, 403);
+      }
+      // 个人空间下还要确保是当前用户自己的笔记本
+      if (workspaceId === null && nb.userId !== userId) {
+        return c.json({ error: "无权写入该笔记本" }, 403);
       }
     }
 
@@ -1479,9 +1513,9 @@ ai.post("/import-to-knowledge", async (c) => {
         const contentText = finalContent.replace(/[#*`>\-|_\[\]()]/g, "").replace(/\n{2,}/g, "\n").trim();
 
         db.prepare(`
-          INSERT INTO notes (id, title, content, contentText, notebookId, userId, isFavorite, isPinned, isTrashed, isLocked, version, createdAt, updatedAt)
-          VALUES (?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 1, datetime('now'), datetime('now'))
-        `).run(noteId, title, JSON.stringify({ type: "doc", content: [{ type: "paragraph", content: [{ type: "text", text: finalContent }] }] }), contentText, targetNotebookId, userId);
+          INSERT INTO notes (id, title, content, contentText, notebookId, userId, workspaceId, isFavorite, isPinned, isTrashed, isLocked, version, createdAt, updatedAt)
+          VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 1, datetime('now'), datetime('now'))
+        `).run(noteId, title, JSON.stringify({ type: "doc", content: [{ type: "paragraph", content: [{ type: "text", text: finalContent }] }] }), contentText, targetNotebookId, userId, workspaceId);
 
         results.push({ fileName: file.name, success: true, noteId });
       } catch (err: any) {

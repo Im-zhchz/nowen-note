@@ -1980,7 +1980,12 @@ export const api = {
       form.append("files", file);
     }
     if (notebookId) form.append("notebookId", notebookId);
-    const res = await fetch(`${getBaseUrl()}/ai/import-to-knowledge`, {
+    // v7：与 getKnowledgeStats 一致——按当前 scope 上传；
+    // 个人空间不带 workspaceId，工作区把当前 workspaceId 透传给后端，
+    // 后端会把笔记/笔记本写到对应 scope，避免落到个人空间。
+    const ws = getCurrentWorkspace();
+    const qs = ws && ws !== "personal" ? `?workspaceId=${encodeURIComponent(ws)}` : "";
+    const res = await fetch(`${getBaseUrl()}/ai/import-to-knowledge${qs}`, {
       method: "POST",
       headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}) },
       body: form,
