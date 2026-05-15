@@ -374,7 +374,12 @@ function AppLayout() {
 
   return (
     <div className="flex h-[100dvh] w-screen bg-app-bg overflow-hidden transition-colors duration-200">
-      {/* ===== 移动端：抽屉式侧边栏 ===== */}
+      {/* ===== 移动端：抽屉式侧边栏 =====
+          v16 P3 后续：与桌面端对齐，抽屉内部也拆成 NavRail + Sidebar 双栏。
+          - NavRail variant="mobile"：48/64px，顶部含关闭 X 与图标/文字模式切换；
+                                       不接受 hidden 模式（抽屉里没意义）。
+          - Sidebar variant="mobile"：主区只渲染 WorkspaceSwitcher + 搜索 + 笔记本 + 标签。
+          抽屉总宽 max-w 从 340 → 380：Rail 约占 48-64px，主区保持 ~320px 与改造前持平。 */}
       <AnimatePresence>
         {state.mobileSidebarOpen && (
           <>
@@ -390,9 +395,12 @@ function AppLayout() {
               animate={{ x: 0 }}
               exit={{ x: "-100%" }}
               transition={{ type: "spring", bounce: 0, duration: 0.35 }}
-              className="fixed inset-y-0 left-0 z-50 w-[85%] max-w-[340px] md:hidden shadow-2xl"
+              className="fixed inset-y-0 left-0 z-50 w-[88%] max-w-[380px] md:hidden shadow-2xl flex"
             >
-              <Sidebar />
+              <NavRail variant="mobile" />
+              <div className="flex-1 min-w-0">
+                <Sidebar />
+              </div>
             </motion.div>
           </>
         )}

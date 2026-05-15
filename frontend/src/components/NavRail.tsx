@@ -7,13 +7,16 @@
  * 视觉模式（由 useRailMode 控制）：
  *   - "icon"  ：48px 纯图标（紧凑）
  *   - "label" ：64px 图标 + 下方 10px 标签文字（识别度优先，企微/钉钉风格）
- *   - "hidden"：整块不渲染（由 App.tsx 处理，本组件不会被挂载）
+ *   - "hidden"：桌面变体下整块不渲染（由 App.tsx 处理，本组件不会被挂载）。
+ *               mobile 变体下抽屉永远显式打开来看导航，不接受 hidden——遇到 hidden 时
+ *               强制按 icon 渲染。
  *
  * 行为约定：
- * - 仅桌面端渲染（md 及以上）；移动端继续走 Sidebar 内的扁平 v15 三组分层。
- * - sidebarCollapsed 时：Rail 仍渲染（这是 Rail 的核心价值——模块切换永远 1 次点击可达）；
- *   主侧栏由 App.tsx 隐藏。
- * - 折叠按钮、设置、登出 都收编到 Rail（替代主侧栏 Footer + Header 折叠按钮的位置）。
+ * - desktop 变体：hidden md:flex，配合 sidebarCollapsed 由 App.tsx 控制可见性。
+ *   折叠按钮、设置、登出 都收编到 Rail（替代主侧栏 Footer + Header 折叠按钮的位置）。
+ * - mobile 变体（v16 P3 后续：移动端也拆 Rail+主区两栏）：
+ *   只在抽屉里渲染（外层已 md:hidden），顶部按钮是"关闭抽屉" X 而非折叠；
+ *   设置 / 登出同样收编到 Rail 底部，与桌面对齐视觉风格。
  *
  * 与 Sidebar 内 navItemsRaw 的关系：
  *   两边各持一份"导航项配置"——拆分得干净（NavRail 不依赖 Sidebar 的内部 state）。
@@ -28,7 +31,8 @@ import React, { useEffect, useState, useCallback } from "react";
 import {
   BookOpen, Star, Trash2, ListTodo, BrainCircuit,
   Sparkles, NotebookPen, FolderOpen,
-  Settings, LogOut, PanelLeftClose, PanelLeft,
+  Settings, LogOut, PanelLeftClose, PanelLeft, X,
+  Columns2, Columns3,
 } from "lucide-react";
 import { AnimatePresence } from "framer-motion";
 import { useTranslation } from "react-i18next";
@@ -37,7 +41,7 @@ import { api, broadcastLogout, getCurrentWorkspace } from "@/lib/api";
 import { ViewMode, WorkspaceFeatures } from "@/types";
 import { cn } from "@/lib/utils";
 import SettingsModal from "@/components/SettingsModal";
-import { useRailMode } from "@/hooks/useRailMode";
+import { useRailMode, nextRailMode, RailMode } from "@/hooks/useRailMode";
 
 type NavGroup = "workspace" | "modules" | "tools";
 
@@ -80,12 +84,16 @@ function isActive(itemMode: ViewMode, viewMode: ViewMode): boolean {
   return viewMode === itemMode;
 }
 
-export default function NavRail() {
+export default function NavRail({ variant = "desktop" }: { variant?: "desktop" | "mobile" } = {}) {
   const { t } = useTranslation();
   const { state } = useApp();
   const actions = useAppActions();
-  const [railMode] = useRailMode();
-  const showLabel = railMode === "label";
+  const [railMode, setRailMode] = useRailMode();
+  // mobile 变体：hidden 在抽屉里没意义（用户已经主动打开抽屉就是要看导航），
+  // 强制按 icon 渲染——不修改持久化值，桌面端切回 hidden 仍然有效。
+  const effectiveMode: RailMode = variant === "mobile" && railMode === "hidden" ? "icon" : railMode;
+  const showLabel = effectiveMode === "label";
+  const isMobile = variant === "mobile";
 
   // 工作区功能开关——独立订阅一份（与 Sidebar 内部各自一份，互不干扰）。
   // 个人空间或加载失败时为 null = 全开。
@@ -120,7 +128,10 @@ export default function NavRail() {
   const handleClick = useCallback((mode: ViewMode) => {
     actions.setViewMode(mode);
     actions.setSelectedNotebook(null);
-  }, [actions]);
+    // mobile 变体：点击导航项后顺手关掉抽屉，符合"我已经选定要去哪"的预期。
+    // 与 Sidebar 内笔记本/标签点击关闭抽屉的行为保持一致。
+    if (isMobile) actions.setMobileSidebar(false);
+  }, [actions, isMobile]);
 
   // ===== 尺寸常量 =====
   // icon 模式：48px 宽栏 / 40px 方按钮
@@ -171,25 +182,59 @@ export default function NavRail() {
   // 分组之间用细分隔线（不要文字组标题——Rail 上分组标题 = 噪音）
   const groups: NavGroup[] = ["workspace", "modules", "tools"];
 
+  // mobile 变体下 Rail 模式切换只在 icon ↔ label 之间循环（hidden 被强制忽略）。
+  // 这样用户能在抽屉里调整图标紧凑度，但不会把自己折叠成无导航死局。
+  const mobileNextMode: RailMode = effectiveMode === "label" ? "icon" : "label";
+  const MobileSwitchIcon = effectiveMode === "label" ? Columns2 : Columns3;
+
   return (
     <div
       className={cn(
-        "hidden md:flex h-full vibrancy-sidebar bg-app-sidebar border-r border-app-border flex-col items-center shrink-0 transition-[width] duration-150",
+        // desktop：桌面专用，md 及以上才显示
+        // mobile：仅在抽屉里使用，本身已被 md:hidden 包裹的容器约束；这里再加 md:hidden 双保险
+        isMobile
+          ? "flex md:hidden h-full"
+          : "hidden md:flex h-full",
+        "vibrancy-sidebar bg-app-sidebar border-r border-app-border flex-col items-center shrink-0 transition-[width] duration-150",
         railWidthClass,
       )}
       style={{ paddingTop: 'calc(var(--safe-area-top) + 8px)', paddingBottom: '8px' }}
     >
-      {/* 顶部：折叠/展开主侧栏按钮（合并 Sidebar 原 Header 折叠按钮的功能）。
-          决策：这里在 label 模式下也只显示图标——它是工具按钮（操作主侧栏可见性），
-          不属于"导航项"，不应与下方导航项视觉对齐成两行；保持紧凑感更恰当。 */}
-      <button
-        onClick={actions.toggleSidebar}
-        title={state.sidebarCollapsed ? t('common.expand') : t('common.collapse')}
-        aria-label={state.sidebarCollapsed ? t('common.expand') : t('common.collapse')}
-        className="w-10 h-10 rounded-lg flex items-center justify-center text-tx-tertiary hover:bg-app-hover hover:text-tx-primary transition-colors"
-      >
-        {state.sidebarCollapsed ? <PanelLeft size={16} /> : <PanelLeftClose size={16} />}
-      </button>
+      {/* 顶部按钮区：
+          - desktop：折叠/展开主侧栏（合并 Sidebar 原 Header 折叠按钮的功能）。
+          - mobile：关闭抽屉 X（替代 Sidebar mobile Header 的关闭按钮，统一收编到 Rail）+
+                    Rail 模式切换（icon ↔ label）。
+          决策：这两个按钮都是工具按钮，不属于"导航项"——保持 40px 方形紧凑感，
+          不与下方导航项的 label 模式纵向对齐。 */}
+      {isMobile ? (
+        <>
+          <button
+            onClick={() => actions.setMobileSidebar(false)}
+            title={t('common.close')}
+            aria-label={t('common.close')}
+            className="w-10 h-10 rounded-lg flex items-center justify-center text-tx-tertiary hover:bg-app-hover hover:text-tx-primary transition-colors"
+          >
+            <X size={16} />
+          </button>
+          <button
+            onClick={() => setRailMode(mobileNextMode)}
+            title={t(`sidebar.railMode.switchTo.${mobileNextMode}`)}
+            aria-label={t(`sidebar.railMode.switchTo.${mobileNextMode}`)}
+            className="w-10 h-10 rounded-lg flex items-center justify-center text-tx-tertiary hover:bg-app-hover hover:text-tx-primary transition-colors"
+          >
+            <MobileSwitchIcon size={16} />
+          </button>
+        </>
+      ) : (
+        <button
+          onClick={actions.toggleSidebar}
+          title={state.sidebarCollapsed ? t('common.expand') : t('common.collapse')}
+          aria-label={state.sidebarCollapsed ? t('common.expand') : t('common.collapse')}
+          className="w-10 h-10 rounded-lg flex items-center justify-center text-tx-tertiary hover:bg-app-hover hover:text-tx-primary transition-colors"
+        >
+          {state.sidebarCollapsed ? <PanelLeft size={16} /> : <PanelLeftClose size={16} />}
+        </button>
+      )}
 
       <div className={cn("my-2 border-t border-app-border/60", showLabel ? "w-8" : "w-6")} aria-hidden />
 

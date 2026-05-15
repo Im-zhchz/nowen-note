@@ -143,7 +143,9 @@ function TitleView({
             className={cn(
               "inline-flex items-center gap-1 align-middle mx-0.5 px-1.5 py-0.5 rounded-md text-xs",
               "bg-app-hover/60 text-accent-primary hover:bg-app-active hover:underline",
-              "max-w-[160px] truncate",
+              // 移动端窄视口下把 hostname 胶囊收紧到 120px，避免与中文标题挤一行时把 TaskRow 撑超视口；
+              // 桌面端（md:）保持 160px。max-w-full 兜底：链接永远不超过父容器宽度。
+              "max-w-[120px] md:max-w-[160px] truncate",
               isCompleted && "opacity-70"
             )}
           >
@@ -260,23 +262,56 @@ const TaskRow = React.forwardRef<HTMLDivElement, {
         )}
       </button>
 
-      {/* Title + 创建者：用列布局承载多行
+      {/* Title + 元信息：用列布局承载多行
           - 外层 `flex-1 min-w-0`：把宽度让给主标题区域，仍让右侧徽标区不被挤压；
-          - 内部用 flex-col：标题在上、creator 徽标在下（仅工作区可见）。
-            创建者徽标用更弱的色阶（tx-tertiary）+ 10px 字号，避免抢标题视线。 */}
+          - 内部用 flex-col：标题在上、元信息（移动端 DateBadge + creator）在下。
+            创建者徽标用更弱的色阶（tx-tertiary）+ 10px 字号，避免抢标题视线。
+
+          v16 P3 fix（移动端 DateBadge 截断）：
+            桌面端 Badges 横向排在右侧（DateBadge / Flag / Trash），但在移动端 ~360px
+            视口 + 长 dueDate 文案（"已逾期 11/05" ≈ 110px）会让 Badges 区超出列表项右沿
+            被裁切——表现为 "已逾期" 半截、日期不可见。
+            修复：移动端 DateBadge 下沉到标题下方（与 creator 同列、用 `flex-wrap` 容纳），
+            右侧 Badges 区只剩 Flag + Trash 两个固定 14px 图标，给标题让出更多横向空间。
+            桌面端保持原版式不变（md: 下隐藏下沉 DateBadge，Badges 区显示 DateBadge）。 */}
       <div className="flex-1 min-w-0 flex flex-col gap-0.5">
         <span
           className={cn(
-            "text-sm leading-relaxed break-all line-clamp-2 transition-all",
+            // v16 P3 fix（移动端长标题/带链接标题溢出截断）：
+            //   - 移动端字号 13px（text-[13px]），桌面端保持 14px（md:text-sm）——
+            //     一行能多容纳 1-2 个中文字符，配合下方 break-words 缓解中英混排截断。
+            //   - `break-words`(=word-break:break-word) + `[overflow-wrap:anywhere]`：
+            //     原 `break-all` 对长 URL/中文有效，但**对内嵌的 inline-flex 链接胶囊
+            //     无能为力**（atomic 元素不能在字符级断行）。`overflow-wrap:anywhere`
+            //     允许在任意位置（包括链接胶囊前后）软换行，杜绝胶囊把行宽撑到父容器外。
+            //   - `line-clamp-2` 保留省略号截断：超过 2 行的标题尾部 ... 收起。
+            "text-[13px] md:text-sm leading-relaxed break-words [overflow-wrap:anywhere] line-clamp-2 transition-all",
             isCompleted ? "line-through text-tx-tertiary" : "text-tx-primary"
           )}
           title={task.title}
         >
           <TitleView title={task.title} compact isCompleted={isCompleted} />
         </span>
+        {/* 移动端元信息行：DateBadge + creator，flex-wrap 防止两者并排时溢出。
+            注意 md:hidden——桌面端 DateBadge 仍在右侧 Badges 里，避免重复。 */}
+        {(task.dueDate || showCreator) && (
+          <div className="md:hidden flex items-center flex-wrap gap-x-3 gap-y-0.5 mt-0.5">
+            <DateBadge dateStr={task.dueDate} />
+            {showCreator && (
+              <span
+                className="flex items-center gap-1 text-[10px] text-tx-tertiary min-w-0"
+                title={t('common.createdBy', { name: task.creatorName })}
+              >
+                <UserIcon size={10} className="shrink-0" />
+                <span className="truncate">{task.creatorName}</span>
+              </span>
+            )}
+          </div>
+        )}
+        {/* 桌面端 creator 行：移动端已在上面元信息行渲染，这里仅桌面端显示 */}
         {showCreator && (
           <span
-            className="flex items-center gap-1 text-[10px] text-tx-tertiary truncate"
+            className="hidden md:flex items-center gap-1 text-[10px] text-tx-tertiary truncate"
             title={t('common.createdBy', { name: task.creatorName })}
           >
             <UserIcon size={10} className="shrink-0" />
@@ -285,9 +320,13 @@ const TaskRow = React.forwardRef<HTMLDivElement, {
         )}
       </div>
 
-      {/* Badges —— items-start 之后要用 mt-0.5 对齐到首行 */}
+      {/* Badges —— items-start 之后要用 mt-0.5 对齐到首行
+          移动端：仅 Flag + Trash（DateBadge 已下沉到标题下方）
+          桌面端：DateBadge + Flag + Trash 三个横向排列 */}
       <div className="flex items-center gap-2 flex-shrink-0 mt-0.5">
-        <DateBadge dateStr={task.dueDate} />
+        <span className="hidden md:inline-flex">
+          <DateBadge dateStr={task.dueDate} />
+        </span>
         <Flag size={14} className={pri.flagClass} />
         <button
           onClick={(e) => { e.stopPropagation(); onDelete(task.id); }}
@@ -901,8 +940,12 @@ export default function TaskCenter() {
           />
         </div>
 
-        {/* Task List */}
-        <div className="flex-1 overflow-auto px-4 md:px-6 py-3">
+        {/* Task List
+            v16 P3 fix：overflow-x-hidden 强制只允许垂直滚动。原来 `overflow-auto`
+            在窄视口 + 长链接胶囊（max-w 120/160px 的 inline-flex）下会触发横向滚动，
+            视觉上表现为 \"列表项右边内容被屏幕吃掉\"。改 hidden 配合 TaskRow 内部的
+            `[overflow-wrap:anywhere]` 软换行，让超长标题/链接强制折到下一行。 */}
+        <div className="flex-1 overflow-y-auto overflow-x-hidden px-4 md:px-6 py-3">
           {isLoading ? (
             <div className="flex items-center justify-center h-32 text-tx-tertiary text-sm">
               {t('common.loading')}
