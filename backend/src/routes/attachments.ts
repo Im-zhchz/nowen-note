@@ -183,6 +183,33 @@ function encodeContentDispositionFilename(name: string): string {
   return `attachment; filename*=UTF-8''${encodeURIComponent(safe)}`;
 }
 
+/**
+ * Buffer → 响应体兼容包装。
+ *
+ * 背景（TS 5.7+ + @types/node 22 的类型鸿沟）：
+ *   - Node `Buffer` 的类型签名在 @types/node 22 / TS 5.7 之后变成
+ *     `Buffer<ArrayBufferLike>`，underlying buffer 可能是 `SharedArrayBuffer`。
+ *   - 而浏览器 `lib.dom.d.ts` 的 `BodyInit` / `BlobPart`、Hono 的 `Data`
+ *     全都要求 `Uint8Array<ArrayBuffer>`（裸 `ArrayBuffer`，非 `Like`）。
+ *   - 直接把 Buffer 喂给 `new Response()` / `new Blob([buf])` / `c.body(buf)`
+ *     都会被 TS 拒绝（TS2345 / TS2322 / TS2769）。
+ *
+ * 解法：
+ *   通过 `new Uint8Array(buf)` 拷贝构造一个**确定 underlying ArrayBuffer**
+ *   的视图。这是真拷贝（O(n)），但响应路径每个请求只走一次，相比磁盘 I/O
+ *   或 sharp 解码可以忽略；换来的是类型层面 100% 干净、运行期完全正确。
+ *
+ *   想零拷贝也可以用 `as unknown as Uint8Array<ArrayBuffer>` 强转，但显式
+ *   类型断言会绕过 TS 的有效检查；这里选择"显式拷贝 + 真实类型"。
+ */
+function toResponseBody(buf: Buffer): Uint8Array<ArrayBuffer> {
+  // Uint8Array 构造函数接受 ArrayBufferView 时会拷贝字节并新建 ArrayBuffer，
+  // 返回类型在新版 lib 里精确为 Uint8Array<ArrayBuffer>，正中 BodyInit 联合。
+  const out = new Uint8Array(buf.byteLength);
+  out.set(buf);
+  return out as Uint8Array<ArrayBuffer>;
+}
+
 // 单个附件最大 200MB。反向代理侧还会再设 body limit。
 // 之前是 50MB（按"图片"设计），放开到任意格式后上调一档，方便传 PDF / 安装包零件 / 压缩包。
 const MAX_ATTACHMENT_SIZE = 200 * 1024 * 1024;
@@ -231,13 +258,7 @@ export async function handleDownloadAttachment(c: Context): Promise<Response> {
       requestedWidth,
     );
     if (thumb) {
-      // 用 Hono c.body() 而不是 new Response()：
-      //   TS 5.7+ 给 Buffer/Uint8Array 加了 ArrayBufferLike generic，
-      //   导致 Buffer<ArrayBufferLike> 不能直接喂给浏览器 dom 的
-      //   Response/Blob/BlobPart（它们都要求 ArrayBuffer 而非 ArrayBufferLike，
-      //   差异是 SharedArrayBuffer）。Hono 的 c.body() 类型签名是 `unknown`-ish
-      //   宽容版，运行期同样用 Response 包，类型层面零摩擦。
-      return c.body(thumb.buffer, 200, {
+      return c.body(toResponseBody(thumb.buffer), 200, {
         "Content-Type": thumb.mimeType,
         // 缩略图与原图一样 immutable（webp 内容由 (id, w) 唯一决定）
         "Cache-Control": "public, max-age=31536000, immutable",
@@ -259,8 +280,8 @@ export async function handleDownloadAttachment(c: Context): Promise<Response> {
   if (!isImageMime(row.mimeType) || forceDownload) {
     headers["Content-Disposition"] = encodeContentDispositionFilename(row.filename || "");
   }
-  // 同上：用 c.body() 替代 new Response()，绕开 TS 5.7+ Buffer<ArrayBufferLike> 不兼容
-  return c.body(buffer, 200, headers);
+  // 同上：Buffer → Uint8Array<ArrayBuffer> 视图，绕开 TS 5.7+ ArrayBufferLike 不兼容
+  return c.body(toResponseBody(buffer), 200, headers);
 }
 
 // ============================================================================
