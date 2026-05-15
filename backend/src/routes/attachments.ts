@@ -231,18 +231,18 @@ export async function handleDownloadAttachment(c: Context): Promise<Response> {
       requestedWidth,
     );
     if (thumb) {
-      // TS 5.7+ 配合新版 @types/node：Buffer<ArrayBufferLike> / Uint8Array<ArrayBufferLike>
-      // 都不再直接命中 lib.dom.d.ts 的 BodyInit 联合类型（结构上与 URLSearchParams 冲突）。
-      // 用 Blob 包一层是最稳的兼容写法：Blob 是 BodyInit 的第一个成员，类型层面
-      // 永远兼容；Node 18+ Blob 是全局对象，构造 [buffer] 内部按需读字节，性能可接受。
-      return new Response(new Blob([thumb.buffer], { type: thumb.mimeType }), {
-        headers: {
-          "Content-Type": thumb.mimeType,
-          // 缩略图与原图一样 immutable（webp 内容由 (id, w) 唯一决定）
-          "Cache-Control": "public, max-age=31536000, immutable",
-          // 让前端 / 代理可以观察到这张响应是缩略图
-          "X-Thumbnail-Width": String(requestedWidth),
-        },
+      // 用 Hono c.body() 而不是 new Response()：
+      //   TS 5.7+ 给 Buffer/Uint8Array 加了 ArrayBufferLike generic，
+      //   导致 Buffer<ArrayBufferLike> 不能直接喂给浏览器 dom 的
+      //   Response/Blob/BlobPart（它们都要求 ArrayBuffer 而非 ArrayBufferLike，
+      //   差异是 SharedArrayBuffer）。Hono 的 c.body() 类型签名是 `unknown`-ish
+      //   宽容版，运行期同样用 Response 包，类型层面零摩擦。
+      return c.body(thumb.buffer, 200, {
+        "Content-Type": thumb.mimeType,
+        // 缩略图与原图一样 immutable（webp 内容由 (id, w) 唯一决定）
+        "Cache-Control": "public, max-age=31536000, immutable",
+        // 让前端 / 代理可以观察到这张响应是缩略图
+        "X-Thumbnail-Width": String(requestedWidth),
       });
     }
     // thumb 为 null（sharp 失败 / 不可用）→ fall through 返回原图
@@ -259,8 +259,8 @@ export async function handleDownloadAttachment(c: Context): Promise<Response> {
   if (!isImageMime(row.mimeType) || forceDownload) {
     headers["Content-Disposition"] = encodeContentDispositionFilename(row.filename || "");
   }
-  // 同上：Buffer → Blob 包装，避免 TS 5.7+ Uint8Array<ArrayBufferLike> 不兼容 BodyInit
-  return new Response(new Blob([buffer], { type: headers["Content-Type"] }), { headers });
+  // 同上：用 c.body() 替代 new Response()，绕开 TS 5.7+ Buffer<ArrayBufferLike> 不兼容
+  return c.body(buffer, 200, headers);
 }
 
 // ============================================================================
