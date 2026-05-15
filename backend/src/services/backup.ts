@@ -125,6 +125,31 @@ const KEEP_COUNT_MIN = 1;
 const KEEP_COUNT_MAX = 100;
 const KEEP_COUNT_DEFAULT = 15;
 
+/**
+ * note_versions 清理策略（P0-1）
+ * --------------------------------------------------------------------------
+ * 背景：
+ *   每条笔记每次编辑（且距上次版本 >= VERSION_MERGE_WINDOW_MS）就会插入一条
+ *   note_versions 行。长期使用下来单条笔记可能积累上千行；普通用户根本不需要
+ *   保留这么久的历史。
+ *
+ * 策略（每篇笔记独立判断）：
+ *   - 保留最近 keepRecent 条（按 version DESC），无论时间多老；
+ *   - 同时保留 createdAt 距今 keepDays 天内的全部条目；
+ *   - 二者取并集——避免“最近一周猛改一篇但 keepRecent=50 不够”的尴尬，
+ *     也避免“一篇笔记两年没动过，却被一刀切丢光所有历史”。
+ *
+ * 配置存储在 system_settings["backup:noteVersionsRetention"]，结构：
+ *   { "keepRecent": 50, "keepDays": 30 }
+ *
+ * 不删 changeType != 'edit' 的版本（manual/snapshot 等通常是用户主动节点）。
+ */
+const VERSION_RETENTION_KV_KEY = "backup:noteVersionsRetention";
+const VERSION_KEEP_RECENT_DEFAULT = 50;
+const VERSION_KEEP_RECENT_MAX = 1000;
+const VERSION_KEEP_DAYS_DEFAULT = 30;
+const VERSION_KEEP_DAYS_MAX = 3650;
+
 /** "HH:mm" 24h 校验 */
 function isValidHHmm(s: string | undefined): s is string {
   return typeof s === "string" && /^([01]\d|2[0-3]):[0-5]\d$/.test(s);
@@ -718,6 +743,8 @@ export class BackupManager {
       // 导致管理员频繁手动备份后列表无限堆积。
       // 容错：若 prune 内部抛错也不能让 createBackup 整体失败。
       try { this.pruneDbOnly(); } catch { /* ignore */ }
+      // P0-1：顺路清理过期 note_versions，避免单表无限膨胀。
+      try { this.pruneNoteVersions(); } catch { /* ignore */ }
       return info;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -730,6 +757,12 @@ export class BackupManager {
         console.error(
           `[Backup] 连续失败 ${this.health.consecutiveFailures} 次，备份链路已降级。最近原因：${msg}`,
         );
+        // P1-3：阈值边沿触发一次告警邮件（fire-and-forget，绝不阻塞主流程）。
+        // 注意只在"刚好达到阈值的那次"发，否则后续每次失败都连发同样邮件
+        // 会变成噪音；如果运维想再收一次，恢复一次成功后下次再降级即可。
+        if (this.health.consecutiveFailures === FAILURE_DEGRADE_THRESHOLD) {
+          void this.sendBackupFailureAlert(msg);
+        }
       }
       // 失败时清理半成品，避免 listBackups 看到坏文件
       try {
@@ -993,11 +1026,17 @@ export class BackupManager {
       } catch (e) {
         throw new Error(`meta.json 解析失败：${e instanceof Error ? e.message : String(e)}`);
       }
-      if (meta.formatVersion && meta.formatVersion > BACKUP_FORMAT_VERSION) {
-        throw new Error(
-          `备份格式版本 ${meta.formatVersion} 高于当前程序支持的 ${BACKUP_FORMAT_VERSION}，请升级到更新版本的 nowen-note 后再导入`,
-        );
-      }
+    if (meta.formatVersion && meta.formatVersion > BACKUP_FORMAT_VERSION) {
+      // P0-3：多行引导，让管理员一眼看出"是什么黑什么”、"该怎么办"
+      throw new Error(
+        [
+          `无法导入：备份格式版本太高。`,
+          `  备份调用的格式版本：${meta.formatVersion}`,
+          `  当前程序支持的最高格式版本：${BACKUP_FORMAT_VERSION}`,
+          `  请升级 nowen-note 到该备份产生时的版本（或更新）后再导入。`,
+        ].join("\n"),
+      );
+    }
       formatVersion = meta.formatVersion ?? BACKUP_FORMAT_VERSION;
       schemaVersion = meta.schemaVersion ?? schemaVersion;
       noteCount = Number(meta.tables?.notes ?? 0) || 0;
@@ -1082,8 +1121,15 @@ export class BackupManager {
     const meta = JSON.parse(await metaFile.async("string"));
 
     if (meta.formatVersion && meta.formatVersion > BACKUP_FORMAT_VERSION) {
+      // P0-3：与 ingestUploadedBackup 保持一致的结构化多行说明
       throw new Error(
-        `备份格式版本 ${meta.formatVersion} 高于当前程序支持的 ${BACKUP_FORMAT_VERSION}，请升级到更新版本的 nowen-note 后再恢复`,
+        [
+          `无法恢复：备份格式版本高于当前程序。`,
+          `  备份格式版本：${meta.formatVersion}（备份产生时间 ${meta.createdAt || "unknown"}）`,
+          `  当前程序支持的最高格式版本：${BACKUP_FORMAT_VERSION}`,
+          `  请升级 nowen-note 到该备份产生时的版本或更新后再恢复；`,
+          `  若仅需从该备份拼选数据，可在 https://github.com/ 查看项目 Releases 页获取对应版本。`,
+        ].join("\n"),
       );
     }
     // schema 版本兼容策略：允许 backup.schemaVersion <= 当前程序支持的最高版本。
@@ -1091,8 +1137,19 @@ export class BackupManager {
     // - 备份版本更高：拒绝，等同于 "新库灌进旧程序"，与 D3 防降级语义一致。
     const codeMaxSchema = (await import("../db/schema.js")).getCodeSchemaVersion();
     if (meta.schemaVersion && meta.schemaVersion > codeMaxSchema) {
+      // P0-3：带上 backup、当前 两个 schema 版本、以及备份产生时间，方便判断
+      // "差多远"、是否值得费劲升级应用
       throw new Error(
-        `备份 schema 版本 ${meta.schemaVersion} 高于当前程序支持的 ${codeMaxSchema}。请升级到对应版本的 nowen-note 后再恢复。`,
+        [
+          `无法恢复：备份 schema 版本高于当前程序。`,
+          `  备份 schema 版本：${meta.schemaVersion}`,
+          `  当前程序支持的最高 schema 版本：${codeMaxSchema}`,
+          `  备份产生时间：${meta.createdAt || "unknown"}`,
+          ``,
+          `原因：该备份是从更新版本的 nowen-note 产生的，错误地被灌到了旧程序。`,
+          `解决方案：升级 nowen-note 到与该备份同版或更新后再试。`,
+          `提示：不要手动修改 meta.json 来绕过此检查，将造成数据不一致。`,
+        ].join("\n"),
       );
     }
 
@@ -1612,6 +1669,120 @@ export class BackupManager {
         intervalHours: opts.intervalHours ?? this.autoBackupConfig.intervalHours ?? this.autoBackupIntervalHours,
       };
       this.persistAutoConfig(this.autoBackupConfig);
+    }
+  }
+
+  /**
+   * 清理 note_versions（P0-1）
+   *
+   * 每篇笔记保留最近 keepRecent 条 + createdAt 距今 keepDays 天内的全部条目。
+   * 用一条 DELETE + 子查询完成，避免逐 noteId 循环。
+   *
+   * 注意：
+   *   - **不删 changeSummary != 'edit' 的版本**（如 manual/snapshot）
+   *     这些通常是用户主动保存的关键节点，无论多老都保留；
+   *   - rowid 子查询走 idx_note_versions_note(noteId, version DESC) 索引，
+   *     即使版本表很大也能快速定位每篇 top-N。
+   *
+   * 返回删除行数（日志用）。
+   */
+  pruneNoteVersions(): number {
+    try {
+      const db = getDb();
+      // 读策略
+      let keepRecent = VERSION_KEEP_RECENT_DEFAULT;
+      let keepDays = VERSION_KEEP_DAYS_DEFAULT;
+      try {
+        const row = db
+          .prepare("SELECT value FROM system_settings WHERE key = ?")
+          .get(VERSION_RETENTION_KV_KEY) as { value: string } | undefined;
+        if (row?.value) {
+          const parsed = JSON.parse(row.value) as { keepRecent?: number; keepDays?: number };
+          if (Number.isFinite(parsed.keepRecent)) {
+            keepRecent = Math.max(1, Math.min(VERSION_KEEP_RECENT_MAX, Math.round(Number(parsed.keepRecent))));
+          }
+          if (Number.isFinite(parsed.keepDays)) {
+            keepDays = Math.max(1, Math.min(VERSION_KEEP_DAYS_MAX, Math.round(Number(parsed.keepDays))));
+          }
+        }
+      } catch {
+        /* 配置坏掉就用默认 */
+      }
+
+      // SQLite datetime('now') 默认 UTC，与 createdAt 默认值同语境
+      const cutoff = `datetime('now', '-${keepDays} days')`;
+      const stmt = db.prepare(`
+        DELETE FROM note_versions
+        WHERE changeType = 'edit'
+          AND createdAt < ${cutoff}
+          AND id NOT IN (
+            SELECT id FROM note_versions v2
+            WHERE v2.noteId = note_versions.noteId
+              AND v2.changeType = 'edit'
+            ORDER BY v2.version DESC
+            LIMIT ?
+          )
+      `);
+      const result = stmt.run(keepRecent);
+      const removed = Number(result.changes) || 0;
+      if (removed > 0) {
+        console.log(
+          `[Backup] pruneNoteVersions: 清理了 ${removed} 行旧版本（keepRecent=${keepRecent}, keepDays=${keepDays}）`,
+        );
+      }
+      return removed;
+    } catch (e) {
+      console.warn("[Backup] pruneNoteVersions failed:", e instanceof Error ? e.message : e);
+      return 0;
+    }
+  }
+
+  /**
+   * 备份连续失败时的告警邮件（P1-3）。
+   *
+   * 触发条件：consecutiveFailures 刚好达到 FAILURE_DEGRADE_THRESHOLD（去抖：
+   * 仅在阈值边沿发一次，避免同样的失败连发 N 封）。
+   *
+   * 收件人：复用 autoBackupConfig.emailTo（管理员配置自动备份邮件时已经给过），
+   * 没配则跳过——不强行向 SMTP fromEmail 发，避免与“成功通知”混淆。
+   *
+   * 失败本身不阻断主流程：sendMail 抛错只记日志。
+   */
+  private async sendBackupFailureAlert(reason: string): Promise<void> {
+    try {
+      const cfg = this.autoBackupConfig;
+      if (!cfg.emailTo) {
+        console.log("[Backup] 跳过失败告警邮件：未配置 emailTo");
+        return;
+      }
+      const { readSmtpConfig, sendMail } = await import("./email");
+      const smtp = readSmtpConfig();
+      if (!smtp.enabled || !smtp.host || !smtp.username || !smtp.password) {
+        console.log("[Backup] 跳过失败告警邮件：SMTP 未启用或未就绪");
+        return;
+      }
+      const lines = [
+        `nowen-note 备份链路连续失败 ${this.health.consecutiveFailures} 次，已进入降级状态。`,
+        ``,
+        `最近失败时间：${this.health.lastFailureAt || new Date().toISOString()}`,
+        `失败原因：${reason}`,
+        `备份目录：${this.backupDir}`,
+        `上次成功时间：${this.health.lastSuccessAt || "（暂无成功记录）"}`,
+        ``,
+        `请尽快登录管理后台 → 数据管理 → 备份页签 排查（常见：磁盘满 / 备份目录不可写 / 跨卷权限）。`,
+      ];
+      const result = await sendMail({
+        to: cfg.emailTo,
+        subject: `[nowen-note] 备份连续失败告警（${this.health.consecutiveFailures} 次）`,
+        text: lines.join("\n"),
+      });
+      if (result.success) {
+        console.log(`[Backup] 失败告警邮件已发送至 ${cfg.emailTo}`);
+      } else {
+        console.warn(`[Backup] 失败告警邮件发送失败: ${result.error}`);
+      }
+    } catch (e) {
+      console.warn("[Backup] sendBackupFailureAlert error:", e instanceof Error ? e.message : e);
     }
   }
 

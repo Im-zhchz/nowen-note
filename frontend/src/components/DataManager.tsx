@@ -13,7 +13,7 @@ import {
 import { useTranslation } from "react-i18next";
 import { exportAllNotes, ExportProgress } from "@/lib/exportService";
 import {
-  readMarkdownFiles, readMarkdownFromZip, importNotes,
+  readMarkdownFiles, readMarkdownFromZipWithMeta, importNotes,
   ImportFileInfo, ImportProgress
 } from "@/lib/importService";
 import { useApp, useAppActions } from "@/store/AppContext";
@@ -168,6 +168,14 @@ export default function DataManager() {
   const [duplicateStrategy, setDuplicateStrategy] = useState<"merge" | "unique">("merge");
   // 当前导入批次是否包含 zip（zip 本身按目录派生笔记本，不需要 perFile 开关）
   const [hasZip, setHasZip] = useState(false);
+  // P1-2：nanowen-note 自家导出 zip 在 metadata.json 中会携带 rootNotebookId；
+  // 如果当前工作区中仍有同 id 的笔记本，则自动预选，避免用户手动找一遍。
+  // 未命中时也给个提示（例如“该备份来自另一个实例/工作区，仍会导入但不会自动选目标本”）。
+  const [zipMetaHint, setZipMetaHint] = useState<
+    | { kind: "matched"; notebookName: string }
+    | { kind: "missing"; rootNotebookName?: string }
+    | null
+  >(null);
   // 导出时是否把图片内嵌为 base64（默认 false：外置到 assets/ 目录，体积小、可读性好）
   const [exportInlineImages, setExportInlineImages] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -217,13 +225,35 @@ export default function DataManager() {
     const zipFile = fileArray.find((f) => f.name.endsWith(".zip"));
 
     if (zipFile) {
-      result = await readMarkdownFromZip(zipFile);
+      const r = await readMarkdownFromZipWithMeta(zipFile);
+      result = r.files;
       setHasZip(true);
       // zip 由其内部目录/zip 文件名派生笔记本，关闭 per-file
       setPerFileNotebook(false);
+
+      // P1-2：试图依据 meta.rootNotebookId 预选目标笔记本
+      // 仅当 scope 与侧边栏匹配且 rootNotebookId 在当前笔记本列表里仍存在时才预选，
+      // 避免传递 "看不见的 id" 到后端造成导入到错误位置。
+      if (r.meta && r.meta.rootNotebookId && scopeMatchesGlobal) {
+        const hit = state.notebooks.find((nb) => nb.id === r.meta!.rootNotebookId);
+        if (hit) {
+          setSelectedNotebookId(hit.id);
+          setZipMetaHint({ kind: "matched", notebookName: hit.name });
+        } else {
+          // 未命中：不覆盖用户上次选择，仅提示
+          setZipMetaHint({
+            kind: "missing",
+            rootNotebookName: r.meta.rootNotebookName,
+          });
+        }
+      } else {
+        // 不是 nowen-note 导出的 zip，或 scope 不匹配：清理上一轮 hint
+        setZipMetaHint(null);
+      }
     } else {
       result = await readMarkdownFiles(files);
       setHasZip(false);
+      setZipMetaHint(null);
       // 散文件默认开启 per-file：以文件名作为笔记本名，而非统一落到"导入的笔记"
       setPerFileNotebook(true);
     }
@@ -728,6 +758,28 @@ export default function DataManager() {
                         </option>
                       ))}
                     </select>
+                    {/* P1-2：zip 内 metadata.json 提供了原笔记本信息时的提示。
+                        - matched：当前空间里存在同 id 的笔记本，已自动预选；
+                        - missing：metadata 提到的 rootNotebookId 在当前空间不存在，
+                          常见于跨实例 / 跨工作区的迁移场景。 */}
+                    {hasZip && zipMetaHint && (
+                      <p className="text-[11px] mt-1.5 leading-relaxed">
+                        {zipMetaHint.kind === "matched" ? (
+                          <span className="text-emerald-600 dark:text-emerald-400">
+                            ✓ 已根据备份元数据自动选中原笔记本：
+                            <span className="font-semibold">{zipMetaHint.notebookName}</span>
+                          </span>
+                        ) : (
+                          <span className="text-amber-600 dark:text-amber-400">
+                            ⓘ 备份来自其他实例或工作区
+                            {zipMetaHint.rootNotebookName ? (
+                              <>（原笔记本：<span className="font-semibold">{zipMetaHint.rootNotebookName}</span>）</>
+                            ) : null}
+                            ；当前空间未找到同 id 的笔记本，可手动选择目标或保持「自动创建」。
+                          </span>
+                        )}
+                      </p>
+                    )}
                   </div>
                 );
               })()}

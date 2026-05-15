@@ -92,6 +92,29 @@ const MIME_EXT_MAP: Record<string, string> = {
   "image/svg+xml": "svg",
   "image/bmp": "bmp",
   "image/x-icon": "ico",
+  // P1-1：扩展非图常见 MIME，用于把笔记里的 <a href="/api/attachments/<id>">
+  // 真实文件名扩展名兜底。仍然是"已知就用 MIME，未知就走 URL 后缀"。
+  "application/pdf": "pdf",
+  "application/zip": "zip",
+  "application/x-zip-compressed": "zip",
+  "application/x-rar-compressed": "rar",
+  "application/x-7z-compressed": "7z",
+  "application/msword": "doc",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
+  "application/vnd.ms-excel": "xls",
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "xlsx",
+  "application/vnd.ms-powerpoint": "ppt",
+  "application/vnd.openxmlformats-officedocument.presentationml.presentation": "pptx",
+  "audio/mpeg": "mp3",
+  "audio/wav": "wav",
+  "audio/ogg": "ogg",
+  "audio/mp4": "m4a",
+  "video/mp4": "mp4",
+  "video/webm": "webm",
+  "video/quicktime": "mov",
+  "text/plain": "txt",
+  "text/csv": "csv",
+  "application/json": "json",
 };
 
 function mimeToExt(mime: string): string {
@@ -123,6 +146,35 @@ export interface ExtractedImage {
   relPath: string;
   /** base64 字符串（不含 data: 前缀） */
   base64: string;
+}
+
+/**
+ * 单条图片下载/内嵌失败记录（P0-2）。
+ *
+ * 用于在 zip 根目录写 `export-warnings.json`，让用户能看到具体是哪些笔记的
+ * 哪些图失败了（之前只有"失败 N 张"的汇总，无法定位）。
+ */
+export interface ImgFailure {
+  /** 原始 src（多半是 /api/attachments/<id> 或绝对 url） */
+  src: string;
+  /** 所属笔记 id；若调用方未传则为空 */
+  noteId?: string;
+  /** 所属笔记标题；用于在 warnings.json 里给人读 */
+  noteTitle?: string;
+  /** 失败原因（HTTP 状态码 / 空响应 / 网络错误 ...） */
+  error: string;
+  /** 失败发生在哪个阶段：download = fetchRemoteImages；inline = inlineRemoteImages */
+  phase: "download" | "inline";
+}
+
+/**
+ * 图片下载统计 + 失败明细。
+ * fetchRemoteImages / inlineRemoteImages 都会往里写，最终由调用方汇总到 zip。
+ */
+export interface ImgStats {
+  ok: number;
+  failed: number;
+  failures: ImgFailure[];
 }
 
 async function extractDataImages(
@@ -250,7 +302,8 @@ function normalizeAttachmentSrc(src: string): string {
 async function fetchRemoteImages(
   html: string,
   registry: Map<string, string>,
-  stats: { ok: number; failed: number }
+  stats: ImgStats,
+  noteContext?: { noteId?: string; noteTitle?: string },
 ): Promise<{ html: string; images: ExtractedImage[] }> {
   if (!html || !/<img\b[^>]*\bsrc=/i.test(html)) {
     return { html, images: [] };
@@ -341,6 +394,14 @@ async function fetchRemoteImages(
           err
         );
         stats.failed++;
+        // P0-2：记一条详细失败信息，在 zip 根输出 export-warnings.json
+        stats.failures.push({
+          src: task.originalSrc,
+          noteId: noteContext?.noteId,
+          noteTitle: noteContext?.noteTitle,
+          error: err instanceof Error ? err.message : String(err),
+          phase: "download",
+        });
         // 下载失败时，至少把 src 规范化为相对路径 `/api/attachments/<id>`，
         // 剥掉随启动而变的 host:port —— 不要把 `http://localhost:3173/...`
         // 这种死链原样写进 zip，否则二次导入时前端会把它当成"外链"完全跳过，
@@ -389,7 +450,8 @@ async function fetchRemoteImages(
 // ============================================================================
 async function inlineRemoteImages(
   html: string,
-  stats: { ok: number; failed: number }
+  stats: ImgStats,
+  noteContext?: { noteId?: string; noteTitle?: string },
 ): Promise<string> {
   if (!html || !/<img\b[^>]*\bsrc=/i.test(html)) return html;
 
@@ -468,6 +530,14 @@ async function inlineRemoteImages(
           err
         );
         stats.failed++;
+        // P0-2：同 fetchRemoteImages，记一条失败信息
+        stats.failures.push({
+          src: task.originalSrc,
+          noteId: noteContext?.noteId,
+          noteTitle: noteContext?.noteTitle,
+          error: err instanceof Error ? err.message : String(err),
+          phase: "inline",
+        });
         // 兜底：规范化为相对路径，避免死 host:port 写进导出物
         const normalized = normalizeAttachmentSrc(task.originalSrc);
         if (normalized !== task.originalSrc) {
@@ -494,8 +564,166 @@ async function inlineRemoteImages(
 
 // ============================================================================
 
-// 初始化 Turndown (HTML → Markdown)
-function createTurndown(): TurndownService {
+// ============================================================================
+// 非图附件下载（P1-1）
+// ----------------------------------------------------------------------------
+// 与 fetchRemoteImages 配对：扫描 html 中的 <a href="/api/attachments/<id>">，
+// 下载到 zip 的 assets/ 目录，并把 href 替换为相对路径 ./assets/xxx.<ext>。
+//
+// 设计要点：
+//   - **只处理本站附件链接**（与 fetchRemoteImages 同款 isAttachmentUrl 判定），
+//     外链 / mailto / 锚点 / blob: 一律不动；
+//   - **不内嵌为 base64**：PDF / 视频动辄几十 MB，base64 会让 .md 爆炸，且 Markdown
+//     的链接语法不允许 data URI 内嵌成文件名，反而打不开；
+//   - 与图片共用同一个 `registry`（按 attachment id 做 key），同一附件被多处引用
+//     时只下载一次；
+//   - 失败兜底：与 fetchRemoteImages 一致——把 href 规范化为相对 /api/attachments/<id>，
+//     保留 zip 内的可读语义，避免死 host 写入；
+//   - 仅在导出 zip 时使用；单笔记 PDF / 图片导出不调用（那些场景图片够用）。
+//
+// 注意：
+//   导入端目前不会自动把这些附件重建回 attachments 表（导入仍以 markdown→html 为
+//   主，<a href="./assets/xxx.pdf"> 会保留为相对链接，但点击后浏览器会去访问宿主
+//   文件系统而不是 attachments 接口）。这是 P1-1 的"导出半边"实现，闭环要等导入侧
+//   改造。即便如此，用户已经能在 zip 里看到原始附件文件，满足"备份完整性"诉求。
+// ============================================================================
+async function fetchRemoteAttachments(
+  html: string,
+  registry: Map<string, string>,
+  stats: ImgStats,
+  noteContext?: { noteId?: string; noteTitle?: string },
+): Promise<{ html: string; assets: ExtractedImage[] }> {
+  if (!html || !/<a\b[^>]*\bhref=/i.test(html)) {
+    return { html, assets: [] };
+  }
+
+  const assets: ExtractedImage[] = [];
+  // 抓 <a ... href="..." ...>，捕获 (前缀, 引号, href, 后缀)；不闭合标签也无所谓
+  const aRe = /<a\b([^>]*?)\bhref\s*=\s*(["'])([^"']+)\2([^>]*)>/gi;
+
+  type Task = {
+    fullMatch: string;
+    beforeHref: string;
+    quote: string;
+    originalHref: string;
+    afterHref: string;
+  };
+  const tasks: Task[] = [];
+  let m: RegExpExecArray | null;
+  while ((m = aRe.exec(html)) !== null) {
+    const originalHref = m[3];
+    if (/^(data:|blob:|mailto:|tel:|#)/i.test(originalHref)) continue;
+    if (/^\.\/?assets\//i.test(originalHref)) continue;
+    if (!isAttachmentUrl(originalHref)) continue;
+    tasks.push({
+      fullMatch: m[0],
+      beforeHref: m[1] || "",
+      quote: m[2],
+      originalHref,
+      afterHref: m[4] || "",
+    });
+  }
+  if (tasks.length === 0) return { html, assets: [] };
+
+  const results: Array<{ task: Task; rebuilt: string } | null> = new Array(tasks.length).fill(null);
+  const concurrency = 4; // 非图附件常见更大，并发收敛一档
+  let cursor = 0;
+
+  async function worker() {
+    while (cursor < tasks.length) {
+      const myIdx = cursor++;
+      const task = tasks[myIdx];
+      try {
+        const absUrl = resolveAttachmentUrl(task.originalHref);
+        const res = await fetch(absUrl, { credentials: "include" });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        // 大附件用 ArrayBuffer 收 + 分块 base64，避免 String.fromCharCode 爆栈
+        const buf = await res.arrayBuffer();
+        if (buf.byteLength === 0) throw new Error("empty body");
+        const bytes = new Uint8Array(buf);
+        let binary = "";
+        const chunk = 0x8000;
+        for (let i = 0; i < bytes.length; i += chunk) {
+          binary += String.fromCharCode.apply(
+            null,
+            bytes.subarray(i, i + chunk) as unknown as number[],
+          );
+        }
+        const base64 = btoa(binary);
+
+        const mime = (res.headers.get("content-type") || "application/octet-stream").split(";")[0].trim();
+        // 文件名优先：从 Content-Disposition 抓；否则用 attachment id 兜底
+        const cd = res.headers.get("content-disposition") || "";
+        let fname: string | null = null;
+        // 兼容 RFC 5987 (filename*=UTF-8'') 与传统 filename="x"
+        const cdStar = /filename\*\s*=\s*[^']*''([^;]+)/i.exec(cd);
+        if (cdStar) {
+          try { fname = decodeURIComponent(cdStar[1].trim().replace(/^\"|\"$/g, "")); } catch { /* ignore */ }
+        }
+        if (!fname) {
+          const cdPlain = /filename\s*=\s*"?([^";]+)"?/i.exec(cd);
+          if (cdPlain) fname = cdPlain[1].trim();
+        }
+
+        const idMatch = /\/api\/attachments\/([^/?#]+)/i.exec(task.originalHref);
+        const key = idMatch ? `att-${idMatch[1]}` : await sha1Hex(base64).then((h) => h.slice(0, 10));
+        let relPath = registry.get(key);
+        if (!relPath) {
+          // 文件名清洗：从 Content-Disposition 拿到的也可能有非法字符
+          const safeFname = fname ? sanitizeFilename(fname) : "";
+          if (safeFname) {
+            relPath = `assets/${safeFname}`;
+          } else {
+            const ext = detectExtFromResponse(mime, task.originalHref);
+            relPath = `assets/${key}.${ext}`;
+          }
+          // 与图片同 registry：避免一个文件既被 <img> 又被 <a> 引用时重写两次
+          registry.set(key, relPath);
+          assets.push({ relPath, base64 });
+        }
+
+        const newHref = `./${relPath}`;
+        const rebuilt = `<a${task.beforeHref} href=${task.quote}${newHref}${task.quote}${task.afterHref}>`;
+        results[myIdx] = { task, rebuilt };
+        stats.ok++;
+      } catch (err) {
+        console.warn(
+          `[exportService] failed to download attachment for zip: ${task.originalHref}`,
+          err,
+        );
+        stats.failed++;
+        stats.failures.push({
+          src: task.originalHref,
+          noteId: noteContext?.noteId,
+          noteTitle: noteContext?.noteTitle,
+          error: err instanceof Error ? err.message : String(err),
+          phase: "download",
+        });
+        // 兜底：把死 host 剥成相对路径
+        const normalized = normalizeAttachmentSrc(task.originalHref);
+        if (normalized !== task.originalHref) {
+          const rebuilt = `<a${task.beforeHref} href=${task.quote}${normalized}${task.quote}${task.afterHref}>`;
+          results[myIdx] = { task, rebuilt };
+        }
+      }
+    }
+  }
+  await Promise.all(
+    Array.from({ length: Math.min(concurrency, tasks.length) }, () => worker()),
+  );
+
+  let out = html;
+  for (const r of results) {
+    if (!r) continue;
+    const idx = out.indexOf(r.task.fullMatch);
+    if (idx >= 0) {
+      out = out.slice(0, idx) + r.rebuilt + out.slice(idx + r.task.fullMatch.length);
+    }
+  }
+  return { html: out, assets };
+}
+
+// ============================================================================
   const td = new TurndownService({
     headingStyle: "atx",
     codeBlockStyle: "fenced",
@@ -635,7 +863,8 @@ export async function exportAllNotes(
     // 已写入 zip 的图片相对路径，避免重复写
     const writtenImages = new Set<string>();
     // 远程图片下载计数（成功 / 失败），最终给用户做个汇总
-    const imgStats = { ok: 0, failed: 0 };
+    // P0-2：同时收集失败明细（src + noteId + error），供 zip 根目录写出 export-warnings.json
+    const imgStats: ImgStats = { ok: 0, failed: 0, failures: [] };
 
     for (let i = 0; i < notes.length; i++) {
       const note = notes[i];
@@ -660,14 +889,20 @@ export async function exportAllNotes(
         extractedImages = r.images;
 
         // 再把指向 /api/attachments/<id> 的图片下载下来并替换 src
-        const r2 = await fetchRemoteImages(html, registry, imgStats);
+        const r2 = await fetchRemoteImages(html, registry, imgStats, { noteId: note.id, noteTitle: note.title });
         html = r2.html;
         extractedImages = extractedImages.concat(r2.images);
+
+        // P1-1：同步拉取本笔记中的非图附件（PDF / docx / 音视频等）
+        // 复用同一个 registry 与 imgStats：与图片共享去重与失败明细。
+        const r3 = await fetchRemoteAttachments(html, registry, imgStats, { noteId: note.id, noteTitle: note.title });
+        html = r3.html;
+        extractedImages = extractedImages.concat(r3.assets);
       } else if (inlineImages && html) {
         // inline 模式：把 /api/attachments/<id> 全部抓回来内嵌成 data URI，
         // 让重新导入时后端 extractInlineBase64Images 自动重建附件，避免
         // 旧 attachment id 在新数据库找不到导致的 404。
-        html = await inlineRemoteImages(html, imgStats);
+        html = await inlineRemoteImages(html, imgStats, { noteId: note.id, noteTitle: note.title });
       }
 
       // 转换为 Markdown
@@ -716,8 +951,26 @@ export async function exportAllNotes(
         exportedAt: new Date().toISOString(),
         totalNotes: total,
         notebooks: Array.from(folderCounts.entries()).map(([name, count]) => ({ name, count })),
+        // P0-2：汇总在 metadata 里，快速看总体；明细看 export-warnings.json
+        imageStats: { ok: imgStats.ok, failed: imgStats.failed },
       }, null, 2)
     );
+
+    // 3.1 如果有图片处理失败，写明细信息到 export-warnings.json，让用户能看到
+    // “哪些笔记的哪些图”失败了，而不是只看到一个“失败 N 张”的总数。
+    if (imgStats.failures.length > 0) {
+      zip.file(
+        "export-warnings.json",
+        JSON.stringify({
+          version: "1.0",
+          app: "nowen-note",
+          generatedAt: new Date().toISOString(),
+          summary: { ok: imgStats.ok, failed: imgStats.failed },
+          failures: imgStats.failures,
+          hint: "请检查：原始附件是否仍在（/api/attachments/<id>）、网络是否可用。导入到其它实例时可能出现这些图加载失败。",
+        }, null, 2)
+      );
+    }
 
     // 4. 生成 ZIP
     onProgress?.({ phase: "packing", current: total, total, message: i18n.t('export.generatingZip') });
@@ -828,7 +1081,8 @@ export async function exportNotebook(
     const folderCounts = new Map<string, number>();
     const perFolderRegistry = new Map<string, Map<string, string>>();
     const writtenImages = new Set<string>();
-    const imgStats = { ok: 0, failed: 0 };
+    // P0-2：与全量导出一致，收集失败明细供写 export-warnings.json
+    const imgStats: ImgStats = { ok: 0, failed: 0, failures: [] };
 
     for (let i = 0; i < notes.length; i++) {
       const note = notes[i];
@@ -848,13 +1102,19 @@ export async function exportNotebook(
         html = r.html;
         extractedImages = r.images;
 
-        const r2 = await fetchRemoteImages(html, registry, imgStats);
+        const r2 = await fetchRemoteImages(html, registry, imgStats, { noteId: note.id, noteTitle: note.title });
         html = r2.html;
         extractedImages = extractedImages.concat(r2.images);
+
+        // P1-1：同步拉取本笔记中的非图附件（PDF / docx / 音视频等）
+        // 复用同一个 registry 与 imgStats：与图片共享去重与失败明细。
+        const r3 = await fetchRemoteAttachments(html, registry, imgStats, { noteId: note.id, noteTitle: note.title });
+        html = r3.html;
+        extractedImages = extractedImages.concat(r3.assets);
       } else if (inlineImages && html) {
         // inline 模式：把 /api/attachments/<id> 全部抓回来内嵌成 data URI，
         // 见 inlineRemoteImages 注释。
-        html = await inlineRemoteImages(html, imgStats);
+        html = await inlineRemoteImages(html, imgStats, { noteId: note.id, noteTitle: note.title });
       }
 
       const markdown = html ? postProcessMarkdown(td.turndown(html)) : "";
@@ -897,8 +1157,27 @@ export async function exportNotebook(
         rootNotebookName: notebookName,
         totalNotes: total,
         notebooks: Array.from(folderCounts.entries()).map(([name, count]) => ({ name, count })),
+        imageStats: { ok: imgStats.ok, failed: imgStats.failed },
       }, null, 2)
     );
+
+    // P0-2：附上图片处理失败明细（与全量导出一致）
+    if (imgStats.failures.length > 0) {
+      zip.file(
+        "export-warnings.json",
+        JSON.stringify({
+          version: "1.0",
+          app: "nowen-note",
+          generatedAt: new Date().toISOString(),
+          scope: "notebook",
+          rootNotebookId: notebookId,
+          rootNotebookName: notebookName,
+          summary: { ok: imgStats.ok, failed: imgStats.failed },
+          failures: imgStats.failures,
+          hint: "请检查：原始附件是否仍在（/api/attachments/<id>）、网络是否可用。导入到其它实例时可能出现这些图加载失败。",
+        }, null, 2)
+      );
+    }
 
     onProgress?.({ phase: "packing", current: total, total, message: i18n.t('export.generatingZip') });
     const blob = await zip.generateAsync(
@@ -958,8 +1237,8 @@ export async function exportSingleNote(
       extractedImages = r.images;
 
       // 同样把 /api/attachments/<id> 的图片一起拉下来
-      const stats = { ok: 0, failed: 0 };
-      const r2 = await fetchRemoteImages(html, registry, stats);
+      const stats: ImgStats = { ok: 0, failed: 0, failures: [] };
+      const r2 = await fetchRemoteImages(html, registry, stats, { noteId: note.id, noteTitle: note.title });
       html = r2.html;
       extractedImages = extractedImages.concat(r2.images);
       if (stats.failed > 0) {
@@ -967,8 +1246,8 @@ export async function exportSingleNote(
       }
     } else if (inlineImages && html) {
       // inline 模式：把附件内嵌成 data URI，让二次导入时后端自动重建附件
-      const stats = { ok: 0, failed: 0 };
-      html = await inlineRemoteImages(html, stats);
+      const stats: ImgStats = { ok: 0, failed: 0, failures: [] };
+      html = await inlineRemoteImages(html, stats, { noteId: note.id, noteTitle: note.title });
       if (stats.failed > 0) {
         console.warn(`[exportSingleNote] ${stats.failed} image(s) failed to inline; src normalized to relative path.`);
       }
@@ -1036,7 +1315,7 @@ async function buildPrintableHtml(note: {
 }): Promise<string> {
   let html = noteContentToHtml(note.content, note.contentText);
   // 把 /api/attachments/<id> 全部 inline 成 data URI（避免新窗口加载失败、canvas tainted）
-  const stats = { ok: 0, failed: 0 };
+  const stats: ImgStats = { ok: 0, failed: 0, failures: [] };
   html = await inlineRemoteImages(html, stats);
 
   const safeTitle = (note.title || i18n.t('common.untitledNote'))

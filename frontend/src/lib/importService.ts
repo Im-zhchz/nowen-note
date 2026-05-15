@@ -413,9 +413,69 @@ function deriveNotebookPath(path: string, outerFolderName?: string): string[] {
 
 // 从 ZIP 文件中读取笔记
 export async function readMarkdownFromZip(file: File): Promise<ImportFileInfo[]> {
+  const r = await readMarkdownFromZipWithMeta(file);
+  return r.files;
+}
+
+/**
+ * P1-2：从导出 zip 里同时拿到笔记 + metadata.json 内容。
+ *
+ * 旧 `readMarkdownFromZip` 只返回 ImportFileInfo[]，丢弃了 metadata.json 里
+ * `rootNotebookId / rootNotebookName / scope` 等信息——这些信息在"把同一份
+ * 备份导回原笔记本"的场景里非常有用：DataManager 可据此自动预选目标笔记本，
+ * 而不是每次都把内容塞进默认的"导入的笔记"。
+ *
+ * 设计取舍：
+ *   - 不强行把 metadata.json 暴露到 ImportFileInfo 里，保持原数据结构稳定；
+ *   - 旧调用方 `readMarkdownFromZip` 行为不变（continue 跳过 metadata.json）；
+ *   - 新调用方走 `readMarkdownFromZipWithMeta`，按需消费 metadata。
+ *
+ * metadata 字段说明（与 exportService 一致）：
+ *   { version, app, exportedAt,
+ *     scope?: "notebook" | undefined,           // 仅 exportNotebook 设置
+ *     rootNotebookId?: string,                  // 仅 exportNotebook 设置
+ *     rootNotebookName?: string,                // 仅 exportNotebook 设置
+ *     totalNotes: number,
+ *     notebooks: { name, count }[],
+ *     imageStats?: { ok, failed }                // 新增字段，旧包没有
+ *   }
+ */
+export interface ZipImportMeta {
+  version?: string;
+  app?: string;
+  exportedAt?: string;
+  scope?: string;
+  rootNotebookId?: string;
+  rootNotebookName?: string;
+  totalNotes?: number;
+  notebooks?: Array<{ name: string; count: number }>;
+  imageStats?: { ok: number; failed: number };
+}
+
+export async function readMarkdownFromZipWithMeta(
+  file: File,
+): Promise<{ files: ImportFileInfo[]; meta: ZipImportMeta | null }> {
   const JSZip = (await import("jszip")).default;
   const zip = await JSZip.loadAsync(file);
   const result: ImportFileInfo[] = [];
+
+  // P1-2：先试读 metadata.json（如果是本应用导出的 zip，根目录会有）
+  let meta: ZipImportMeta | null = null;
+  const metaEntry = zip.file("metadata.json");
+  if (metaEntry) {
+    try {
+      const text = await metaEntry.async("text");
+      const parsed = JSON.parse(text) as ZipImportMeta;
+      // 轻量边界检查：只认可 nowen-note 自家导出的 metadata，避免被外部 zip
+      // 中的同名文件误认（用户可能上传个包含 metadata.json 的项目压缩包）。
+      if (parsed && parsed.app === "nowen-note") {
+        meta = parsed;
+      }
+    } catch (e) {
+      // 解析失败不中断导入，仅告知调用方 meta=null
+      console.warn("解析 metadata.json 失败，将忽略该文件：", e);
+    }
+  }
 
   // 用 zip 文件名（去掉 .zip 扩展）作为最外层笔记本名，保证"导出前的顶层目录"在导入后依然存在
   const rawZipBase = (file.name || "archive.zip").replace(/\.zip$/i, "");
@@ -447,6 +507,7 @@ export async function readMarkdownFromZip(file: File): Promise<ImportFileInfo[]>
     if (zipEntry.dir) continue;
     if (!isSupportedFile(path)) continue;
     if (path === "metadata.json") continue;
+    if (path === "export-warnings.json") continue;
     // 跳过 macOS 资源文件
     if (path.includes("__MACOSX") || path.startsWith(".")) continue;
 
@@ -487,7 +548,7 @@ export async function readMarkdownFromZip(file: File): Promise<ImportFileInfo[]>
     }
   }
 
-  return result;
+  return { files: result, meta };
 }
 
 // 从 YAML frontmatter 中提取日期信息
