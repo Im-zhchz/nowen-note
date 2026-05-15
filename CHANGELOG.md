@@ -12,6 +12,28 @@
 
 <!-- ADD_NEW_HERE -->
 
+## v1.1.0 - 2026-05-15
+
+### ✨ 新增
+
+- enhance FileManager, SharedNoteView, clipboard & image host formats (ae28579)
+
+### 🐛 修复
+
+- **backend**: Buffer→Uint8Array<ArrayBuffer> 拷贝包装，彻底兼容 TS 5.7 类型 (ac1cd51)
+- **backend**: 改用 Hono c.body() 替代 new Response()，彻底绕开 BodyInit 类型摩擦 (25ace00)
+- **backend**: TS 5.7+ 下用 Blob 包装 Response body 修 BodyInit 不兼容 (51ca0c2)
+- **backend**: 修复 attachments 缩略图 Response 在新版 TS 下的 BodyInit 类型错 (d5daecb)
+- **mobile**: 优化移动端导航与任务中心布局 (592b18e)
+- **share**: 路由正则支持 base64url 字符集；评论/分享/文件管理等多项改动 (6760199)
+- **share**: 分享页图片在 IP+自定义端口部署上 https 误判导致全部 ERR (6139c1a)
+- **release**: 发布时同步 bump backend/package.json 的 version (d73b747)
+
+### 📝 文档
+
+- 更新 README 用桌面端/移动端/AI 设置展示截图 (9865c92)
+
+
 ## Unreleased
 
 ### ✨ 新增
