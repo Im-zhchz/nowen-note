@@ -19,6 +19,7 @@
     "jsonwebtoken": "^9.0.3",
     "jszip": "^3.10.1",
     "mammoth": "^1.11.0",
+    "sharp": "^0.33.5",
     "sqlite-vec": "^0.1.9",
     "unpdf": "^1.6.2",
     "uuid": "^11.0.5",

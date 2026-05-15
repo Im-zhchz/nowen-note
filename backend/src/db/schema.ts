@@ -322,10 +322,24 @@ function initSchema(db: Database.Database) {
     CREATE INDEX IF NOT EXISTS idx_note_versions_note ON note_versions(noteId, version DESC);
 
     -- 评论批注表
+    --
+    -- userId 的语义（v13 起放松为可空）：
+    --   - 非 NULL：登录用户评论，可 JOIN users 拿用户名/头像；
+    --   - NULL  ：未登录访客评论（公开分享 + comment 权限），用 guestName 显示。
+    --
+    -- 用户被删除时：原先 ON DELETE CASCADE 会把该用户写过的所有评论一起清掉，
+    --   但分享场景下"用户注销"不应该让公开分享下的对话历史消失（笔记主和其他
+    --   访客已经看过的留言不应该突然蒸发）。改为 ON DELETE SET NULL：用户被删
+    --   后该评论变成"匿名访客"，guestName 字段（若有）作为兜底显示名。
+    --
+    -- guestIpHash 仅用于反垃圾（频次限制 / 屏蔽），不暴露给前端；存 SHA-256 hex
+    --   而非明文 IP，符合最小化数据收集原则。
     CREATE TABLE IF NOT EXISTS share_comments (
       id TEXT PRIMARY KEY,
       noteId TEXT NOT NULL,
-      userId TEXT NOT NULL,
+      userId TEXT,
+      guestName TEXT,
+      guestIpHash TEXT,
       parentId TEXT,
       content TEXT NOT NULL,
       anchorData TEXT,
@@ -333,11 +347,16 @@ function initSchema(db: Database.Database) {
       createdAt TEXT NOT NULL DEFAULT (datetime('now')),
       updatedAt TEXT NOT NULL DEFAULT (datetime('now')),
       FOREIGN KEY (noteId) REFERENCES notes(id) ON DELETE CASCADE,
-      FOREIGN KEY (userId) REFERENCES users(id) ON DELETE CASCADE,
+      FOREIGN KEY (userId) REFERENCES users(id) ON DELETE SET NULL,
       FOREIGN KEY (parentId) REFERENCES share_comments(id) ON DELETE CASCADE
     );
 
     CREATE INDEX IF NOT EXISTS idx_share_comments_note ON share_comments(noteId);
+    -- 注意：idx_share_comments_guest_ip 不在这里建。
+    -- 原因：老库（v12 之前）已经有 share_comments 表但没有 guestIpHash 列，
+    --       CREATE TABLE IF NOT EXISTS 会跳过重建，紧接着对不存在的列建索引会让
+    --       整个 db.exec() 段失败，连带 v13 迁移都没机会跑。
+    -- 索引由 migrations.ts v13 在表重建/列补齐之后再建（且对新装库幂等）。
 
     -- 全文搜索虚拟表
     CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(

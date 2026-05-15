@@ -142,6 +142,15 @@ export default function ShareModal({ noteId, noteTitle, onClose }: ShareModalPro
     view: "仅查看",
     comment: "可评论",
     edit: "可编辑",
+    edit_auth: "可编辑（需登录）",
+  };
+
+  // 权限说明（用于按钮 title 提示），让用户清楚每档语义
+  const permissionTitles: Record<SharePermission, string> = {
+    view: "访客仅能阅读笔记内容",
+    comment: "访客填昵称即可留言；评论对所有访客可见（留言板模式）",
+    edit: "任何人填昵称即可编辑笔记，无需注册",
+    edit_auth: "需登录账号才能编辑；未登录用户访问会被引导跳转登录页",
   };
 
   const expiresOptions = [
@@ -195,15 +204,16 @@ export default function ShareModal({ noteId, noteTitle, onClose }: ShareModalPro
 
             <div className="space-y-3">
               {/* 权限选择 */}
-              <div className="flex items-center gap-2">
-                <label className="text-xs text-tx-tertiary w-16 shrink-0">权限</label>
-                <div className="flex gap-1.5 flex-1">
-                  {(["view", "comment", "edit"] as SharePermission[]).map((p) => (
+              <div className="flex items-start gap-2">
+                <label className="text-xs text-tx-tertiary w-16 shrink-0 mt-1.5">权限</label>
+                <div className="grid grid-cols-2 gap-1.5 flex-1">
+                  {(["view", "comment", "edit", "edit_auth"] as SharePermission[]).map((p) => (
                     <button
                       key={p}
                       onClick={() => setPermission(p)}
+                      title={permissionTitles[p]}
                       className={cn(
-                        "px-3 py-1.5 text-xs rounded-lg border transition-colors flex-1",
+                        "px-3 py-1.5 text-xs rounded-lg border transition-colors",
                         permission === p
                           ? "bg-accent-primary/10 border-accent-primary/30 text-accent-primary font-medium"
                           : "border-app-border text-tx-tertiary hover:bg-app-hover hover:text-tx-secondary"
@@ -350,12 +360,15 @@ function ShareItem({
     view: "bg-blue-500/10 text-blue-500",
     comment: "bg-amber-500/10 text-amber-500",
     edit: "bg-green-500/10 text-green-500",
+    // edit_auth：与 edit 区分一下（紫色），暗示"门槛更高"
+    edit_auth: "bg-purple-500/10 text-purple-500",
   };
 
   const permissionLabels: Record<string, string> = {
     view: "仅查看",
     comment: "可评论",
     edit: "可编辑",
+    edit_auth: "需登录编辑",
   };
 
   const formatDate = (date: string) => {

@@ -27,6 +27,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { motion, AnimatePresence } from "framer-motion";
 import {
   Upload,
+  UploadCloud,
   X,
   Trash2,
   Search,
@@ -133,9 +134,19 @@ function formatLocalTime(s: string): string {
 /**
  * UI 侧的分类 Tab 值。在 FileCategory（"image" | "file"）基础上额外加：
  *   - "all"          全部（不传 category / filter）
+ *   - "myUploads"    我的上传（用户从文件管理页直接上传的附件，
+ *                    实现上 = attachments.noteId 指向 holder note）
  *   - "unreferenced" 孤儿视图（走 filter=unreferenced，category 不参与）
  */
-type CategoryFilter = "all" | FileCategory | "unreferenced";
+type CategoryFilter = "all" | FileCategory | "myUploads" | "unreferenced";
+
+/**
+ * "我的上传"内部的二级子筛选。仅在 category="myUploads" 时生效。
+ *   - "all"          ：我的上传全部
+ *   - "referenced"   ：已经被任意笔记引用过的
+ *   - "unreferenced" ：还没被任何笔记引用过的
+ */
+type MyUploadsRefFilter = "all" | "referenced" | "unreferenced";
 
 const SORT_OPTIONS: Array<{ value: FileSortKey; label: string }> = [
   { value: "created_desc", label: "最新上传" },
@@ -146,7 +157,82 @@ const SORT_OPTIONS: Array<{ value: FileSortKey; label: string }> = [
   { value: "name_desc", label: "名称 Z→A" },
 ];
 
-const PAGE_SIZE = 60;
+// ---------------------------------------------------------------------------
+// 分页大小（每页条数）
+// ---------------------------------------------------------------------------
+// - 默认 10：与笔记列表 / 任务列表的视觉密度对齐，首屏更轻；
+// - 提供 10 / 20 / 50 / 100 四档，覆盖"日常翻阅"到"批量整理"的全频谱；
+// - 用户选择会持久化到 localStorage（per-device），避免每次进文件管理都要重选；
+// - 切档时回到第 1 页（避免在第 5 页/小档切到大档后落到一个空页）。
+const PAGE_SIZE_OPTIONS = [10, 20, 50, 100] as const;
+const DEFAULT_PAGE_SIZE = 10;
+const PAGE_SIZE_STORAGE_KEY = "nowen.fileManager.pageSize";
+
+/** 从 localStorage 读出上次选择的 pageSize；非法/缺失时回退默认值。 */
+function readStoredPageSize(): number {
+  if (typeof window === "undefined") return DEFAULT_PAGE_SIZE;
+  try {
+    const raw = window.localStorage.getItem(PAGE_SIZE_STORAGE_KEY);
+    if (!raw) return DEFAULT_PAGE_SIZE;
+    const n = Number.parseInt(raw, 10);
+    if (PAGE_SIZE_OPTIONS.includes(n as (typeof PAGE_SIZE_OPTIONS)[number])) {
+      return n;
+    }
+    return DEFAULT_PAGE_SIZE;
+  } catch {
+    return DEFAULT_PAGE_SIZE;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 列表缓存（v12 性能优化）
+// ---------------------------------------------------------------------------
+// 背景：
+//   翻页 / 切分类 / 搜索后再切回来时，原本每次都打一次后端 API。在图床场景下
+//   后端要做 JOIN notes/notebooks + COUNT，加上 stats 也要全表统计，单页响应
+//   通常 80~250ms。一个简单的 30s TTL 缓存就能把"切回上一页"做到秒开。
+//
+// 策略：
+//   - 模块级 Map（FileManager 实例销毁后下次进来仍然命中，体感更好）；
+//   - cacheKey 是 list 的所有筛选参数 + workspace 作用域 + isImageHostMode；
+//   - TTL 30s：足够覆盖典型"翻页 → 看图 → 切回上一页"的窗口；
+//   - 写动作（删除 / 上传 / 重命名）会调用 invalidateFileListCache() 清空，
+//     避免显示陈旧数据。
+//   - "孤儿"视图（filter=unreferenced）也走缓存，符合预期：30s 内一次扫描结果。
+//
+// 不上 react-query 的取舍：项目 api.ts 没用任何数据获取库，引入 react-query
+//   要在多个组件里同时改造才一致；当前只为这一处优化引入大依赖不划算。
+interface CachedListEntry {
+  items: FileItem[];
+  total: number;
+  ts: number;
+}
+const fileListCache = new Map<string, CachedListEntry>();
+const FILE_LIST_CACHE_TTL_MS = 30_000;
+
+function readFileListCache(key: string): CachedListEntry | null {
+  const entry = fileListCache.get(key);
+  if (!entry) return null;
+  if (Date.now() - entry.ts > FILE_LIST_CACHE_TTL_MS) {
+    fileListCache.delete(key);
+    return null;
+  }
+  return entry;
+}
+
+function writeFileListCache(key: string, value: CachedListEntry): void {
+  // 软上限：超过 64 个 key 时整体清空（图床场景翻页参数组合有限，
+  // 64 已经远超日常操作）。LRU 不值得为这点收益引入。
+  if (fileListCache.size > 64) fileListCache.clear();
+  fileListCache.set(key, value);
+}
+
+/** 任何修改附件的操作（删除 / 上传 / 重命名）都应调用这个函数，避免读到陈旧列表。 */
+function invalidateFileListCache(): void {
+  fileListCache.clear();
+}
+
+
 
 export default function FileManager() {
   const { state } = useApp();
@@ -158,15 +244,23 @@ export default function FileManager() {
   const [stats, setStats] = useState<FileStats | null>(null);
   const [loading, setLoading] = useState(true);
   const [page, setPage] = useState(1);
+  // 每页条数：默认 10，从 localStorage 恢复上次选择，跨会话保留。
+  const [pageSize, setPageSize] = useState<number>(() => readStoredPageSize());
 
   // 筛选 / 搜索
   const [category, setCategory] = useState<CategoryFilter>("all");
+  // "我的上传"内部的二级子筛选；仅在 category === "myUploads" 时参与请求。
+  // 切到非 myUploads 主 tab 时不重置——下次回到"我的上传"还能保持上次的子筛选选择。
+  const [myUploadsRef, setMyUploadsRef] = useState<MyUploadsRefFilter>("all");
   const [sort, setSort] = useState<FileSortKey>("created_desc");
   const [searchInput, setSearchInput] = useState("");
   const [searchQuery, setSearchQuery] = useState(""); // debounced
 
-  // 视图模式：图片分类默认 grid；文件分类默认 list；"all" 跟随上次选择
-  const [viewMode, setViewMode] = useState<"grid" | "list">("grid");
+  // 视图模式：文件管理默认 list（信息密度高、文件名 / 时间 / 大小一目了然，
+  //          普通用户进文件管理多半是来"找一个具体文件"的，列表更高效）；
+  //          切到"图片"分类时会自动跳 grid（见 handleCategoryChange）；
+  //          图床模式下强制 grid（见 toggleImageHostMode）。
+  const [viewMode, setViewMode] = useState<"grid" | "list">("list");
 
   // 图床模式（Image Host）：
   //   特化的 UI 子模式，专门服务于"把笔记附件当外链图床用"的场景。
@@ -244,42 +338,79 @@ export default function FileManager() {
 
   // ---- 拉列表（受 category / sort / searchQuery / page 驱动）----
   const loadList = useCallback(async () => {
+    // v12：客户端 30s TTL 缓存。命中即跳过 API 调用，秒开翻页。
+    // cacheKey 包含全部筛选维度 + workspace + 图床模式，保证不同场景互不串台。
+    const cacheKey = JSON.stringify({
+      c: category,
+      // 仅在 myUploads tab 下子筛选才有意义；其他 tab 固定写空串避免污染 key
+      mur: category === "myUploads" ? myUploadsRef : "",
+      s: sort,
+      q: searchQuery,
+      p: page,
+      ps: pageSize,
+      ihm: isImageHostMode,
+      // 工作区切换会重新 mount FileManager，理论上 cache 跟着销毁，
+      // 但模块级 Map 跨实例存活——把当前 workspace 加进 key 防误命中。
+      // 直接读取 store 在这里不方便，简单起见用 location 作为代理（已包含 workspace 路径）。
+      // 如果路由没把 workspace 放进 path 也没关系，30s TTL 自然降级。
+      ws: typeof window !== "undefined" ? window.location.pathname : "",
+    });
+    const cached = readFileListCache(cacheKey);
+    if (cached) {
+      setItems(cached.items);
+      setTotal(cached.total);
+      setLoading(false);
+      return;
+    }
+
     setLoading(true);
     try {
-      // category="unreferenced" 是 UI 上的伪分类，实际走后端 filter=unreferenced，
-      // 真正的 category 维度不参与（保持"孤儿"视图包含全部 MIME）。
+      // category="unreferenced" / "myUploads" 都是 UI 上的伪分类，实际走后端 filter=...，
+      // 真正的 category 维度不参与（孤儿视图保持包含全部 MIME；我的上传同理，
+      // 用户上传过的可能既有图也有文件）。
+      // v14：图床模式下不再强制 category=image——图床定位扩展为"任意文件的外链分享"，
+      //      用户可能要把 zip / pdf 也传上来发链接给别人下载。tab 切换由用户自主决定。
       const isOrphan = category === "unreferenced";
+      const isMyUploads = category === "myUploads";
+      const apiFilter = isOrphan
+        ? ("unreferenced" as const)
+        : isMyUploads
+          ? ("myUploads" as const)
+          : undefined;
+      const apiCategory =
+        isOrphan || isMyUploads
+          ? undefined
+          : category === "all"
+            ? undefined
+            : (category as FileCategory);
       const res = await api.files.list({
-        category: isOrphan ? undefined : category === "all" ? undefined : (category as FileCategory),
-        filter: isOrphan ? "unreferenced" : undefined,
+        category: apiCategory,
+        filter: apiFilter,
+        myUploadsRef:
+          isMyUploads && myUploadsRef !== "all" ? myUploadsRef : undefined,
         q: searchQuery || undefined,
         sort,
         page,
-        pageSize: PAGE_SIZE,
+        pageSize,
       });
-      // 图床模式 + 未引用 tab：后端 filter=unreferenced 会把所有 MIME 的孤儿都返回，
-      // 前端把非 image 过滤掉，保持"图床里看到的全是图片"的体感一致。
-      // total 同步只算过滤后的——避免分页器显示一个大于实际可见项的"假总数"。
-      // 注意：因为是单页过滤，跨页计数可能小于真实未引用图片总数，但这是可接受的
-      //       近似，且 unreferenced 通常数量不大。
-      const filteredItems =
-        isImageHostMode && isOrphan
-          ? res.items.filter((it) => it.category === "image")
-          : res.items;
-      const filteredTotal =
-        isImageHostMode && isOrphan
-          ? // 估算：用过滤比例换算总数，避免分页器跳变
-            Math.round((filteredItems.length / Math.max(1, res.items.length)) * res.total)
-          : res.total;
-      setItems(filteredItems);
-      setTotal(filteredTotal);
+      // v13：图床模式下对"我的上传/未引用"也走 category=image，由后端直接收口，
+      //       前端不再做二次过滤——total 就是真实可分页数，分页器不会跳变。
+      //       早期版本（仅 unreferenced 时）做客户端过滤是因为后端 filter=unreferenced
+      //       不接受 category，今天后端两个维度可同时生效，这段 dead path 已去除。
+      setItems(res.items);
+      setTotal(res.total);
+      writeFileListCache(cacheKey, {
+        items: res.items,
+        total: res.total,
+        ts: Date.now(),
+      });
     } catch (err: any) {
       console.error("[FileManager] list failed:", err);
       toast.error(err?.message || "加载文件列表失败");
     } finally {
       setLoading(false);
     }
-  }, [category, sort, searchQuery, page, isImageHostMode]);
+  }, [category, myUploadsRef, sort, searchQuery, page, pageSize, isImageHostMode]);
 
   useEffect(() => {
     loadList();
@@ -309,6 +440,8 @@ export default function FileManager() {
       toast.success(
         `已清理 ${res.totalRemovedItems} 个附件，释放 ${humanSize(res.totalFreedBytes)}`,
       );
+      // v12：清列表缓存（孤儿被删了，缓存里还在的话翻页会出现裂图）
+      invalidateFileListCache();
       // 清理后刷新：列表 + 统计 + 可回收徽标
       setPage(1);
       loadList();
@@ -337,6 +470,8 @@ export default function FileManager() {
     };
     // 跨组件的"空间占用变了"通知（清空回收站 / 数据库维护 等场景发）
     const onStorage = () => {
+      // v12：外部事件可能伴随附件被删，必须清缓存避免拿到陈旧条目
+      invalidateFileListCache();
       loadStats();
       loadReclaimable();
       loadList();
@@ -353,11 +488,17 @@ export default function FileManager() {
   const handleCategoryChange = useCallback((c: CategoryFilter) => {
     setCategory(c);
     setPage(1);
-    // 切到"文件"分类时默认列表视图；"图片" / "全部" / "孤儿"默认网格视图。
+    // 切到"文件"分类时默认列表视图；"图片" / "全部" / "我的上传" / "孤儿"默认网格视图。
     // 用户在同一分类里手动切换了视图就不再被覆盖（放在 effect 依赖外）。
-    if (c === "file") setViewMode("list");
-    else setViewMode("grid");
-  }, []);
+    // **图床例外**：图床整体锁 grid（顶栏视图切换按钮也是隐藏的），所以这里跳过自动切。
+    if (!isImageHostMode) {
+      if (c === "file") setViewMode("list");
+      else setViewMode("grid");
+    }
+    // 进入"我的上传"时，子筛选总是从"全部"开始；保留旧值会让"刚切过来就只看到一种"
+    // 与用户预期不符。离开 myUploads 时不需要重置，下次进来还是从全部开始。
+    if (c === "myUploads") setMyUploadsRef("all");
+  }, [isImageHostMode]);
 
   // ---- 详情加载 ----
   const openDetail = useCallback(async (id: string) => {
@@ -401,6 +542,8 @@ export default function FileManager() {
         // 本地列表即时剔除（让 UI 立刻有反馈，不等接口往返）
         setItems((prev) => prev.filter((it) => it.id !== id));
         setTotal((t) => Math.max(0, t - 1));
+        // v12：清缓存，避免 loadList 命中陈旧条目
+        invalidateFileListCache();
         loadStats();
         loadReclaimable();
         // 关键：删除后必须重新拉当前页，把"被删项后面的"那一项从第 N+1 项
@@ -441,6 +584,8 @@ export default function FileManager() {
           prev.map((it) => (it.id === id ? { ...it, filename: finalName } : it)),
         );
         setDetail((prev) => (prev && prev.id === id ? { ...prev, filename: finalName } : prev));
+        // v12：清列表缓存——文件名变了，缓存里仍是老名字会与 UI 不一致
+        invalidateFileListCache();
         if (!res.unchanged) toast.success("已重命名");
         return true;
       } catch (err: any) {
@@ -530,6 +675,8 @@ export default function FileManager() {
           `已删除 ${res.deleted} 个，${res.failed.length} 个失败：${res.failed[0].reason}${res.failed.length > 1 ? " 等" : ""}`,
         );
       }
+      // v12：清列表缓存，避免下一次 loadList 命中陈旧（含已删项）的列表
+      invalidateFileListCache();
       loadStats();
       loadReclaimable();
       // 关键：与单删一致——删除后必须重新拉当前页，把后续页的项顶上来，
@@ -553,7 +700,7 @@ export default function FileManager() {
   // 体验上保留集合也容易让用户产生"幽灵勾选"。统一在这些维度变化时清空。
   useEffect(() => {
     setSelectedIds(new Set());
-  }, [category, sort, searchQuery, page]);
+  }, [category, myUploadsRef, sort, searchQuery, page]);
 
   // ---- 上传 ----
   const handleUpload = useCallback(
@@ -576,6 +723,8 @@ export default function FileManager() {
       setUploading(false);
       if (ok > 0) {
         toast.success(`已上传 ${ok} 个文件${fail > 0 ? `，失败 ${fail}` : ""}`);
+        // v12：清列表缓存，确保新上传的文件能立刻出现
+        invalidateFileListCache();
         // 重新拉首屏 + 刷统计 + 刷可回收徽标（刚上传可能让旧孤儿的"宽限期"外延）
         setPage(1);
         loadList();
@@ -627,8 +776,9 @@ export default function FileManager() {
 
   // ---- 图床模式开关 ----
   //
-  // 进入：强制 category=image / viewMode=grid，回到第 1 页（避免在"文件"分页里残留页码）。
-  // 退出：回到 "all" 分类，view 由用户上次手动状态决定（保持 grid 不变）。
+  // 进入：默认看"全部"，强制 viewMode=grid（图床的核心交互是缩略图 + 复制直链），
+  //       回到第 1 页（避免在"文件"分页里残留页码）。
+  // 退出：保持当前 category 不变（用户可能本来在浏览"图片"），view 由用户上次手动状态决定。
   // 两个方向都清空多选，避免状态混乱。
   const toggleImageHostMode = useCallback(() => {
     setIsImageHostMode((prev) => {
@@ -637,10 +787,9 @@ export default function FileManager() {
       setSelectionMode(false);
       setPage(1);
       if (next) {
-        setCategory("image");
-        setViewMode("grid");
-      } else {
+        // 进入图床：默认"全部"——图床承载图片+文件两类资源的外链分享
         setCategory("all");
+        setViewMode("grid");
       }
       return next;
     });
@@ -751,8 +900,15 @@ export default function FileManager() {
   // 所以这里走 fetch → blob → createObjectURL → 临时 <a download> 触发，
   // 兼容所有 MIME 且能保留用户上传时的原始 filename。
   const [downloadingId, setDownloadingId] = useState<string | null>(null);
+  // 用 ref 同步 downloadingId 的最新值，避免 downloadItem useCallback 依赖
+  // downloadingId 状态——否则每次开始/结束下载 downloadItem 引用都会变，
+  // 进而打穿 GridCard 的 React.memo，触发 60+ 张卡全部重渲。
+  const downloadingIdRef = useRef<string | null>(null);
+  useEffect(() => {
+    downloadingIdRef.current = downloadingId;
+  }, [downloadingId]);
   const downloadItem = useCallback(async (item: { id: string; filename: string; url: string }) => {
-    if (downloadingId === item.id) return;
+    if (downloadingIdRef.current === item.id) return;
     setDownloadingId(item.id);
     try {
       const res = await fetch(resolveAttachmentUrl(item.url));
@@ -773,12 +929,29 @@ export default function FileManager() {
     } finally {
       setDownloadingId((id) => (id === item.id ? null : id));
     }
-  }, [downloadingId]);
+  }, []);
+
 
 
 
   // 分页控件相关
-  const pageCount = Math.max(1, Math.ceil(total / PAGE_SIZE));
+  const pageCount = Math.max(1, Math.ceil(total / pageSize));
+
+  // 切换每页条数：
+  //   - 持久化到 localStorage（per-device 偏好）
+  //   - 回到第 1 页：避免在第 N 页（小档）切到大档后页码越界落到空页
+  //   - 不清空多选：保留用户已有勾选 id（即便它们落到不同页也能在选择栏看到计数）
+  const handlePageSizeChange = useCallback((next: number) => {
+    setPageSize(next);
+    setPage(1);
+    if (typeof window !== "undefined") {
+      try {
+        window.localStorage.setItem(PAGE_SIZE_STORAGE_KEY, String(next));
+      } catch {
+        /* 隐私模式下 setItem 可能抛异常——忽略，仅本会话生效 */
+      }
+    }
+  }, []);
 
   // 空态文案：区分"一张没有" vs "当前筛选无结果"
   const isFirstPageNoResults = !loading && items.length === 0 && page === 1;
@@ -820,7 +993,7 @@ export default function FileManager() {
             </h2>
             <p className="text-[11px] text-tx-tertiary leading-none mt-0.5">
               {isImageHostMode
-                ? "上传图片即得直链 · 支持复制 URL / Markdown / HTML"
+                ? "上传图片 / 文件即得直链 · 支持复制 URL / Markdown / HTML"
                 : statsLine || "\u00A0"}
             </p>
           </div>
@@ -840,7 +1013,7 @@ export default function FileManager() {
             isImageHostMode &&
               "bg-indigo-500 hover:bg-indigo-600 text-white border-indigo-500",
           )}
-          title={isImageHostMode ? "退出图床" : "进入图床（图片专区 + 直链复制）"}
+          title={isImageHostMode ? "退出图床" : "进入图床（外链分享 · 图片与文件直链）"}
         >
           <Globe size={14} className="mr-1" />
           {isImageHostMode ? "退出图床" : "图床"}
@@ -918,16 +1091,14 @@ export default function FileManager() {
 
         <Button size="sm" onClick={onPickFiles} disabled={uploading} className="shrink-0">
           {uploading ? <Loader2 size={14} className="animate-spin mr-1" /> : <Upload size={14} className="mr-1" />}
-          {uploading ? "上传中" : isImageHostMode ? "上传图片" : "上传文件"}
+          {uploading ? "上传中" : "上传文件"}
         </Button>
         <input
           ref={fileInputRef}
           type="file"
           multiple
-          // 图床模式下点击文件选择器只允许选图片（限制 MIME，提示更明确）。
-          // 注意：accept 是"建议"而非强制——拖拽 / 粘贴板进来的非图片文件后端依旧会接收，
-          //        所以此处只是改善文件选择器体验，不依赖它做安全过滤。
-          accept={isImageHostMode ? "image/*" : undefined}
+          // 图床支持任意类型——图片 / 压缩包 / PDF 等都能拿到公开直链分享给他人下载，
+          // 不再限制 accept。
           className="hidden"
           onChange={onFileInputChange}
         />
@@ -936,18 +1107,21 @@ export default function FileManager() {
       {/* 工具条：分类 / 搜索 / 排序 */}
       <div className="flex flex-wrap items-center gap-2 px-4 md:px-6 py-2 border-b border-app-border bg-app-surface/20">
         {/* 分类 Tabs：
-            - 普通模式：4 个 tab（全部/图片/文件/孤儿）
-            - 图床模式：固定 category=image，原本的"全部/图片/文件"切换没意义，
-              只保留"全部图片 / 未引用图片"两个快捷过滤——后者复用孤儿 tab 的语义，
-              方便用户清理图床里没被任何笔记引用的"野图"。 */}
+            - 普通模式：5 个 tab（全部 / 图片 / 文件 / 我的上传 / 孤儿）
+            - 图床模式：与普通模式同构，但"孤儿"改名为"未引用"——更贴合图床场景
+              （图床里这一类多是用户传上去专门发外链的、本就不需要被笔记引用的资源，
+              "孤儿"措辞略带贬义，"未引用"更中性）。 */}
         <div className="flex items-center gap-1 text-xs">
           {(isImageHostMode
             ? ([
+                { key: "all", label: "全部", count: stats?.total ?? 0, icon: <Filter size={12} /> },
+                { key: "image", label: "图片", count: stats?.images.count ?? 0, icon: <ImageIcon size={12} /> },
+                { key: "file", label: "文件", count: stats?.files.count ?? 0, icon: <FileText size={12} /> },
                 {
-                  key: "image",
-                  label: "全部图片",
-                  count: stats?.images.count ?? 0,
-                  icon: <ImageIcon size={12} />,
+                  key: "myUploads",
+                  label: "我的上传",
+                  count: stats?.myUploads?.total ?? 0,
+                  icon: <UploadCloud size={12} />,
                 },
                 {
                   key: "unreferenced",
@@ -960,6 +1134,14 @@ export default function FileManager() {
                 { key: "all", label: "全部", count: stats?.total ?? 0, icon: <Filter size={12} /> },
                 { key: "image", label: "图片", count: stats?.images.count ?? 0, icon: <ImageIcon size={12} /> },
                 { key: "file", label: "文件", count: stats?.files.count ?? 0, icon: <FileText size={12} /> },
+                // 我的上传：用户从文件管理页直接上传的文件（≠ 编辑器粘贴的）。
+                // 选中后下面会显示二级子 tab（全部 / 已引用 / 未引用）。
+                {
+                  key: "myUploads",
+                  label: "我的上传",
+                  count: stats?.myUploads?.total ?? 0,
+                  icon: <UploadCloud size={12} />,
+                },
                 // 孤儿（unreferenced）tab：高亮琥珀色，与顶栏"可回收"徽标视觉呼应；
                 // count 为 0 时也显示，方便用户确认"当前没有孤儿"。
                 {
@@ -986,7 +1168,9 @@ export default function FileManager() {
               title={
                 tab.key === "unreferenced"
                   ? "没有被任何笔记引用的附件（刚上传 24 小时内的不算）"
-                  : undefined
+                  : tab.key === "myUploads"
+                    ? "你从文件管理页直接上传的文件（不含编辑器粘贴的）"
+                    : undefined
               }
             >
               {tab.icon}
@@ -1036,6 +1220,58 @@ export default function FileManager() {
           </select>
         </div>
       </div>
+
+      {/* "我的上传"二级子筛选条：仅在该主 tab 选中时出现。
+          三选一：全部 / 已引用 / 未引用。徽标计数来自 stats.myUploads。
+          视觉上与主工具条同款 padding，淡背景区分层级。 */}
+      {category === "myUploads" && (
+        <div className="flex flex-wrap items-center gap-1 px-4 md:px-6 py-1.5 border-b border-app-border bg-app-surface/10 text-xs">
+          <span className="text-tx-tertiary mr-1">引用状态:</span>
+          {(
+            [
+              {
+                key: "all" as const,
+                label: "全部",
+                count: stats?.myUploads?.total ?? 0,
+              },
+              {
+                key: "referenced" as const,
+                label: "已引用",
+                count: stats?.myUploads?.referenced ?? 0,
+              },
+              {
+                key: "unreferenced" as const,
+                label: "未引用",
+                count: stats?.myUploads?.unreferenced ?? 0,
+              },
+            ] as const
+          ).map((sub) => (
+            <button
+              key={sub.key}
+              onClick={() => {
+                setMyUploadsRef(sub.key);
+                setPage(1);
+              }}
+              className={cn(
+                "px-2 py-0.5 rounded-md flex items-center gap-1 transition-colors",
+                myUploadsRef === sub.key
+                  ? "bg-accent-primary/15 text-accent-primary"
+                  : "text-tx-secondary hover:bg-app-hover",
+              )}
+              title={
+                sub.key === "referenced"
+                  ? "已经被某条笔记引用过的"
+                  : sub.key === "unreferenced"
+                    ? "还没插到任何笔记里的"
+                    : undefined
+              }
+            >
+              <span>{sub.label}</span>
+              <span className="text-[10px] text-tx-tertiary">{sub.count}</span>
+            </button>
+          ))}
+        </div>
+      )}
 
       {/* 批量操作栏（仅选择模式下出现） */}
       <AnimatePresence initial={false}>
@@ -1141,8 +1377,8 @@ export default function FileManager() {
             )}
 
             {/* 分页 */}
-            {pageCount > 1 && (
-              <div className="flex items-center justify-center gap-2 mt-6 text-xs text-tx-secondary">
+            {(pageCount > 1 || total > PAGE_SIZE_OPTIONS[0]) && (
+              <div className="flex flex-wrap items-center justify-center gap-x-3 gap-y-2 mt-6 text-xs text-tx-secondary">
                 <Button size="sm" variant="outline" disabled={page <= 1 || loading} onClick={() => setPage((p) => Math.max(1, p - 1))}>
                   上一页
                 </Button>
@@ -1152,6 +1388,24 @@ export default function FileManager() {
                 <Button size="sm" variant="outline" disabled={page >= pageCount || loading} onClick={() => setPage((p) => Math.min(pageCount, p + 1))}>
                   下一页
                 </Button>
+                {/* 每页条数：放在分页器右侧。
+                    选择后立即回到第 1 页，避免页码越界落到空页。
+                    样式与工具条排序下拉保持一致，视觉熟悉度更高。 */}
+                <div className="flex items-center gap-1">
+                  <span className="text-tx-tertiary">每页</span>
+                  <select
+                    className="h-7 px-1.5 rounded-md border border-app-border bg-app-bg text-tx-primary text-xs outline-none"
+                    value={pageSize}
+                    onChange={(e) => handlePageSizeChange(Number.parseInt(e.target.value, 10))}
+                    disabled={loading}
+                  >
+                    {PAGE_SIZE_OPTIONS.map((n) => (
+                      <option key={n} value={n}>
+                        {n} 条
+                      </option>
+                    ))}
+                  </select>
+                </div>
               </div>
             )}
           </div>
@@ -1250,6 +1504,13 @@ function GridView({
   onToggleSelect: (id: string) => void;
   isImageHostMode: boolean;
 }) {
+  // 性能优化（v12）：
+  //   GridCard 用 React.memo 浅比较 props。为了让 memo 真正生效，
+  //   父级把"全局态 → 单卡 boolean"的派生在 GridView 里完成，
+  //   只把当前卡需要的 isCopied / isDownloading / isSelected 三个 bool 传下去。
+  //   这样：当 copiedId 从 null → "id-A" 时，只有 A、和（可能的）原命中卡两张
+  //   会因为 isCopied prop 变化重渲，其余 58 张全部跳过 render。
+  //   下载、选择同理。
   return (
     <div
       className="grid gap-3"
@@ -1263,8 +1524,8 @@ function GridView({
           onCopyUrl={onCopyUrl}
           onCopySnippet={onCopySnippet}
           onDownload={onDownload}
-          copiedId={copiedId}
-          downloadingId={downloadingId}
+          isCopied={copiedId === it.id}
+          isDownloading={downloadingId === it.id}
           selectionMode={selectionMode}
           selected={selectedIds.has(it.id)}
           onToggleSelect={onToggleSelect}
@@ -1275,31 +1536,48 @@ function GridView({
   );
 }
 
-function GridCard({
-  item,
-  onOpen,
-  onCopyUrl,
-  onCopySnippet,
-  onDownload,
-  copiedId,
-  downloadingId,
-  selectionMode,
-  selected,
-  onToggleSelect,
-  isImageHostMode,
-}: {
+interface GridCardProps {
   item: FileItem;
   onOpen: (id: string) => void;
   onCopyUrl: (item: FileItem) => void;
   onCopySnippet: (item: FileItem, format: ImageHostFormat) => void;
   onDownload: (item: FileItem) => void;
-  copiedId: string | null;
-  downloadingId: string | null;
+  /** 当前卡片是否处于"刚刚复制成功"高亮态（替代 copiedId === item.id 全局比较） */
+  isCopied: boolean;
+  /** 当前卡片是否正在下载 */
+  isDownloading: boolean;
   selectionMode: boolean;
   selected: boolean;
   onToggleSelect: (id: string) => void;
   isImageHostMode: boolean;
-}) {
+}
+
+/**
+ * 单张文件卡片。
+ *
+ * 性能要点（v12 优化）：
+ *   1. 用 React.memo 包裹，浅比较 props 命中即跳过 render。
+ *   2. 所有回调（onOpen / onCopyUrl / onCopySnippet / onDownload / onToggleSelect）
+ *      都在父组件用 useCallback 稳定引用——见 FileManager 主体。
+ *   3. 父级派生 isCopied / isDownloading / selected 三个 boolean，
+ *      避免传 copiedId / downloadingId / selectedIds 这种"全局对象，引用稳定但
+ *      字段值跨卡耦合"的 props 让 memo 失效。
+ *   4. 图片优先用 thumbnailUrl（后端 webp 缩略图），原图作为 fallback。
+ *      thumbnailUrl 仅在 raster 图片下发；svg / ico / 老服务端会自动回退到原图。
+ */
+const GridCard = React.memo(function GridCard({
+  item,
+  onOpen,
+  onCopyUrl,
+  onCopySnippet,
+  onDownload,
+  isCopied,
+  isDownloading,
+  selectionMode,
+  selected,
+  onToggleSelect,
+  isImageHostMode,
+}: GridCardProps) {
   const isImage = item.category === "image";
   // 图床的"复制格式"下拉菜单是否展开。每张卡独立维护——同时只能展开一个比较自然，
   // 但实现上让外层点击就关掉即可，无需引入全局状态。
@@ -1320,6 +1598,13 @@ function GridCard({
     if (selectionMode) onToggleSelect(item.id);
     else onOpen(item.id);
   };
+
+  // 缩略图 src：
+  //   - 优先 thumbnailUrl（后端 webp，体积通常 ~10-30KB，相比 3MB 原图缩 100x）；
+  //   - 不存在则回退原图 url（svg / ico / 老服务端兼容）。
+  // 注意：DetailDrawer / Markdown 复制等场景仍然用原图 url，不受此影响。
+  const thumbSrc = resolveAttachmentUrl(item.thumbnailUrl || item.url);
+
   return (
     <div
       className={cn(
@@ -1334,13 +1619,25 @@ function GridCard({
       <div className="aspect-square w-full bg-app-bg flex items-center justify-center overflow-hidden">
         {isImage ? (
           <img
-            src={resolveAttachmentUrl(item.url)}
+            src={thumbSrc}
             alt={item.filename}
             loading="lazy"
+            // decoding="async"：让浏览器在 worker 里解码，不阻塞主线程
+            decoding="async"
+            // fetchpriority="low"：缩略图非首屏关键资源，给主线程腾带宽
+            // （未在 React 类型里声明时用 lowercase 属性透传到 DOM）
+            // @ts-expect-error fetchPriority 是 HTML 标准属性，TS 类型在某些版本未收录
+            fetchpriority="low"
             className="w-full h-full object-cover"
             onError={(e) => {
-              // 破图兜底：换成占位图标
+              // 破图兜底：先尝试退回原图（缩略图生成失败时尤其有用），
+              // 仍失败再隐藏 + 展示占位。
               const el = e.currentTarget;
+              const fallbackUrl = resolveAttachmentUrl(item.url);
+              if (el.src !== fallbackUrl) {
+                el.src = fallbackUrl;
+                return;
+              }
               el.style.display = "none";
               const fallback = el.nextElementSibling as HTMLElement | null;
               if (fallback) fallback.style.display = "flex";
@@ -1361,12 +1658,13 @@ function GridCard({
         )}
 
         {/* 图床模式：左下角的"公开直链"角标。
-            语义提示：当前图片有一条无需登录就能访问的 URL，
-            点击下面的复制按钮可拿到 URL/Markdown/HTML 任一形式。 */}
-        {isImageHostMode && isImage && (
+            语义提示：当前附件有一条无需登录就能访问的 URL，
+            点击右上的复制按钮可拿到 URL/Markdown/HTML 任一形式。
+            v14：扩展到所有附件（不止图片）——图床支持文件外链分享。 */}
+        {isImageHostMode && (
           <div
             className="absolute bottom-1.5 left-1.5 px-1.5 py-0.5 rounded bg-indigo-500/85 text-white text-[9px] flex items-center gap-1 pointer-events-none"
-            title="此图片有公开直链，可对外引用"
+            title="此附件有公开直链，可对外引用"
           >
             <Link2 size={9} />
             <span>直链</span>
@@ -1417,10 +1715,10 @@ function GridCard({
               e.stopPropagation();
               onDownload(item);
             }}
-            disabled={downloadingId === item.id}
+            disabled={isDownloading}
             title="下载"
           >
-            {downloadingId === item.id ? <Loader2 size={12} className="animate-spin" /> : <Download size={12} />}
+            {isDownloading ? <Loader2 size={12} className="animate-spin" /> : <Download size={12} />}
           </button>
 
           {isImageHostMode ? (
@@ -1434,7 +1732,7 @@ function GridCard({
                 }}
                 title="复制 URL"
               >
-                {copiedId === item.id ? <Check size={12} /> : <Copy size={12} />}
+                {isCopied ? <Check size={12} /> : <Copy size={12} />}
               </button>
               <button
                 className="px-0.5 bg-black/50 hover:bg-black/70 text-white flex items-center border-l border-white/15"
@@ -1477,14 +1775,14 @@ function GridCard({
               }}
               title="复制链接"
             >
-              {copiedId === item.id ? <Check size={12} /> : <Copy size={12} />}
+              {isCopied ? <Check size={12} /> : <Copy size={12} />}
             </button>
           )}
         </div>
       )}
     </div>
   );
-}
+});
 
 // ---------------------------------------------------------------------------
 // 子组件：列表视图（文件为主）
@@ -1565,7 +1863,15 @@ function ListView({
                 <td className="px-3 py-2 w-10">
                   <div className="w-8 h-8 rounded-md bg-app-bg flex items-center justify-center overflow-hidden">
                     {it.category === "image" ? (
-                      <img src={resolveAttachmentUrl(it.url)} alt="" loading="lazy" className="w-full h-full object-cover" />
+                      // 列表小缩略图：32×32，优先用后端 webp 缩略（240w 显示在 32px 上完全够），
+                      // 没有 thumbnailUrl 时回退原图（svg / ico / 老服务端兼容）
+                      <img
+                        src={resolveAttachmentUrl(it.thumbnailUrl || it.url)}
+                        alt=""
+                        loading="lazy"
+                        decoding="async"
+                        className="w-full h-full object-cover"
+                      />
                     ) : (
                       <span className="text-accent-primary/70">{mimeIcon(it.mimeType)}</span>
                     )}

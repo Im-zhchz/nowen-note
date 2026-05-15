@@ -65,6 +65,47 @@ function isImage(mime: string | null | undefined): boolean {
   return !!mime && mime.toLowerCase().startsWith(IMAGE_MIME_PREFIX);
 }
 
+// ---------------------------------------------------------------------------
+// 调试开关：files-list query 解析详情打印
+// ---------------------------------------------------------------------------
+//
+// 双源开关——env 与 system_settings.debug_files_query 任一为 true 即开启：
+//   - env DEBUG_FILES_QUERY=1：运维侧旁路开关，进程启动后即生效，不依赖前端；
+//   - system_settings 表 debug_files_query='true'：管理员在前端「设置 → 开发者」
+//     面板上切换的运行时开关，进程不重启即可临时启用。
+//
+// 由于这条路径在每次列表请求里都会走一次，加 30s 内存缓存，避免给 SQLite
+// 增加无谓压力。settings PUT 后最迟 30s 内对所有请求生效，肉眼不可感。
+let debugFlagCache: { value: boolean; expiresAt: number } | null = null;
+const DEBUG_FLAG_TTL_MS = 30_000;
+
+function isFilesQueryDebugEnabled(db: ReturnType<typeof getDb>): boolean {
+  if (process.env.DEBUG_FILES_QUERY === "1") return true;
+  const now = Date.now();
+  if (debugFlagCache && debugFlagCache.expiresAt > now) {
+    return debugFlagCache.value;
+  }
+  let v = false;
+  try {
+    const row = db
+      .prepare("SELECT value FROM system_settings WHERE key = 'debug_files_query'")
+      .get() as { value: string } | undefined;
+    v = row?.value === "true";
+  } catch {
+    // 老库或迁移异常时静默退回 false——调试开关不能反过来阻塞主路径
+    v = false;
+  }
+  debugFlagCache = { value: v, expiresAt: now + DEBUG_FLAG_TTL_MS };
+  return v;
+}
+
+/** 测试 / settings PUT 后立即生效场景使用：清掉缓存，下次读取强制查 DB。 */
+export function invalidateFilesQueryDebugCache() {
+  debugFlagCache = null;
+}
+
+
+
 /**
  * 把一条附件行 + 关联的 notebook 信息转成前端消费格式。
  *
@@ -95,6 +136,15 @@ interface FileOut {
   createdAt: string;
   category: "image" | "file";
   url: string;
+  /**
+   * v12：图片缩略图 URL（可选）。
+   * - 仅当 category === "image" 且 MIME 在 raster 白名单内（png/jpeg/webp/bmp/gif）时下发；
+   * - 指向 `/api/attachments/<id>?w=240`，后端自动按需生成 webp 并落盘缓存；
+   * - 前端 GridCard 列表用此 URL，避免拉原图（手机截图常 3-5MB × 60 张 = 几百 MB）；
+   * - 详情大图、Markdown 复制时仍用 `url`（原图）。
+   * - svg / ico 等不下发 thumbnailUrl，前端回退到原图（通常本身就小）。
+   */
+  thumbnailUrl?: string;
   /** SHA-256 hex；v11 之前的老附件可能为 null（懒迁移）。 */
   hash: string | null;
   /** 首次归属的笔记（attachments.noteId）。被删除或不存在时为 null。 */
@@ -108,14 +158,31 @@ interface FileOut {
   } | null;
 }
 
+/** 生成 thumbnailUrl 时使用的默认宽度。
+ *  与前端 FileManager 卡片视觉宽度（auto-fill minmax 140px）+ 2x 高分屏匹配。 */
+const DEFAULT_THUMBNAIL_WIDTH = 240;
+
+/** raster 缩略图候选 MIME（与 services/thumbnails.ts 的 isThumbnailable 对齐）。
+ *  这里独立维护一份是为了避免 toFileOut 走到 sharp 加载分支——
+ *  toFileOut 是高频纯数据转换函数，不引入 native 模块。 */
+const THUMBNAILABLE_MIMES = new Set([
+  "image/png",
+  "image/jpeg",
+  "image/webp",
+  "image/bmp",
+  "image/gif",
+]);
+
 function toFileOut(row: FileRow): FileOut {
-  return {
+  const mimeLower = (row.mimeType || "").toLowerCase();
+  const isImg = isImage(row.mimeType);
+  const out: FileOut = {
     id: row.id,
     filename: row.filename,
     mimeType: row.mimeType,
     size: row.size,
     createdAt: row.createdAt,
-    category: isImage(row.mimeType) ? "image" : "file",
+    category: isImg ? "image" : "file",
     url: `/api/attachments/${row.id}`,
     hash: row.hash ?? null,
     primaryNote: row.noteId
@@ -129,6 +196,10 @@ function toFileOut(row: FileRow): FileOut {
         }
       : null,
   };
+  if (isImg && THUMBNAILABLE_MIMES.has(mimeLower)) {
+    out.thumbnailUrl = `/api/attachments/${row.id}?w=${DEFAULT_THUMBNAIL_WIDTH}`;
+  }
+  return out;
 }
 
 /**
@@ -243,12 +314,33 @@ function buildUnreferencedSet(
 }
 
 // ---------------------------------------------------------------------------
+// "我的上传" 识别口径（v12 起）
+// ---------------------------------------------------------------------------
+// 文件管理上传入口（POST /api/files/upload）会在 INSERT attachments 时写
+// `uploadSource = 'file_manager'`。"我的上传"筛选 / 统计直接按这个字段查。
+//
+// 与 holder note（"未归档文件"）关系：holder 只是 attachments.noteId 外键
+// 的承载笔记（保证外键 NOT NULL 约束），不再用作"我的上传"的判定依据。
+// 这样：
+//   - 编辑器粘贴 / Tiptap 内联抽取 / API 直接调用 attachments 上传等任何
+//     非"文件管理直传"路径都不会进"我的上传"——uploadSource 留 NULL；
+//   - v12 之前堆积在 holder 下的历史脏数据（含浏览器粘贴的 favicon、
+//     测试上传等）uploadSource=NULL，自动从"我的上传"中清出。
+//
+// 历史口径（v11 之前）：靠 `attachments.noteId == holderNoteId` 判定，
+// 已废弃；相关 lookupHolderNoteId 函数随之删除。需要回看请查 v11 之前版本。
+
+
+
+// ---------------------------------------------------------------------------
 // GET /api/files
 // 列表 + 搜索 + 筛选 + 分页
 //
 // Query 参数：
 //   category   "all" | "image" | "file"                    —— 大类筛选
-//   filter     "unreferenced"                              —— 视图筛选（孤儿视图）
+//   filter     "unreferenced" | "myUploads"                —— 视图筛选
+//   myUploadsRef "referenced" | "unreferenced"             —— 仅 filter=myUploads 时生效，
+//                                                            子筛选"已被任意笔记引用 / 还没被引用"
 //   mime       精确 MIME（如 image/png）                    —— 细分筛选
 //   notebookId 所属笔记本 id                                —— 按笔记本筛
 //   q          文件名关键字（ILIKE）                         —— 搜索
@@ -334,8 +426,66 @@ app.get("/", requireWorkspaceFeature("files"), (c) => {
     }
   }
 
+  // filter=myUploads：仅返回"用户在文件管理页主动上传"的附件——
+  // v12 起改用 attachments.uploadSource = 'file_manager' 字段判定，与 holder note 解耦。
+  //
+  // 历史背景（v12 之前）：
+  //   旧实现是 `a.noteId = holderNoteId`——即"挂在 holder note 下的"都算我的上传。
+  //   但这个口径会把以下脏数据一并算上：
+  //     - 用户在 FileManager 页面被全局 paste 监听器抓到的浏览器图标 / 截图；
+  //     - 任何代码路径走过 POST /api/files/upload 的测试数据；
+  //   实际线上数据里 89 张"我的上传"中绝大多数都不是用户预期。
+  //
+  // v12 之后：
+  //   - POST /api/files/upload 在 INSERT 时写 uploadSource='file_manager'；
+  //   - 老附件 uploadSource 留 NULL，自动从"我的上传"中排除（历史脏数据干净下线）；
+  //   - 不再调 lookupHolderNoteId，holder note 仅作为 attachments.noteId 外键容器存在。
+  //
+  // myUploadsRef 子筛选语义不变：
+  //   referenced   → attachment_references 里有至少一行；
+  //   unreferenced → attachment_references 里无任何行（"上传了但还没用过"）。
+  // 注意：filter 已在上方 .toLowerCase()，所以这里**必须**用小写字面量。
+  // 历史血泪：之前写成 "myUploads" 永远 false，导致整个分支 dead code，
+  // 列表退化为返回 scope 全集 → 用户看到「我的上传」展示了所有附件。
+  if (filter === "myuploads") {
+    whereParts.push("a.uploadSource = ?");
+    params.push("file_manager");
+
+    const refSub = (c.req.query("myUploadsRef") || "").toLowerCase();
+    if (refSub === "referenced") {
+      whereParts.push(
+        "EXISTS(SELECT 1 FROM attachment_references ar WHERE ar.attachmentId = a.id)",
+      );
+    } else if (refSub === "unreferenced") {
+      whereParts.push(
+        "NOT EXISTS(SELECT 1 FROM attachment_references ar WHERE ar.attachmentId = a.id)",
+      );
+    }
+  }
+
   const whereSql = whereParts.join(" AND ");
   const orderSql = resolveOrderBy(sort);
+
+  // 调试开关：env DEBUG_FILES_QUERY=1 或 system_settings.debug_files_query='true'
+  // 任一启用时，打印**实际进入 SQL** 的解析后参数 + 拼好的 WHERE 子句。专为
+  // 排查 query 大小写 / 拼写陷阱（参考 v12 myUploads 字面量血泪）设计——下次
+  // 再出现"前端传了 filter 但后端像没收到"的现象，开开关看一眼即可。
+  // 注意只 dump 解析后的标量，不打 params 里可能出现的用户输入字符串（q），避免日志泄露。
+  if (isFilesQueryDebugEnabled(db)) {
+    console.log("[files.list]", {
+      userId,
+      scope: scope.scope,
+      workspaceId: scope.workspaceId ?? null,
+      raw: {
+        category: c.req.query("category") ?? null,
+        filter: c.req.query("filter") ?? null,
+        myUploadsRef: c.req.query("myUploadsRef") ?? null,
+      },
+      parsed: { category, filter, mime, notebookId, sort, page, pageSize },
+      whereSql,
+      paramCount: params.length,
+    });
+  }
 
   // LEFT JOIN：允许 attachment 对应的 note 已被真删（极端场景，DB 外键 CASCADE
   // 下这不会发生，但保留健壮性）；notebook 也 LEFT JOIN，保持列表可渲染。
@@ -451,12 +601,55 @@ app.get("/stats", requireWorkspaceFeature("files"), (c) => {
     unreferencedBytes = sumRow?.b ?? 0;
   }
 
+  // "我的上传" 徽标（v12 起）：scope 内 uploadSource='file_manager' 的附件，
+  // 按是否被任意笔记引用拆两档。走 attachment_references 倒排表——索引覆盖
+  // attachmentId 列，不会扫全表。
+  // 老附件 uploadSource=NULL 不计入；用户从未走过文件管理上传时三个值都为 0。
+  let myUploadsTotal = 0;
+  let myUploadsReferenced = 0;
+  let myUploadsUnreferenced = 0;
+  {
+    const { sql: muSql, args: muArgs } =
+      scope.scope === "workspace"
+        ? {
+            sql: `SELECT
+                    COUNT(*) AS total,
+                    SUM(CASE WHEN EXISTS(
+                      SELECT 1 FROM attachment_references ar WHERE ar.attachmentId = a.id
+                    ) THEN 1 ELSE 0 END) AS referenced
+                  FROM attachments a
+                  WHERE a.workspaceId = ? AND a.uploadSource = 'file_manager'`,
+            args: [scope.workspaceId!] as (string | number)[],
+          }
+        : {
+            sql: `SELECT
+                    COUNT(*) AS total,
+                    SUM(CASE WHEN EXISTS(
+                      SELECT 1 FROM attachment_references ar WHERE ar.attachmentId = a.id
+                    ) THEN 1 ELSE 0 END) AS referenced
+                  FROM attachments a
+                  WHERE a.userId = ? AND a.workspaceId IS NULL AND a.uploadSource = 'file_manager'`,
+            args: [userId] as (string | number)[],
+          };
+    const sumRow = db.prepare(muSql).get(...muArgs) as
+      | { total: number; referenced: number }
+      | undefined;
+    myUploadsTotal = sumRow?.total ?? 0;
+    myUploadsReferenced = sumRow?.referenced ?? 0;
+    myUploadsUnreferenced = myUploadsTotal - myUploadsReferenced;
+  }
+
   return c.json({
     total,
     totalBytes,
     images: { count: imageCount, bytes: imageBytes },
     files: { count: fileCount, bytes: fileBytes },
     unreferenced: { count: unreferencedCount, bytes: unreferencedBytes },
+    myUploads: {
+      total: myUploadsTotal,
+      referenced: myUploadsReferenced,
+      unreferenced: myUploadsUnreferenced,
+    },
     byMime: rows,
   });
 });
@@ -1005,6 +1198,16 @@ app.post("/upload", requireWorkspaceFeature("files"), async (c) => {
     ) as { id: string; mimeType: string; size: number; filename: string } | undefined;
 
   if (dedupRow) {
+    // v12：dedup 命中老行时把 uploadSource 升级到 'file_manager'——
+    // 用户这次是从文件管理页主动上传同一份内容，理应进入"我的上传"。
+    // 用 COALESCE 语义：仅当老行还没标过来源时才写，避免把已有的 'file_manager'
+    // 反复 UPDATE（无害但浪费写）；老行已是 'file_manager' 则保持。
+    db.prepare(
+      `UPDATE attachments
+          SET uploadSource = 'file_manager'
+        WHERE id = ? AND (uploadSource IS NULL OR uploadSource = '')`,
+    ).run(dedupRow.id);
+
     return c.json(
       {
         id: dedupRow.id,
@@ -1031,8 +1234,8 @@ app.post("/upload", requireWorkspaceFeature("files"), async (c) => {
 
   try {
     db.prepare(
-      `INSERT INTO attachments (id, noteId, userId, filename, mimeType, size, path, workspaceId, hash)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO attachments (id, noteId, userId, filename, mimeType, size, path, workspaceId, hash, uploadSource)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
       id,
       noteId,
@@ -1043,6 +1246,9 @@ app.post("/upload", requireWorkspaceFeature("files"), async (c) => {
       `${id}.${ext}`,
       scope.workspaceId,
       sha256,
+      // v12：标记此附件来自"文件管理"直传入口，"我的上传"筛选据此判定。
+      // 编辑器粘贴 / 内联 base64 抽取 / 老附件等其它路径不写此字段，留 NULL。
+      "file_manager",
     );
   } catch (err) {
     // DB 写失败时把已落盘文件清掉，避免孤儿

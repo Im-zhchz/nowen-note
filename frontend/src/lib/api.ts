@@ -1,4 +1,4 @@
-import { Notebook, Note, NoteListItem, Tag, SearchResult, User, UserPublicInfo, Task, TaskStats, TaskFilter, CustomFont, MindMap, MindMapListItem, Diary, DiaryTimeline, DiaryStats, Share, ShareInfo, SharedNoteContent, NoteVersion, ShareComment, Workspace, WorkspaceMember, WorkspaceInvite, WorkspaceRole, WorkspaceFeatures, FileItem, FileDetail, FileListResponse, FileStats, FileSortKey, FileCategory } from "@/types";
+import { Notebook, Note, NoteListItem, Tag, SearchResult, User, UserPublicInfo, Task, TaskStats, TaskFilter, CustomFont, MindMap, MindMapListItem, Diary, DiaryTimeline, DiaryStats, Share, ShareInfo, SharedNoteContent, NoteVersion, ShareComment, Workspace, WorkspaceMember, WorkspaceInvite, WorkspaceRole, WorkspaceFeatures, FileItem, FileDetail, FileListResponse, FileStats, FileSortKey, FileCategory, FileFilter, FileMyUploadsRef } from "@/types";
 import {
   shouldEnqueue as _shouldEnqueue,
   enqueue as _enqueue,
@@ -992,6 +992,8 @@ export const api = {
       editor_font_family: string;
       feature_personal_export_enabled?: string;
       feature_personal_import_enabled?: string;
+      // 调试开关："true" / "false"。仅管理员可写，未写过时为 "false"。
+      debug_files_query?: string;
     }>("/settings"),
   updateSiteSettings: (data: {
     site_title?: string;
@@ -1000,6 +1002,8 @@ export const api = {
     // 布尔值或 "true"/"false" 字符串；后端做归一化
     feature_personal_export_enabled?: boolean | string;
     feature_personal_import_enabled?: boolean | string;
+    // 同上：后端归一化为 "true"/"false"
+    debug_files_query?: boolean | string;
   }) =>
     request<{
       site_title: string;
@@ -1007,6 +1011,7 @@ export const api = {
       editor_font_family: string;
       feature_personal_export_enabled?: string;
       feature_personal_import_enabled?: string;
+      debug_files_query?: string;
     }>("/settings", {
       method: "PUT",
       body: JSON.stringify(data),
@@ -1306,10 +1311,13 @@ export const api = {
      *  Y4: 自动注入 workspaceId（调用方未显式指定时）。
      *  filter=unreferenced：仅返回 scope 内"没有被任何笔记引用"的附件（含 24h 宽限期）。
      *    与 category 正交——可同时传 category=image 得到"孤儿图片"。
+     *  filter=myUploads：仅返回"用户从文件管理页直接上传"的附件（noteId 指向 holder note）；
+     *    可叠加 myUploadsRef=referenced/unreferenced 进一步拆分"已被笔记引用 / 还没引用"。
      */
     list: (params: {
       category?: FileCategory;
-      filter?: "unreferenced";
+      filter?: FileFilter;
+      myUploadsRef?: FileMyUploadsRef;
       mime?: string;
       notebookId?: string;
       q?: string;
@@ -1324,6 +1332,11 @@ export const api = {
       // 在传进来之前就会把 "all" 映射成 undefined，这里只需非空判断。
       if (params.category) qs.set("category", params.category);
       if (params.filter) qs.set("filter", params.filter);
+      // myUploadsRef 仅在 filter=myUploads 时才有意义；后端会忽略其他场景，
+      // 但为了让 URL 干净，前端只在 filter 匹配时传。
+      if (params.filter === "myUploads" && params.myUploadsRef) {
+        qs.set("myUploadsRef", params.myUploadsRef);
+      }
       if (params.mime) qs.set("mime", params.mime);
       if (params.notebookId) qs.set("notebookId", params.notebookId);
       if (params.q) qs.set("q", params.q);

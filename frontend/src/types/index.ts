@@ -190,11 +190,26 @@ export type FileCategory = "image" | "file";
 /**
  * 文件视图筛选（与 category 正交）：
  *   - "unreferenced"：scope 内"没有任何笔记引用"的附件（含 24h 宽限期）。
+ *   - "myUploads"   ：scope 内"用户从文件管理页直接上传"的附件
+ *                     （即 attachments.noteId 指向 isArchived=1 的 holder note）。
+ *                     可与 myUploadsRef 子筛选搭配使用——见下方类型。
  *
- * 前端单独维护 UI 选择（"孤儿"tab），传给后端 `filter=unreferenced`；
- * 与 category=image/file 可并存（"孤儿图片" / "孤儿文件"）。
+ * 前端单独维护 UI 选择（"孤儿" / "我的上传"两个 tab），传给后端 `filter=...`；
+ * 与 category=image/file 可并存（"孤儿图片" / "我的上传里的文件"）。
  */
-export type FileFilter = "unreferenced";
+export type FileFilter = "unreferenced" | "myUploads";
+
+/**
+ * "我的上传"子筛选：仅当 filter=myUploads 时由前端发送。
+ *   - "referenced"   ：上传后已经被任意笔记引用过（attachment_references 有行）。
+ *   - "unreferenced" ：上传后还没被任何笔记引用。
+ *   不传 = 不再细分（返回我的上传全部）。
+ *
+ * 注意：这里的 "unreferenced" 与 FileFilter.unreferenced 不同——后者是全集合的孤儿
+ * （包括编辑器里粘贴后又删除的图，且有 24h 宽限期）；本字段是"我的上传"子集内的
+ * "还没用过的"，没有宽限期，刚上传的也立刻可见。
+ */
+export type FileMyUploadsRef = "referenced" | "unreferenced";
 
 /** 文件排序键（与后端 resolveOrderBy 白名单一致）。 */
 export type FileSortKey =
@@ -221,6 +236,15 @@ export interface FileItem {
   createdAt: string;
   category: FileCategory;
   url: string;
+  /**
+   * v12：图片缩略图 URL（可选）。
+   * - 仅 category === "image" 且 MIME 是 raster（png/jpeg/webp/bmp/gif）时由后端下发；
+   * - 形如 `/api/attachments/<id>?w=240`，后端按需生成 webp 缩略图并落盘缓存；
+   * - 前端 GridCard / ListView 缩略图位置优先用它，回退 url（svg / ico / 老服务端）；
+   * - DetailDrawer 的大图预览仍用 url（原图）；
+   * - 复制到 Markdown / HTML 的也是 url（外链给别人用必然要原图）。
+   */
+  thumbnailUrl?: string;
   /**
    * SHA-256 hex；v11 起新上传/抽取的附件会带；v11 之前的老附件为 null
    * （懒迁移策略，不强制回填）。仅在文件管理详情视图里供"复制 hash / 排查重复"用。
@@ -267,6 +291,14 @@ export interface FileStats {
   files: { count: number; bytes: number };
   /** 孤儿视图徽标：scope 内没有被任何笔记引用的附件数 / 占用。 */
   unreferenced: { count: number; bytes: number };
+  /**
+   * "我的上传"徽标（v12 文件管理新增）：
+   *   - total       ：用户从文件管理页直接上传的全部附件数；
+   *   - referenced  ：其中已被任意笔记引用过的；
+   *   - unreferenced：其中还没被任何笔记引用的。
+   * 老后端可能不下发该字段，前端按需要做兜底（视作三个 0）。
+   */
+  myUploads?: { total: number; referenced: number; unreferenced: number };
   byMime: Array<{ mime: string; count: number; bytes: number }>;
 }
 
@@ -377,7 +409,15 @@ export interface DiaryStats {
 }
 
 // 分享
-export type SharePermission = "view" | "comment" | "edit";
+//
+// SharePermission 取值：
+//   - 'view'      仅查看
+//   - 'comment'   可查看 + 留言（未登录访客填昵称即可评论；留言板模式：所有访客互见）
+//   - 'edit'      可编辑（允许匿名访客填昵称编辑，无需注册）
+//   - 'edit_auth' 可编辑（需登录）；未登录访问到带此权限的 PUT 内容接口会返回
+//                 401 + code='LOGIN_REQUIRED'，前端引导跳转 /login?redirect=/share/<token>
+//                 登录回来后再次提交即可。
+export type SharePermission = "view" | "comment" | "edit" | "edit_auth";
 
 export interface Share {
   id: string;
@@ -441,11 +481,22 @@ export interface NoteVersion {
 }
 
 // 评论批注
+//
+// userId 为 null 表示未登录访客评论（公开分享 + comment 权限场景）；
+// 此时 guestName 是访客自填的昵称，前端显示用 displayName（后端合成的统一字段）。
+// isGuest=true 时 UI 上可以加"访客"标记或不同颜色，与登录用户区分。
 export interface ShareComment {
   id: string;
   noteId: string;
-  userId: string;
-  username: string;
+  userId: string | null;
+  /** 显示用的统一名（后端 COALESCE(guestName, users.username) 合成，永远非空） */
+  displayName?: string;
+  /** 是否为未登录访客留言（userId IS NULL） */
+  isGuest?: boolean;
+  /** 访客填写的昵称；登录用户为 null */
+  guestName?: string | null;
+  /** 兼容旧字段：登录用户的用户名（前端优先用 displayName，其次用 username） */
+  username?: string | null;
   avatarUrl: string | null;
   parentId: string | null;
   content: string;

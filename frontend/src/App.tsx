@@ -3,6 +3,8 @@ import { motion, AnimatePresence } from "framer-motion";
 import { Menu, X } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import Sidebar from "@/components/Sidebar";
+import NavRail from "@/components/NavRail";
+import { useRailMode } from "@/hooks/useRailMode";
 import NoteList from "@/components/NoteList";
 import EditorPane from "@/components/EditorPane";
 import TaskCenter from "@/components/TaskCenter";
@@ -210,6 +212,11 @@ function AppLayout() {
   const { state } = useApp();
   const actions = useAppActions();
   const { t } = useTranslation();
+  // v16 P3 后续：Rail 视觉模式三档（icon / label / hidden）。
+  // 约束：主侧栏折叠时强制显示 Rail（即便偏好是 hidden），
+  // 否则用户会陷入"既无 Rail 又无主侧栏"的死局，找不到任何导航入口。
+  const [railMode] = useRailMode();
+  const railVisible = railMode !== "hidden" || state.sidebarCollapsed;
   const isTaskView = state.viewMode === "tasks";
   const isMindMapView = state.viewMode === "mindmaps";
   const isAIChatView = state.viewMode === "ai-chat";
@@ -391,13 +398,21 @@ function AppLayout() {
         )}
       </AnimatePresence>
 
-      {/* ===== 桌面端：固定侧边栏 + 拖拽条 ===== */}
-      <div
-        className="hidden md:flex shrink-0"
-        style={{ width: state.sidebarCollapsed ? undefined : `${state.sidebarWidth}px` }}
-      >
-        <Sidebar />
-      </div>
+      {/* ===== 桌面端：永久 Rail + 可折叠主侧栏 + 拖拽条 =====
+          v16 P3：左侧 Rail 永久可见（含模块切换 + 设置/登出 + 折叠按钮）；
+          主侧栏（笔记本 + 标签）由 sidebarCollapsed 控制显隐——折叠时主侧栏整块消失，
+          但 Rail 仍在，模块切换永远 1 次点击可达。
+          v16 P3 后续：Rail 三档模式（icon=48px 纯图标 / label=64px 图标+文字 / hidden=完全隐藏）；
+          hidden 模式下若主侧栏也折叠，强制保留 Rail（避免完全无侧栏入口）。 */}
+      {railVisible && <NavRail />}
+      {!state.sidebarCollapsed && (
+        <div
+          className="hidden md:flex shrink-0"
+          style={{ width: `${state.sidebarWidth}px` }}
+        >
+          <Sidebar variant="desktop" />
+        </div>
+      )}
       <SidebarResizeHandle />
 
       {/* ===== 主内容区 ===== */}
@@ -660,6 +675,31 @@ function AuthGate() {
     setUser(userData);
     setActiveToken(token);
     setIsAuthenticated(true);
+
+    // 登录引导回跳：支持来自分享页（edit_auth 权限）的 `/login?redirect=/share/<token>`。
+    //
+    // 安全约束 —— 只允许相对路径回跳，绝不允许 http(s):// 或 // 开头：
+    //   1. 防止开放重定向（open redirect）：恶意人造 `?redirect=https://attacker.example`
+    //      把刚登录的用户带到钓鱼页；
+    //   2. 防 protocol-relative URL（`//attacker.example`）和 `javascript:` 协议；
+    //   3. 兼容 hash router 链路：相对 `/share/xxx` 直接 location.assign 即可命中
+    //      App.tsx 顶部的 path 路由匹配（shareMatch）。
+    //
+    // 命中即跳；不命中保持原行为（停留在主界面）。
+    try {
+      const params = new URLSearchParams(window.location.search);
+      const raw = params.get("redirect");
+      if (raw) {
+        // 仅接受单斜杠 + 字母/数字/常见符号的相对路径
+        if (/^\/[A-Za-z0-9_\-./?&=%#]*$/.test(raw) && !raw.startsWith("//")) {
+          // 用 replace 而非 assign：登录页在历史栈中没意义，避免用户后退又回登录页
+          window.location.replace(raw);
+          return;
+        }
+      }
+    } catch {
+      // location 异常时静默：保持登录后的默认主界面渲染即可，不阻断登录流程
+    }
   };
 
   /** 仅用于 LoginPage（密码登录路径），登录成功后下一帧弹引导对话框 */
@@ -740,8 +780,16 @@ function AuthGate() {
 
 function App() {
   // 检查是否是分享页面路由 /share/:token
+  //
+  // 字符集说明：后端 generateShareToken() 用 crypto.randomBytes(9).toString("base64url")
+  // 输出 12 字符 base64url，字符集是 [A-Za-z0-9_-]（注意包含下划线和连字符）。
+  //
+  // 历史 BUG（必须保留下划线/连字符的支持）：
+  //   早期正则写成 [A-Za-z0-9]+，碰到含 `-` / `_` 的 token 时匹配失败，
+  //   App 直接落到 AuthGate 分支 → 未登录用户被导到登录页，
+  //   被误诊为"可评论分享触发登录"。如果再次收紧此正则，请同步约束 token 生成。
   const path = window.location.pathname;
-  const shareMatch = path.match(/^\/share\/([A-Za-z0-9]+)$/);
+  const shareMatch = path.match(/^\/share\/([A-Za-z0-9_-]+)$/);
   if (shareMatch) {
     return (
       <ThemeProvider>

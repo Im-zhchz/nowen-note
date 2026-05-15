@@ -211,10 +211,23 @@ function CommentItem({
     <div className={cn("rounded-lg border p-3 transition-colors", comment.isResolved ? "border-app-border/50 bg-app-bg/30 opacity-60" : "border-app-border bg-app-bg")}>
       {/* 评论头部 */}
       <div className="flex items-center gap-2 mb-1.5">
-        <div className="w-5 h-5 rounded-full bg-accent-primary/20 flex items-center justify-center text-[10px] font-medium text-accent-primary">
-          {(comment.username || "?")[0]?.toUpperCase()}
+        <div className={cn(
+          "w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-medium",
+          // 访客评论用更柔和的灰底，与登录用户的 accent-primary 区分
+          comment.isGuest
+            ? "bg-zinc-200 dark:bg-zinc-700 text-zinc-600 dark:text-zinc-300"
+            : "bg-accent-primary/20 text-accent-primary",
+        )}>
+          {((comment.displayName || comment.username || "?")[0] || "?").toUpperCase()}
         </div>
-        <span className="text-[11px] font-medium text-tx-primary">{comment.username || "匿名"}</span>
+        <span className="text-[11px] font-medium text-tx-primary">
+          {comment.displayName || comment.username || "匿名"}
+        </span>
+        {comment.isGuest && (
+          <span className="px-1 text-[9px] rounded bg-zinc-100 dark:bg-zinc-800 text-tx-tertiary" title="未登录访客留言">
+            访客
+          </span>
+        )}
         <span className="text-[10px] text-tx-tertiary/60">{formatTime(comment.createdAt)}</span>
         <div className="ml-auto flex items-center gap-1">
           <button
@@ -247,7 +260,12 @@ function CommentItem({
           {replies.map((reply) => (
             <div key={reply.id} className="text-xs">
               <div className="flex items-center gap-1.5 mb-0.5">
-                <span className="font-medium text-tx-primary text-[11px]">{reply.username || "匿名"}</span>
+                <span className="font-medium text-tx-primary text-[11px]">
+                  {reply.displayName || reply.username || "匿名"}
+                </span>
+                {reply.isGuest && (
+                  <span className="px-1 text-[9px] rounded bg-zinc-100 dark:bg-zinc-800 text-tx-tertiary">访客</span>
+                )}
                 <span className="text-[10px] text-tx-tertiary/60">{formatTime(reply.createdAt)}</span>
                 <button onClick={() => onDelete(reply.id)} className="ml-auto p-0.5 rounded text-tx-tertiary/40 hover:text-red-500 transition-colors">
                   <Trash2 size={11} />

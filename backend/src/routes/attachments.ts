@@ -49,6 +49,12 @@ import fs from "fs";
 import path from "path";
 import { resolveNotePermission, hasPermission } from "../middleware/acl";
 import { enqueueAttachment } from "../services/embedding-worker";
+import {
+  parseThumbnailWidth,
+  getOrCreateThumbnailAsync,
+  isThumbnailable,
+  deleteThumbnailsFor,
+} from "../services/thumbnails";
 
 const ATTACHMENTS_DIR = path.join(
   process.env.ELECTRON_USER_DATA || path.join(process.cwd(), "data"),
@@ -108,6 +114,11 @@ export function deleteAttachmentFilesByNoteIds(noteIds: string[]): number {
     } catch {
       /* 单个失败不阻塞批量 */
     }
+    // v12：顺手清理对应的缩略图缓存（best-effort）。
+    // 即便上面 unlink 原图失败也尝试删缩略图，避免缩略图“残留代替原图”造成幻觉。
+    // 缩略图文件名从 attachments.id 推算（path = "<id>.<ext>"），而不是依赖 row.path。
+    const baseName = (r.path || "").replace(/\.[^.]+$/, "");
+    if (baseName) deleteThumbnailsFor(ATTACHMENTS_DIR, baseName);
   }
   return removed;
 }
@@ -183,8 +194,14 @@ const MAX_ATTACHMENT_SIZE = 200 * 1024 * 1024;
  *   - 通过 id 不可枚举（uuid）保护；
  *   - 不调用 resolveNotePermission（因为拿不到 userId）；
  *   - 未来升级为签名 URL 时，在这里校验签名即可。
+ *
+ * v12 新增：缩略图分支
+ *   支持 `?w=240|480|960` 查询参数，命中白名单且原图为 raster 时返回 webp 缩略图。
+ *   - 不命中白名单 / 非 raster / sharp 不可用 → 透明降级为原图（不报错）。
+ *   - 缩略图与原图共用同一份 immutable Cache-Control，浏览器二次访问无网络。
+ *   - handler 改为 async：sharp 是异步管道。
  */
-export function handleDownloadAttachment(c: Context): Response {
+export async function handleDownloadAttachment(c: Context): Promise<Response> {
   const id = c.req.param("id");
   const db = getDb();
   const row = db
@@ -197,6 +214,36 @@ export function handleDownloadAttachment(c: Context): Response {
     return c.json({ error: "附件文件丢失" }, 404);
   }
 
+  const forceDownload = c.req.query("download") === "1";
+  const requestedWidth = parseThumbnailWidth(c.req.query("w"));
+
+  // 缩略图分支：仅在
+  //   1) 请求带合法 ?w=
+  //   2) 不是 ?download=1（下载场景必须给原文件）
+  //   3) 原图是可缩略的 raster 图片
+  // 三者同时满足时尝试。任何一步失败就回退到原图。
+  if (requestedWidth && !forceDownload && isThumbnailable(row.mimeType)) {
+    const thumb = await getOrCreateThumbnailAsync(
+      ATTACHMENTS_DIR,
+      row.id,
+      absPath,
+      row.mimeType,
+      requestedWidth,
+    );
+    if (thumb) {
+      return new Response(thumb.buffer, {
+        headers: {
+          "Content-Type": thumb.mimeType,
+          // 缩略图与原图一样 immutable（webp 内容由 (id, w) 唯一决定）
+          "Cache-Control": "public, max-age=31536000, immutable",
+          // 让前端 / 代理可以观察到这张响应是缩略图
+          "X-Thumbnail-Width": String(requestedWidth),
+        },
+      });
+    }
+    // thumb 为 null（sharp 失败 / 不可用）→ fall through 返回原图
+  }
+
   const buffer = fs.readFileSync(absPath);
   const headers: Record<string, string> = {
     "Content-Type": row.mimeType || "application/octet-stream",
@@ -205,7 +252,6 @@ export function handleDownloadAttachment(c: Context): Response {
   };
   // 非图片（或显式 ?download=1）：带 Content-Disposition，浏览器点击会按原名下载。
   // 图片默认 inline，由 <img> 直接渲染。
-  const forceDownload = c.req.query("download") === "1";
   if (!isImageMime(row.mimeType) || forceDownload) {
     headers["Content-Disposition"] = encodeContentDispositionFilename(row.filename || "");
   }
@@ -425,6 +471,8 @@ app.delete("/:id", (c) => {
     } catch {
       /* 文件删不掉不阻塞，DB 记录仍然要清掉 */
     }
+    // v12：清理对应缩略图缓存（仅当确实 unlink 原图时）
+    deleteThumbnailsFor(ATTACHMENTS_DIR, id);
   }
   db.prepare("DELETE FROM attachments WHERE id = ?").run(id);
 
@@ -610,9 +658,12 @@ export function scanOrphanAttachments(graceHours = 24): OrphanScanResult {
   const db = getDb();
 
   // 1) 物理目录全部文件
+  // 跳过 .thumbs/ 这种隐藏子目录（v12 缩略图缓存）：isFile 已能挡住目录条目，
+  // 但对未来若把缩略图改成同目录平铺命名时多一层防御。
   let diskFiles: string[] = [];
   try {
     diskFiles = fs.readdirSync(ATTACHMENTS_DIR).filter((f) => {
+      if (f.startsWith(".")) return false;
       const abs = path.join(ATTACHMENTS_DIR, f);
       try {
         return fs.statSync(abs).isFile();
@@ -755,6 +806,9 @@ export function cleanOrphanAttachments(opts: {
         } catch {
           /* 文件已不存在或权限问题，DB 行已删；下次扫描会变成"孤行"而消失 */
         }
+        // v12：连带清缩略图缓存。事务外执行也行（只是磁盘清理），
+        //      放这里方便和原图删除靠近，单失败不影响事务。
+        deleteThumbnailsFor(ATTACHMENTS_DIR, o.id);
       }
     });
     tx();

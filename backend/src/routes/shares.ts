@@ -14,6 +14,58 @@ function generateShareToken(): string {
   return crypto.randomBytes(9).toString("base64url");
 }
 
+/**
+ * 取请求方真实 IP（按反代头优先级）。
+ *
+ * 用于：
+ *   - 公开评论的频次限制（同 IP/分钟），防止滥用；
+ *   - 写入 share_comments.guestIpHash（SHA-256 hex，不存明文）。
+ *
+ * 不直接用 c.req.raw.headers.get('x-forwarded-for')[0] 的原因：
+ *   有些反代会写多 IP 链 "client, proxy1, proxy2"，第一个才是真实客户端。
+ */
+function getClientIp(c: any): string {
+  const xff = c.req.header("X-Forwarded-For");
+  if (xff) {
+    const first = xff.split(",")[0]?.trim();
+    if (first) return first;
+  }
+  const xreal = c.req.header("X-Real-IP");
+  if (xreal) return xreal.trim();
+  // Hono 没有标准 socket.remoteAddress 暴露；fallback 到一个稳定但低分辨率的占位
+  return "unknown";
+}
+
+function hashIp(ip: string): string {
+  return crypto.createHash("sha256").update(ip).digest("hex");
+}
+
+/**
+ * 简易内存频次限制器（IP × token 维度）：默认每分钟 30 条评论。
+ *
+ * 设计权衡：
+ *   - 用 Map 而非 Redis：单进程部署足够，多进程后端可在反代/Nginx 层加 limit_req
+ *     再叠一层。本服务目前未支持多进程后端。
+ *   - 滑动窗口比 Token Bucket 实现简单，对人类滥用足够（机器人会绕，不在防御范围）。
+ *   - 自带 60s 过期清理，避免长期运行内存泄漏。
+ */
+const commentRateLimit = new Map<string, number[]>();
+const RATE_LIMIT_WINDOW_MS = 60_000;
+const RATE_LIMIT_MAX = 30;
+
+function checkRateLimit(key: string): boolean {
+  const now = Date.now();
+  const bucket = commentRateLimit.get(key) || [];
+  const recent = bucket.filter((t) => now - t < RATE_LIMIT_WINDOW_MS);
+  if (recent.length >= RATE_LIMIT_MAX) {
+    commentRateLimit.set(key, recent);
+    return false;
+  }
+  recent.push(now);
+  commentRateLimit.set(key, recent);
+  return true;
+}
+
 // ===== 需要 JWT 认证的管理路由 =====
 const sharesRouter = new Hono();
 
@@ -338,9 +390,13 @@ sharedRouter.get("/:token/content", (c) => {
   });
 });
 
-// 访客更新分享笔记内容（仅当 permission === 'edit'）
+// 访客更新分享笔记内容（permission ∈ {'edit', 'edit_auth'}）
 // 设计原则：
-//   - 不需要 JWT 登录态；若分享有密码则校验临时 accessToken
+//   - permission='edit'      ：不需要 JWT 登录态，访客填昵称即可写入；密码分享额外校验 accessToken
+//   - permission='edit_auth' ：必须有 JWT（X-User-Id header）；未登录返 401 + code='LOGIN_REQUIRED'，
+//                              前端引导用户跳 /login?redirect=/share/<token>，登录回来再次提交。
+//                              登录后的请求依然可以走访客昵称兜底 —— 但实际上前端会用真实
+//                              用户名作为 guestName，方便审计；后端不强制。
 //   - 强制乐观锁，由前端带上最新 version，避免覆盖他人改动
 //   - 写入版本历史，changeType='guest_edit'，changeSummary 记录访客昵称，便于所有者审计
 //   - 笔记 isLocked === 1 时禁止写入
@@ -374,9 +430,27 @@ sharedRouter.put("/:token/content", async (c) => {
     return c.json({ error: "分享链接已达到最大访问次数" }, 410);
   }
 
-  // 2) 权限校验：必须是 edit
-  if (share.permission !== "edit") {
+  // 2) 权限校验：必须是 edit / edit_auth
+  if (share.permission !== "edit" && share.permission !== "edit_auth") {
     return c.json({ error: "当前分享不支持编辑" }, 403);
+  }
+
+  // 2.1) edit_auth 额外校验：必须已登录
+  // 前端调用 updateSharedContent 时若用户已登录，api.ts 会自动带 X-User-Id header
+  // （见 src/lib/api.ts 的 fetchWithAuth）。后端直接读 header 判断登录态。
+  // 注意：这里不做"用户必须是笔记主"的校验——edit_auth 的语义是"任何登录用户
+  // 都可以编辑"，与笔记主的私人分享场景区分；私人分享应走带密码 + 短期 token 的链路。
+  if (share.permission === "edit_auth") {
+    const authUserId = c.req.header("X-User-Id");
+    if (!authUserId) {
+      return c.json(
+        {
+          error: "此分享需登录后才能编辑",
+          code: "LOGIN_REQUIRED",
+        },
+        401,
+      );
+    }
   }
 
   // 3) 笔记锁定校验
@@ -719,27 +793,61 @@ sharedRouter.get("/:token/comments", (c) => {
   }
 
   const comments = db.prepare(`
-    SELECT sc.id, sc.noteId, sc.parentId, sc.content, sc.anchorData, sc.isResolved, sc.createdAt, sc.updatedAt,
-           u.username, u.avatarUrl
+    SELECT sc.id, sc.noteId, sc.userId, sc.guestName, sc.parentId, sc.content, sc.anchorData,
+           sc.isResolved, sc.createdAt, sc.updatedAt,
+           u.username, u.avatarUrl,
+           -- displayName：未登录访客 → guestName；登录用户 → username；都没有兜底"匿名"
+           COALESCE(NULLIF(sc.guestName, ''), u.username, '匿名') AS displayName,
+           -- isGuest：userId IS NULL 即为访客（v13 起 userId 可空）
+           CASE WHEN sc.userId IS NULL THEN 1 ELSE 0 END AS isGuest
     FROM share_comments sc
     LEFT JOIN users u ON sc.userId = u.id
     WHERE sc.noteId = ?
     ORDER BY sc.createdAt ASC
   `).all(share.noteId) as any[];
 
+  // SQLite 的 1/0 → 转成 boolean，前端用起来更直观
+  for (const r of comments) {
+    r.isGuest = r.isGuest === 1;
+  }
+
   return c.json(comments);
 });
 
-// 公开访问 - 添加评论（需要 comment 或 edit 权限）
+// 公开访问 - 添加评论（需要 comment / edit / edit_auth 权限）
+//
+// 鉴权策略：
+//   - 已登录用户（X-User-Id header 有值且对应用户存在）：写真实 userId，guestName=NULL
+//   - 未登录访客：写 userId=NULL，guestName=访客昵称（必填，最长 32）
+//
+// 反垃圾基础措施（最小可用）：
+//   - 内容长度 ≤ 1000（防灌水）
+//   - 同 IP 每分钟 ≤ 30 条评论（防机器刷屏）
+//   - honeypot 字段 `_hp`：前端永远不发，后端收到非空就认为是机器人，静默 200 不入库
+//
+// 注：edit_auth 权限下评论是否需要登录？
+//   不需要——评论与编辑是两个能力。edit_auth 仅约束"写正文"必须登录，
+//   评论沿用 comment 权限的访客政策（填昵称即可）。如果以后业务上要"评论也得登录"，
+//   再加 comment_auth 权限档位即可，本次不做。
 sharedRouter.post("/:token/comments", async (c) => {
   const db = getDb();
   const token = c.req.param("token");
   const body = await c.req.json();
-  const { content, parentId, anchorData, guestName } = body as {
-    content: string; parentId?: string; anchorData?: string; guestName?: string;
+  const { content, parentId, anchorData, guestName, _hp } = body as {
+    content: string; parentId?: string; anchorData?: string; guestName?: string; _hp?: string;
   };
 
+  // honeypot：机器人填的字段，正常用户不会填
+  if (_hp && _hp.trim()) {
+    // 静默成功，不给攻击者反馈
+    return c.json({ ok: true, suppressed: true });
+  }
+
   if (!content || !content.trim()) return c.json({ error: "评论内容不能为空" }, 400);
+  const trimmedContent = content.trim();
+  if (trimmedContent.length > 1000) {
+    return c.json({ error: "评论内容过长（最多 1000 字）" }, 400);
+  }
 
   const share = db.prepare(`
     SELECT s.id, s.noteId, s.ownerId, s.isActive, s.permission, s.password
@@ -759,21 +867,56 @@ sharedRouter.post("/:token/comments", async (c) => {
     if (!payload) return c.json({ error: "无效或已过期的令牌" }, 401);
   }
 
+  // 频次限制：以 (token, IP) 为 key，避免一个分享被同一 IP 刷屏
+  const ip = getClientIp(c);
+  const ipHash = hashIp(ip);
+  if (!checkRateLimit(`${token}:${ipHash}`)) {
+    return c.json({ error: "评论过于频繁，请稍后再试" }, 429);
+  }
+
+  // 鉴权识别：已登录 → 真实 userId；未登录 → NULL + guestName
+  const authUserId = c.req.header("X-User-Id") || "";
+  let userId: string | null = null;
+  let storedGuestName: string | null = null;
+
+  if (authUserId) {
+    // 校验用户确实存在（避免伪造 header）
+    const userRow = db.prepare("SELECT id FROM users WHERE id = ?").get(authUserId) as { id: string } | undefined;
+    if (userRow) {
+      userId = userRow.id;
+    }
+  }
+
+  if (!userId) {
+    // 未登录访客必须填昵称
+    const trimmedName = (guestName || "").trim();
+    if (!trimmedName) {
+      return c.json({ error: "请填写昵称后再评论", code: "GUEST_NAME_REQUIRED" }, 400);
+    }
+    if (trimmedName.length > 32) {
+      return c.json({ error: "昵称过长（最多 32 个字符）" }, 400);
+    }
+    storedGuestName = trimmedName;
+  }
+
   const id = uuid();
-  // 公开评论使用分享所有者 ID 关联（实际生产环境应区分访客）
   db.prepare(`
-    INSERT INTO share_comments (id, noteId, userId, parentId, content, anchorData)
-    VALUES (?, ?, ?, ?, ?, ?)
-  `).run(id, share.noteId, share.ownerId, parentId || null, content.trim(), anchorData || null);
+    INSERT INTO share_comments (id, noteId, userId, guestName, guestIpHash, parentId, content, anchorData)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(id, share.noteId, userId, storedGuestName, ipHash, parentId || null, trimmedContent, anchorData || null);
 
   const comment = db.prepare(`
-    SELECT sc.id, sc.noteId, sc.parentId, sc.content, sc.anchorData, sc.isResolved, sc.createdAt,
-           COALESCE(?, u.username) AS username, u.avatarUrl
+    SELECT sc.id, sc.noteId, sc.userId, sc.guestName, sc.parentId, sc.content, sc.anchorData,
+           sc.isResolved, sc.createdAt, sc.updatedAt,
+           u.username, u.avatarUrl,
+           COALESCE(NULLIF(sc.guestName, ''), u.username, '匿名') AS displayName,
+           CASE WHEN sc.userId IS NULL THEN 1 ELSE 0 END AS isGuest
     FROM share_comments sc
     LEFT JOIN users u ON sc.userId = u.id
     WHERE sc.id = ?
-  `).get(guestName || null, id) as any;
+  `).get(id) as any;
 
+  comment.isGuest = comment.isGuest === 1;
   return c.json(comment, 201);
 });
 

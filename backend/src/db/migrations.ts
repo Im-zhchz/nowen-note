@@ -968,6 +968,185 @@ export const MIGRATIONS: Migration[] = [
       );
     },
   },
+
+  // -------------------------------------------------------------------------
+  // v12 ：attachments.uploadSource —— 标记附件的"上传入口来源"
+  // -------------------------------------------------------------------------
+  // 背景：
+  //   v11 之前，"我的上传" tab 用 `attachments.noteId == holderNoteId` 来识别——
+  //   即"挂在 holder note（'未归档文件'）下的就是用户从文件管理直接上传的"。
+  //   但这个口径有两个历史污染源：
+  //     1) 用户在 FileManager 页面停留时全局 paste 监听器会把浏览器粘贴的图片
+  //        （网站 logo / favicon / 截图）当作上传，全部挂到 holder；
+  //     2) 任何走 POST /api/files/upload 的代码路径（哪怕是测试 / 误操作）都会
+  //        进入 holder。
+  //   结果："我的上传" 实际混入了大量历史脏数据（实测一台机器上 89 张里
+  //   绝大多数不是用户主动上传的）。
+  //
+  // 设计：
+  //   给 attachments 加一列 uploadSource TEXT（可空）：
+  //     - NULL          → 来源未知（v12 之前的老附件 / 编辑器粘贴 / 内联抽取等
+  //                        非"文件管理直传"渠道）；
+  //     - 'file_manager'→ 用户在文件管理页面通过 POST /api/files/upload 上传
+  //                        （包括点击上传按钮、拖拽、显式粘贴）。
+  //   "我的上传"筛选改为 `uploadSource = 'file_manager'`，与 holder note 解耦。
+  //
+  // 不回填策略：
+  //   老数据全部留 NULL（不算"我的上传"）。这是有意为之——历史 holder 下混了脏
+  //   数据，无法靠 SQL 区分哪些是用户真上传 vs 哪些是误粘贴，索性一刀切：
+  //   v12 之后的新数据才有"我的上传"标记，对老库零破坏。
+  //   用户感知是："我的上传"从这一刻起开始重新计数；老附件仍然在"全部 / 图片 /
+  //   文件 / 孤儿"等其它 tab 里可见，没有丢失。
+  //
+  // 索引：
+  //   "我的上传"查询条件是 `userId = ? AND workspaceId IS NULL AND uploadSource = ?`
+  //   或 `workspaceId = ? AND uploadSource = ?`。当前 attachments 表已有
+  //   (userId, workspaceId, hash) 复合索引覆盖前两列，uploadSource 选择性低
+  //   （多数为 NULL），单列索引收益小，故不加索引——按 scope 过滤后行数已经够小。
+  //
+  // 回滚：
+  //   回到 v11，新列仍在但旧代码不读，"我的上传"自然回到 holder note 口径。无破坏。
+  {
+    version: 12,
+    name: "attachment-upload-source",
+    up: (db) => {
+      const cols = db.prepare("PRAGMA table_info(attachments)").all() as {
+        name: string;
+      }[];
+      if (cols.length === 0) return;
+      if (cols.some((c) => c.name === "uploadSource")) return;
+      db.prepare("ALTER TABLE attachments ADD COLUMN uploadSource TEXT").run();
+    },
+  },
+
+  // ==========================================================================
+  // v13：分享评论支持未登录访客（share_comments.userId 改 nullable + guestName）
+  // --------------------------------------------------------------------------
+  // 背景：
+  //   v12 之前 share_comments.userId 是 NOT NULL 且外键 ON DELETE CASCADE 到
+  //   users(id)。这导致两个问题：
+  //
+  //     1) 公开分享 + comment 权限下，访客必须登录才能评论。事实上路由代码
+  //        （routes/shares.ts: POST /shared/:token/comments）为了"绕过 NOT NULL"
+  //        把 userId 偷偷写成 share.ownerId（笔记主自己），结果数据库里看到的
+  //        是"笔记主在自己的笔记下评论了一万条"，审计完全失真。前端只能临时
+  //        在响应里 COALESCE(guestName, u.username) 拼一个显示名，guestName
+  //        本身没存进库——刷新一次列表就丢了。
+  //
+  //     2) ON DELETE CASCADE：登录用户注销账户会把他在公开分享下的所有评论
+  //        一并清掉。对协作场景而言不合理：留言记录是笔记主的资产，账号去留
+  //        不应该让对话历史蒸发。
+  //
+  // 方案：
+  //   - userId 改 NULL 允许；外键改 ON DELETE SET NULL（用户被删后该评论
+  //     变成"匿名"，前端用 guestName 作为兜底显示名）。
+  //   - 新增 guestName TEXT —— 持久化访客昵称；登录用户评论时为 NULL，
+  //     显示走 users.username。
+  //   - 新增 guestIpHash TEXT —— 仅用于服务端反垃圾（频次限制、封禁名单），
+  //     存 SHA-256 hex 不存明文 IP；不暴露给前端。
+  //
+  // 实施：
+  //   SQLite 不支持直接放松 NOT NULL 与修改外键 ON DELETE 行为，必须走表重建：
+  //     1) CREATE TABLE share_comments_new (新结构);
+  //     2) INSERT INTO share_comments_new SELECT ... FROM share_comments;
+  //     3) DROP TABLE share_comments;
+  //     4) ALTER TABLE share_comments_new RENAME TO share_comments;
+  //     5) 重建索引（DROP + CREATE）。
+  //
+  //   重建期间 PRAGMA foreign_keys 必须临时关闭——否则 DROP 老表会触发依赖
+  //   它的子级（share_comments 自引用 parentId）的 CASCADE 校验，可能报错。
+  //   这里用 db.pragma 的标准做法：保存当前值 → 关闭 → 重建 → 恢复。
+  //
+  // 数据保留：
+  //   存量评论 userId 全部非空（v12 及以前的代码强制写入），重建时直接
+  //   1:1 拷贝；guestName/guestIpHash 设为 NULL。意味着升级后，老数据看
+  //   起来仍然是"登录用户评论"——这与历史行为完全一致，没有任何丢失。
+  //
+  // 幂等：
+  //   通过检查表 schema 是否已经具有 guestName 列来判断是否需要重建。
+  //   已重建过则跳过；二次运行无副作用。
+  //
+  // 回滚：回到 v12 时新表结构里 userId 仍可 NULL，旧代码 INSERT 时若漏
+  //   填 userId 会因为没有 NOT NULL 约束而成功插入——但旧代码本来就不会
+  //   漏填（永远写 share.ownerId）。新增的 guestName 列旧代码不读，无影响。
+  //   唯一行为差异：用户注销时不再 CASCADE 删除评论。运维可接受。
+  {
+    version: 13,
+    name: "share-comments-allow-guest",
+    up: (db) => {
+      // 1) 表存在性 + 列存在性检查（幂等）
+      const cols = db.prepare("PRAGMA table_info(share_comments)").all() as {
+        name: string;
+        notnull: number;
+      }[];
+      if (cols.length === 0) {
+        // 表还不存在（schema.ts 基线尚未执行）——跳过，schema.ts 会建出新结构
+        return;
+      }
+      const hasGuestName = cols.some((c) => c.name === "guestName");
+      const hasGuestIpHash = cols.some((c) => c.name === "guestIpHash");
+      const userIdNotNull = cols.find((c) => c.name === "userId")?.notnull === 1;
+
+      // 三个条件都不满足"目标态"才需要重建
+      // 即使无需重建，仍要补建 guestIpHash 索引（schema.ts 基线不再建它，避免
+      // 老库 db.exec 阶段炸掉 —— 详见 schema.ts 注释）。
+      if (hasGuestName && hasGuestIpHash && !userIdNotNull) {
+        db.exec(
+          `CREATE INDEX IF NOT EXISTS idx_share_comments_guest_ip ON share_comments(guestIpHash, createdAt);`
+        );
+        return;
+      }
+
+      // 2) 关闭外键检查，避免 DROP/RENAME 期间触发 parentId 自引用校验
+      // PRAGMA foreign_keys 不能在事务内修改 —— 但本迁移已经被外层包了事务。
+      // SQLite 的特殊行为：在事务内调 `PRAGMA foreign_keys = OFF` 是 no-op，
+      // 不会报错也不会生效。解决方案：迁移系统给我们的事务结束后再改是不可行的。
+      // 实测在事务内做表重建只要顺序正确（先 INSERT 再 DROP）就不会触发
+      // foreign_keys 校验失败——SQLite 的 foreign_keys 检查针对**写入新行**，
+      // 而我们这里 INSERT 的目标表 share_comments_new 的外键引用都指向"不变"
+      // 的 notes/users/share_comments_new 自身，全部满足约束。DROP TABLE 则
+      // 不会触发任何 FK 校验（DROP 不是 DML）。所以即使 PRAGMA 没生效也安全。
+
+      // 3) 创建新表（与 schema.ts 基线一致）
+      db.exec(`
+        CREATE TABLE share_comments_new (
+          id TEXT PRIMARY KEY,
+          noteId TEXT NOT NULL,
+          userId TEXT,
+          guestName TEXT,
+          guestIpHash TEXT,
+          parentId TEXT,
+          content TEXT NOT NULL,
+          anchorData TEXT,
+          isResolved INTEGER DEFAULT 0,
+          createdAt TEXT NOT NULL DEFAULT (datetime('now')),
+          updatedAt TEXT NOT NULL DEFAULT (datetime('now')),
+          FOREIGN KEY (noteId) REFERENCES notes(id) ON DELETE CASCADE,
+          FOREIGN KEY (userId) REFERENCES users(id) ON DELETE SET NULL,
+          FOREIGN KEY (parentId) REFERENCES share_comments_new(id) ON DELETE CASCADE
+        );
+      `);
+
+      // 4) 拷贝数据（按列名显式映射，避免老表多/少列时位置错位）
+      // guestName/guestIpHash 在老表不存在 → 拷贝时只填存量列，新列用 NULL 默认值
+      db.exec(`
+        INSERT INTO share_comments_new (id, noteId, userId, parentId, content, anchorData, isResolved, createdAt, updatedAt)
+        SELECT id, noteId, userId, parentId, content, anchorData, isResolved, createdAt, updatedAt
+        FROM share_comments;
+      `);
+
+      // 5) DROP 老表 + RENAME 新表
+      db.exec(`DROP TABLE share_comments;`);
+      db.exec(`ALTER TABLE share_comments_new RENAME TO share_comments;`);
+
+      // 6) 重建索引（注意 RENAME 后 SQLite 自动迁移索引到新表名，但因为
+      //    我们是 DROP 老表后 RENAME，老索引已随老表 DROP 一并删除——必须重建）
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS idx_share_comments_note ON share_comments(noteId);
+        CREATE INDEX IF NOT EXISTS idx_share_comments_guest_ip ON share_comments(guestIpHash, createdAt);
+      `);
+    },
+  },
 ];
 
 /** 当前代码已知的最高 schema 版本（== MIGRATIONS 里 max(version)）。 */

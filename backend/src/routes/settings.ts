@@ -1,6 +1,7 @@
 import { Hono } from "hono";
 import { getDb } from "../db/schema";
 import { isSystemAdmin } from "../middleware/acl";
+import { invalidateFilesQueryDebugCache } from "./files";
 
 const settings = new Hono();
 
@@ -21,6 +22,16 @@ export interface SiteSettings {
   feature_personal_export_enabled: string;
   /** @deprecated 同上，参考 {@link SiteSettings.feature_personal_export_enabled} */
   feature_personal_import_enabled: string;
+  /**
+   * 调试开关：是否在 GET /api/files 列表请求中打印 query 解析详情（raw / parsed
+   * / whereSql / paramCount）。专为排查 query 大小写 / 拼写陷阱（参考 v12
+   * myUploads 字面量血泪）设计。
+   *
+   * 值为 "true" / "false" 字符串。仅系统管理员可写——开启后日志量与请求成正比，
+   * 普通用户不应能切换；env `DEBUG_FILES_QUERY=1` 仍作为运维侧旁路开关，二者
+   * 任一为 true 即生效（运维与运行时设置互不阻塞）。
+   */
+  debug_files_query: string;
 }
 
 const DEFAULTS: SiteSettings = {
@@ -30,15 +41,18 @@ const DEFAULTS: SiteSettings = {
   // 仅作为"旧前端拿到的透传兜底值"存在；新前端忽略。
   feature_personal_export_enabled: "true",
   feature_personal_import_enabled: "true",
+  debug_files_query: "false",
 };
 
 // 获取所有站点设置
 settings.get("/", (c) => {
   const db = getDb();
   // 同时下发 feature_* 旧键以兼容未升级的旧客户端；新客户端不再消费这两个值。
+  // debug_* 系列是运行时调试开关（如 debug_files_query），下发给前端以便管理员
+  // 在「设置 → 开发者」面板里看到当前状态；非管理员前端会自行忽略。
   const rows = db
     .prepare(
-      "SELECT key, value FROM system_settings WHERE key LIKE 'site_%' OR key LIKE 'editor_%' OR key LIKE 'feature_%'",
+      "SELECT key, value FROM system_settings WHERE key LIKE 'site_%' OR key LIKE 'editor_%' OR key LIKE 'feature_%' OR key LIKE 'debug_%'",
     )
     .all() as { key: string; value: string }[];
   const result: Record<string, string> = { ...DEFAULTS };
@@ -73,6 +87,16 @@ settings.put("/", async (c) => {
     );
   }
 
+  // debug_* 系列是站点级运行时开关，影响所有用户的请求行为（日志量、可能的
+  // 性能开销），普通用户不能切——单独再做一次闸门。
+  const wantsDebugFlag = body.debug_files_query !== undefined;
+  if (wantsDebugFlag && !isSystemAdmin(userId)) {
+    return c.json(
+      { error: "仅管理员可修改调试开关", code: "FORBIDDEN" },
+      403,
+    );
+  }
+
   const db = getDb();
 
   const upsert = db.prepare(`
@@ -91,6 +115,17 @@ settings.put("/", async (c) => {
     if (body.editor_font_family !== undefined) {
       upsert.run("editor_font_family", body.editor_font_family);
     }
+    if (body.debug_files_query !== undefined) {
+      // 归一化成 "true" / "false"——前端可能传 boolean，也可能传字符串
+      const raw = body.debug_files_query as unknown;
+      const normalized =
+        raw === true || raw === "true" || raw === 1 || raw === "1"
+          ? "true"
+          : "false";
+      upsert.run("debug_files_query", normalized);
+      // files.ts 内部缓存 30s，写入后主动失效一次，让下一个请求立即读到新值
+      invalidateFilesQueryDebugCache();
+    }
     // feature_personal_*_enabled 已废弃：即使传了也不再写库，避免跟 per-user
     // 字段互相遮蔽。要修改请调 PATCH /api/users/:id。
   });
@@ -99,7 +134,7 @@ settings.put("/", async (c) => {
   // 返回更新后的全部设置
   const rows = db
     .prepare(
-      "SELECT key, value FROM system_settings WHERE key LIKE 'site_%' OR key LIKE 'editor_%' OR key LIKE 'feature_%'",
+      "SELECT key, value FROM system_settings WHERE key LIKE 'site_%' OR key LIKE 'editor_%' OR key LIKE 'feature_%' OR key LIKE 'debug_%'",
     )
     .all() as { key: string; value: string }[];
   const result: Record<string, string> = { ...DEFAULTS };

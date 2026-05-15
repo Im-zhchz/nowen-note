@@ -2,10 +2,11 @@ import React, { useState, useEffect, useMemo, useRef, useCallback } from "react"
 import { motion, AnimatePresence } from "framer-motion";
 import {
   BookOpen, Plus, Star, Trash2, Search, ChevronRight,
-  ChevronDown, PanelLeftClose, PanelLeft, ListTodo,
+  ChevronDown, ListTodo,
   Settings, LogOut, FilePlus, FolderPlus, Edit2, X, BrainCircuit,
-  Bot, CalendarDays, Smile, GripVertical,
-  FolderInput, Check, Home, Download, Inbox
+  Sparkles, NotebookPen, Smile, GripVertical,
+  FolderInput, Check, Home, Download, FolderOpen,
+  Columns2, Columns3,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -17,6 +18,7 @@ import WorkspaceSwitcher from "@/components/WorkspaceSwitcher";
 import { useContextMenu } from "@/hooks/useContextMenu";
 import { useApp, useAppActions } from "@/store/AppContext";
 import { useSiteSettings } from "@/hooks/useSiteSettings";
+import { useRailMode, nextRailMode } from "@/hooks/useRailMode";
 import { api, broadcastLogout, getCurrentWorkspace } from "@/lib/api";
 import { exportNotebook } from "@/lib/exportService";
 import { Notebook, ViewMode, WorkspaceFeatures } from "@/types";
@@ -598,11 +600,29 @@ function NotebookItem({
 
 // 笔记本右键菜单项 - 在组件内使用 t() 动态生成
 
-export default function Sidebar() {
+/**
+ * Sidebar
+ *
+ * variant:
+ *   - "mobile"（默认）：全功能侧栏——导航 8 项分 3 组（v15）+ 笔记本 + 标签 + 设置/登出。
+ *                      用于移动端抽屉，以及 NavRail 引入前的回退路径。
+ *   - "desktop"：精简侧栏——仅 WorkspaceSwitcher + 搜索 + 笔记本 + 标签。
+ *                导航、设置、登出、折叠按钮都迁移到 NavRail（v16 P3 双层 Rail 改造）。
+ *
+ * 桌面端配合 App.tsx 中的 <NavRail /> + <Sidebar variant="desktop" /> 组合使用；
+ * 折叠态（sidebarCollapsed=true）下 App.tsx 隐藏整个 Sidebar 但保留 NavRail。
+ */
+export default function Sidebar({ variant = "mobile" }: { variant?: "desktop" | "mobile" } = {}) {
   const { state } = useApp();
   const actions = useAppActions();
   const { siteConfig } = useSiteSettings();
+  const isDesktop = variant === "desktop";
   const { t } = useTranslation();
+  // v16 P3 后续：Rail 三档视觉模式（icon / label / hidden），仅桌面变体使用。
+  // 入口约定：Sidebar Header 那个按钮 = 循环切换到下一档，tooltip 提示下一档是什么。
+  // 约束（在 App.tsx 实施）：sidebarCollapsed=true 时即便 mode=hidden 也强制显示 Rail，
+  // 避免用户陷入"完全无侧栏入口"的死局——本组件不需要关心这个边界。
+  const [railMode, setRailMode] = useRailMode();
   const [searchInput, setSearchInput] = useState("");
   const [showSettings, setShowSettings] = useState(false);
   // Y4: 当前工作区的功能开关。null = 个人空间（不受限），对象 = 工作区 normalized 配置。
@@ -646,16 +666,11 @@ export default function Sidebar() {
     }
   });
 
-  // 导航区（所有笔记 / 说说 / 待办 / 思维导图 / AI 问答 / 收藏 / 回收站）折叠状态
-  // 与笔记本、标签区的折叠策略保持一致：默认展开，切换后持久化到 localStorage
-  const [navExpanded, setNavExpanded] = useState(() => {
-    try {
-      const saved = localStorage.getItem("nowen-nav-expanded");
-      return saved === null ? true : saved === "true";
-    } catch {
-      return true;
-    }
-  });
+  // v15 信息架构改造前：导航区是一个可折叠的扁平 8 项列表（与笔记本/标签的折叠策略一致），
+  // 用 navExpanded + nowen-nav-expanded localStorage 控制。改造后导航被拆为
+  // 工作台 / 内容模块 / 工具 三组并始终展开，折叠交互被去掉——主入口不应被隐藏。
+  // localStorage key 保留写权也不再读取，旧值会被自然遗忘；如果未来需要恢复，
+  // 可以重新引入这套 state。
 
   // 切换标签折叠状态时持久化到 localStorage
   const toggleTagsExpanded = useCallback(() => {
@@ -671,15 +686,6 @@ export default function Sidebar() {
     setNotebooksExpanded((prev) => {
       const next = !prev;
       try { localStorage.setItem("nowen-notebooks-expanded", String(next)); } catch {}
-      return next;
-    });
-  }, []);
-
-  // 切换导航区折叠状态时持久化到 localStorage
-  const toggleNavExpanded = useCallback(() => {
-    setNavExpanded((prev) => {
-      const next = !prev;
-      try { localStorage.setItem("nowen-nav-expanded", String(next)); } catch {}
       return next;
     });
   }, []);
@@ -1215,62 +1221,94 @@ export default function Sidebar() {
   //   - 工作区启用 JSON：显式 false 的模块被隐藏；未列出 / true 默认开启。
   //   - "all"（所有笔记）、"favorites"、"trash" 永远显示——它们是笔记模块本身，
   //     关掉 notes 相当于关掉整个工作区，产品上由 owner 在开关面板体现。
+  //
+  // v15 信息架构（方案 A）：扁平 8 项 → 3 个语义清晰的分组：
+  //   - workspace（工作台）：所有笔记 + 它的过滤视图（收藏 / 回收站）+ 横切资源（文件管理）。
+  //                        高频主入口，紧贴顶部，无分组标题，视觉权重最强。
+  //   - modules（内容模块）：说说 / 待办 / 思维导图——独立的内容类型。
+  //   - tools（工具）：AI 问答——功能性，与"内容"区分开。
+  // 顺序在数组里就是渲染顺序；分组渲染时按 group 字段切片。
   const navItemsRaw: {
     icon: React.ReactNode;
     label: string;
     mode: ViewMode;
     active: boolean;
     feature?: keyof WorkspaceFeatures;
+    group: "workspace" | "modules" | "tools";
   }[] = [
-    { icon: <BookOpen size={16} />, label: t('sidebar.allNotes'), mode: "all", active: state.viewMode === "all", feature: "notes" },
-    { icon: <CalendarDays size={16} />, label: t('sidebar.diary'), mode: "diary", active: state.viewMode === "diary", feature: "diaries" },
-    { icon: <ListTodo size={16} />, label: t('sidebar.tasks'), mode: "tasks", active: state.viewMode === "tasks", feature: "tasks" },
-    { icon: <BrainCircuit size={16} />, label: t('sidebar.mindMaps'), mode: "mindmaps", active: state.viewMode === "mindmaps", feature: "mindmaps" },
-    { icon: <Bot size={16} />, label: t('sidebar.aiChat'), mode: "ai-chat", active: state.viewMode === "ai-chat" },
-    { icon: <Inbox size={16} />, label: t('sidebar.fileManager'), mode: "files", active: state.viewMode === "files", feature: "files" },
+    // ─── 工作台 ───
+    { icon: <BookOpen size={16} />, label: t('sidebar.allNotes'), mode: "all", active: state.viewMode === "all", feature: "notes", group: "workspace" },
+    { icon: <Star size={16} />, label: t('sidebar.favorites'), mode: "favorites", active: state.viewMode === "favorites", feature: "favorites", group: "workspace" },
+    { icon: <FolderOpen size={16} />, label: t('sidebar.fileManager'), mode: "files", active: state.viewMode === "files", feature: "files", group: "workspace" },
+    { icon: <Trash2 size={16} />, label: t('sidebar.trash'), mode: "trash", active: state.viewMode === "trash", group: "workspace" },
 
-    { icon: <Star size={16} />, label: t('sidebar.favorites'), mode: "favorites", active: state.viewMode === "favorites", feature: "favorites" },
-    { icon: <Trash2 size={16} />, label: t('sidebar.trash'), mode: "trash", active: state.viewMode === "trash" },
+    // ─── 内容模块 ───
+    { icon: <NotebookPen size={16} />, label: t('sidebar.diary'), mode: "diary", active: state.viewMode === "diary", feature: "diaries", group: "modules" },
+    { icon: <ListTodo size={16} />, label: t('sidebar.tasks'), mode: "tasks", active: state.viewMode === "tasks", feature: "tasks", group: "modules" },
+    { icon: <BrainCircuit size={16} />, label: t('sidebar.mindMaps'), mode: "mindmaps", active: state.viewMode === "mindmaps", feature: "mindmaps", group: "modules" },
+
+    // ─── 工具 ───
+    { icon: <Sparkles size={16} />, label: t('sidebar.aiChat'), mode: "ai-chat", active: state.viewMode === "ai-chat", group: "tools" },
   ];
   const navItems = features
     ? navItemsRaw.filter((it) => !it.feature || features[it.feature] !== false)
     : navItemsRaw;
 
-  if (state.sidebarCollapsed) {
-    return (
-      <div className="hidden md:flex w-12 h-full vibrancy-sidebar bg-app-sidebar border-r border-app-border flex-col items-center py-3 gap-2 shrink-0 transition-colors">
-        <Button variant="ghost" size="icon" onClick={actions.toggleSidebar}>
-          <PanelLeft size={16} />
-        </Button>
-      </div>
-    );
-  }
+  // v16：桌面端折叠态由 App.tsx 控制（隐藏整个 Sidebar 但保留 NavRail）。
+  // 移动端没有折叠概念（抽屉显隐由 mobileSidebarOpen 控制），所以这里无需任何分支。
+
+
 
   return (
     <div
       className="w-full h-full vibrancy-sidebar bg-app-sidebar border-r border-app-border flex flex-col shrink-0 transition-colors"
       style={{ width: undefined }}
     >
-      {/* Header */}
-      <div className="flex items-center justify-between px-4 py-3 border-b border-app-border" style={{ paddingTop: 'calc(var(--safe-area-top) + 12px)' }}>
+      {/* Header（v15 紧凑化：py-3 → py-2，给下方笔记本/标签腾出 ~8px）
+          v16：桌面变体下折叠按钮已迁移到 NavRail，Header 仅保留 Title +（移动）关闭按钮
+          v16 P3 后续：桌面变体右侧加 Rail 模式切换按钮——单按钮循环切换三档
+          icon → label → hidden → icon …，tooltip 提示下一档名称。
+          单按钮循环的好处：无需新增菜单组件、无需占用 Header 多余空间；
+          代价：用户首次发现需要点 2 次才到目标态——属于可接受的学习成本。 */}
+      <div className="flex items-center justify-between px-4 py-2 border-b border-app-border" style={{ paddingTop: 'calc(var(--safe-area-top) + 8px)' }}>
         <h1 className="text-sm font-semibold text-tx-primary tracking-wide">{siteConfig.title}</h1>
         <div className="flex items-center gap-1">
-          <Button variant="ghost" size="icon" className="hidden md:inline-flex" onClick={actions.toggleSidebar}>
-            <PanelLeftClose size={16} />
-          </Button>
-          <Button variant="ghost" size="icon" className="md:hidden" onClick={() => actions.setMobileSidebar(false)}>
-            <X size={16} />
-          </Button>
+          {isDesktop && (() => {
+            const next = nextRailMode(railMode);
+            // 当前态对应的图标（提示"现在是几栏"），点击后切到 next：
+            //   icon   → Columns3（3 列：Rail+Sidebar+Editor，纯图标 Rail）
+            //   label  → 在 Columns3 基础上加底部小条暗示"带文字"——lucide 没有正好的图标，
+            //           复用 Columns3 但 tooltip 不一样，足够区分（实测优于硬塞个不准的图标）
+            //   hidden → Columns2（2 列：仅 Sidebar+Editor）
+            const CurrentIcon = railMode === "hidden" ? Columns2 : Columns3;
+            return (
+              <Button
+                variant="ghost"
+                size="icon"
+                onClick={() => setRailMode(next)}
+                title={t(`sidebar.railMode.switchTo.${next}`)}
+                aria-label={t(`sidebar.railMode.switchTo.${next}`)}
+              >
+                <CurrentIcon size={16} />
+              </Button>
+            );
+          })()}
+          {!isDesktop && (
+            <Button variant="ghost" size="icon" className="md:hidden" onClick={() => actions.setMobileSidebar(false)}>
+              <X size={16} />
+            </Button>
+          )}
         </div>
       </div>
 
-      {/* Workspace Switcher (Phase 1 多用户协作) */}
-      <div className="px-3 pt-2">
+      {/* Workspace Switcher + Search（v15：合并垂直 padding，
+          原来 pt-2 + py-2 共占 ~16px 间隙，现在压到 ~8px） */}
+      <div className="px-3 pt-1.5 pb-1">
         <WorkspaceSwitcher />
       </div>
 
       {/* Search */}
-      <div className="px-3 py-2">
+      <div className="px-3 pb-1.5">
         <div className="relative">
           <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 text-tx-tertiary" size={14} />
           <Input
@@ -1295,84 +1333,105 @@ export default function Sidebar() {
         </div>
       </div>
 
-      {/* Navigation */}
-      <div className="px-3 flex items-center justify-between mb-1 mt-1">
-        <button
-          onClick={() => toggleNavExpanded()}
-          className="flex items-center gap-1 hover:text-tx-secondary transition-colors"
-          title={t('sidebar.navigation')}
-        >
-          <ChevronDown
-            size={12}
-            className={cn(
-              "text-tx-tertiary transition-transform duration-200",
-              !navExpanded && "-rotate-90"
-            )}
-          />
-          <span className="text-xs font-medium text-tx-tertiary uppercase tracking-wider">{t('sidebar.navigation')}</span>
-        </button>
-      </div>
+      {/* ===== Navigation（信息架构 v15：方案 A 三组分层） =====
+          v16：桌面端这块整体迁移到 NavRail（左侧 48px 列）。移动端继续在抽屉里渲染——
+          因为抽屉宽 ~340px，没必要再分 Rail/主侧栏两栏。
 
-      <AnimatePresence initial={false}>
-        {navExpanded && (
-          <motion.div
-            initial={{ height: 0, opacity: 0, overflow: "hidden" }}
-            animate={{ height: "auto", opacity: 1, overflow: "visible", transitionEnd: { overflow: "visible" } }}
-            exit={{ height: 0, opacity: 0, overflow: "hidden" }}
-            transition={{ duration: 0.2 }}
-          >
-            <div className="px-3 py-1 space-y-0.5">
-              {navItems.map((item) => {
-                const isTrashItem = item.mode === "trash";
-                return (
-                  <div key={item.mode} className="relative group">
-                    <button
-                      onClick={() => {
-                        actions.setViewMode(item.mode);
-                        actions.setSelectedNotebook(null);
-                        actions.setMobileSidebar(false);
-                      }}
-                      onContextMenu={
-                        isTrashItem
-                          ? (e) => {
-                              e.preventDefault();
-                              openEmptyTrashConfirm();
-                            }
-                          : undefined
-                      }
-                      className={cn(
-                        "flex items-center gap-2.5 w-full px-2 py-1.5 rounded-md text-sm transition-colors",
-                        item.active
-                          ? "bg-app-active text-tx-primary"
-                          : "text-tx-secondary hover:bg-app-hover hover:text-tx-primary",
-                        isTrashItem && "pr-8"
-                      )}
-                    >
-                      {item.icon}
-                      {item.label}
-                    </button>
-                    {isTrashItem && (
+          - 工作台（无标题，紧贴顶部直接呈现）：所有笔记 / 收藏 / 文件管理 / 回收站
+          - 内容模块（小标题）：说说 / 待办 / 思维导图
+          - 工具（小标题）：AI 问答
+
+          v15 之前是「导航」一个折叠头 + 8 个扁平项。本次改造：
+          - 去掉「导航」折叠头——工作台是高频主入口，不该折叠隐藏；
+            navExpanded 状态保留但仅作"全部展开"分支使用，不再渲染折叠交互
+            （历史用户的 localStorage 值继续兼容，未来可彻底废弃）。
+          - 子分组用更弱的小标题（不可折叠），避免抢笔记本/标签栏的视觉权重。
+          - Active 态改为左侧 2px 高亮条 + 图标变色——比纯背景色变化在余光里更可识别
+            （Notion / Linear / Things 通用做法）。 */}
+      {!isDesktop && (
+      <div className="px-3 mt-1">
+        {(["workspace", "modules", "tools"] as const).map((group) => {
+          const items = navItems.filter((it) => it.group === group);
+          if (items.length === 0) return null;
+          // 工作台无标题（视觉上紧贴搜索框，强调主入口地位）。
+          const groupLabel =
+            group === "modules"
+              ? t('sidebar.navModules')
+              : group === "tools"
+                ? t('sidebar.navTools')
+                : null;
+          return (
+            <div key={group} className={cn(group !== "workspace" && "mt-2")}>
+              {groupLabel && (
+                <div className="px-2 mb-1">
+                  <span className="text-[10px] font-medium text-tx-tertiary uppercase tracking-wider">
+                    {groupLabel}
+                  </span>
+                </div>
+              )}
+              <div className="space-y-0.5">
+                {items.map((item) => {
+                  const isTrashItem = item.mode === "trash";
+                  return (
+                    <div key={item.mode} className="relative group">
                       <button
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          openEmptyTrashConfirm();
+                        onClick={() => {
+                          actions.setViewMode(item.mode);
+                          actions.setSelectedNotebook(null);
+                          actions.setMobileSidebar(false);
                         }}
-                        title={t('sidebar.emptyTrash')}
-                        className="absolute right-1 top-1/2 -translate-y-1/2 p-1 rounded opacity-0 group-hover:opacity-100 hover:bg-red-500/10 text-tx-tertiary hover:text-red-500 transition-all"
+                        onContextMenu={
+                          isTrashItem
+                            ? (e) => {
+                                e.preventDefault();
+                                openEmptyTrashConfirm();
+                              }
+                            : undefined
+                        }
+                        className={cn(
+                          "relative flex items-center gap-2.5 w-full pl-3 pr-2 py-1.5 rounded-md text-sm transition-colors",
+                          item.active
+                            ? "bg-accent-primary/10 text-accent-primary font-medium"
+                            : "text-tx-secondary hover:bg-app-hover hover:text-tx-primary",
+                          // 回收站作为破坏性入口，未选中时进一步降级（更弱的灰）
+                          isTrashItem && !item.active && "text-tx-tertiary",
+                          isTrashItem && "pr-8"
+                        )}
                       >
-                        <Trash2 size={13} />
+                        {/* Active 左侧高亮条：2px 宽，避开圆角，仅在选中时出现 */}
+                        {item.active && (
+                          <span
+                            className="absolute left-0 top-1.5 bottom-1.5 w-[2px] rounded-full bg-accent-primary"
+                            aria-hidden
+                          />
+                        )}
+                        {item.icon}
+                        {item.label}
                       </button>
-                    )}
-                  </div>
-                );
-              })}
+                      {isTrashItem && (
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            openEmptyTrashConfirm();
+                          }}
+                          title={t('sidebar.emptyTrash')}
+                          className="absolute right-1 top-1/2 -translate-y-1/2 p-1 rounded opacity-0 group-hover:opacity-100 hover:bg-red-500/10 text-tx-tertiary hover:text-red-500 transition-all"
+                        >
+                          <Trash2 size={13} />
+                        </button>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
             </div>
-          </motion.div>
-        )}
-      </AnimatePresence>
+          );
+        })}
+      </div>
+      )}
 
-      {/* Separator */}
-      <div className="mx-3 my-2 border-t border-app-border" />
+      {/* Separator——仅移动端需要（桌面端 Navigation 已迁出，无须再隔） */}
+      {!isDesktop && <div className="mx-3 my-2 border-t border-app-border" />}
 
       {/* Notebooks */}
       <div className="px-3 flex items-center justify-between mb-1">
@@ -1580,7 +1639,8 @@ export default function Sidebar() {
         </AnimatePresence>
       </div>
 
-      {/* Footer: Settings + Logout */}
+      {/* Footer: Settings + Logout（v16：桌面端这两项已迁移到 NavRail 底部） */}
+      {!isDesktop && (
       <div className="border-t border-app-border px-3 py-2.5 flex items-center gap-2 shrink-0">
         <button
           onClick={() => setShowSettings(true)}
@@ -1603,6 +1663,7 @@ export default function Sidebar() {
           <LogOut size={15} />
         </button>
       </div>
+      )}
 
       {/* Settings Modal */}
       <AnimatePresence>

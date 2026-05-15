@@ -378,11 +378,26 @@ export default function SharedNoteView({ shareToken }: SharedNoteViewProps) {
    * - 已有昵称：直接进入编辑模式
    */
   const handleStartEditing = useCallback(() => {
-    if (!content || content.permission !== "edit") return;
+    if (!content) return;
+    // 支持 edit / edit_auth 两档；其他权限拒绝
+    const isEditable = content.permission === "edit" || content.permission === "edit_auth";
+    if (!isEditable) return;
     if (content.isLocked) {
       setSaveError("笔记已被所有者锁定，暂不可编辑");
       setSaveStatus("error");
       return;
+    }
+    // edit_auth 前置门禁：检查浏览器是否已有 nowen-token；没有就直接跳登录页，
+    // 不要让用户输完昵称再被服务端 401 弹回——体验会很差。
+    // 真正的合法性校验在后端 PUT /shared/:token/content 里二次确认（防绕过）。
+    if (content.permission === "edit_auth") {
+      let hasToken = false;
+      try { hasToken = !!localStorage.getItem("nowen-token"); } catch { /* ignore */ }
+      if (!hasToken) {
+        const redirect = encodeURIComponent(`/share/${shareToken}`);
+        window.location.assign(`/login?redirect=${redirect}`);
+        return;
+      }
     }
     // 作者本人访问自己的分享链接：免填昵称
     if (isOwnerViewing) {
@@ -404,7 +419,7 @@ export default function SharedNoteView({ shareToken }: SharedNoteViewProps) {
       return;
     }
     setIsEditing(true);
-  }, [content, isOwnerViewing, viewerDisplayName]);
+  }, [content, isOwnerViewing, viewerDisplayName, shareToken]);
 
   /**
    * 昵称弹窗提交：
@@ -476,6 +491,19 @@ export default function SharedNoteView({ shareToken }: SharedNoteViewProps) {
       } else if (e?.code === "GUEST_NAME_REQUIRED") {
         setSaveError("请先填写访客昵称");
         setShowNicknameModal(true);
+      } else if (e?.code === "LOGIN_REQUIRED") {
+        // edit_auth 权限：未登录用户的写入会被后端拒绝。
+        // 引导用户跳到登录页，附带 redirect 参数让登录成功后自动回到本分享页。
+        // 用 window.location.assign 而非 history.pushState：因为登录页是
+        // AuthGate 接管的整页路由，需要硬切才能正确触发；返回时也借浏览器
+        // 后退或登录成功后的 redirect 跳转回来。
+        setSaveError("此分享需登录后才能编辑，正在跳转登录页…");
+        setIsEditing(false);
+        const redirect = encodeURIComponent(`/share/${shareToken}`);
+        // 给用户一点时间看到提示再跳
+        setTimeout(() => {
+          window.location.assign(`/login?redirect=${redirect}`);
+        }, 800);
       } else {
         setSaveError(e?.message || "保存失败");
       }
@@ -740,8 +768,11 @@ export default function SharedNoteView({ shareToken }: SharedNoteViewProps) {
               </button>
             )}
 
-            {/* 访客编辑：入口按钮 / 昵称徽章 / 保存状态（仅当 permission === 'edit' 且笔记未锁定） */}
-            {content.permission === "edit" && !content.isLocked && (
+            {/* 访客编辑：入口按钮 / 昵称徽章 / 保存状态
+                permission === 'edit'      ：访客填昵称即可编辑
+                permission === 'edit_auth' ：必须登录；点击编辑后若未登录会被后端 401，
+                                              前端在 handleGuestSave 里捕获 LOGIN_REQUIRED 跳登录页 */}
+            {(content.permission === "edit" || content.permission === "edit_auth") && !content.isLocked && (
               <>
                 {isEditing ? (
                   <>
@@ -793,7 +824,13 @@ export default function SharedNoteView({ shareToken }: SharedNoteViewProps) {
             )}
 
             <span className="px-2 py-1 text-[10px] rounded-md bg-indigo-500/10 text-indigo-500 font-medium">
-              {content.permission === "view" ? "仅查看" : content.permission === "edit" ? "可编辑" : "可评论"}
+              {content.permission === "view"
+                ? "仅查看"
+                : content.permission === "edit"
+                ? "可编辑"
+                : content.permission === "edit_auth"
+                ? "可编辑（需登录）"
+                : "可评论"}
             </span>
           </div>
         </div>
@@ -808,9 +845,9 @@ export default function SharedNoteView({ shareToken }: SharedNoteViewProps) {
         )}
       </header>
 
-      {/* 笔记内容：edit + isEditing 时走 TiptapEditor；否则继续走只读 HTML 渲染 */}
+      {/* 笔记内容：edit / edit_auth + isEditing 时走 TiptapEditor；否则继续走只读 HTML 渲染 */}
       <main className="max-w-4xl mx-auto px-4 py-8">
-        {isEditing && content.permission === "edit" && fakeNoteForEditing ? (
+        {isEditing && (content.permission === "edit" || content.permission === "edit_auth") && fakeNoteForEditing ? (
           <div className="shared-note-editor">
             <TiptapEditor
               note={fakeNoteForEditing}
