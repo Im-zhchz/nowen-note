@@ -231,12 +231,11 @@ export async function handleDownloadAttachment(c: Context): Promise<Response> {
       requestedWidth,
     );
     if (thumb) {
-      // Node Buffer 在新版 @types/node + TS 5.x 下不再直接命中 BodyInit 联合类型
-      // （Buffer<ArrayBufferLike> 与 URLSearchParams 字段冲突）。Buffer 本就是
-      // Uint8Array 的子类，这里通过 new Uint8Array(buffer) 构造一个共享底层
-      // ArrayBuffer 的视图（零拷贝），既满足 BodyInit 又保留原始字节。
-      const body = new Uint8Array(thumb.buffer.buffer, thumb.buffer.byteOffset, thumb.buffer.byteLength);
-      return new Response(body, {
+      // TS 5.7+ 配合新版 @types/node：Buffer<ArrayBufferLike> / Uint8Array<ArrayBufferLike>
+      // 都不再直接命中 lib.dom.d.ts 的 BodyInit 联合类型（结构上与 URLSearchParams 冲突）。
+      // 用 Blob 包一层是最稳的兼容写法：Blob 是 BodyInit 的第一个成员，类型层面
+      // 永远兼容；Node 18+ Blob 是全局对象，构造 [buffer] 内部按需读字节，性能可接受。
+      return new Response(new Blob([thumb.buffer], { type: thumb.mimeType }), {
         headers: {
           "Content-Type": thumb.mimeType,
           // 缩略图与原图一样 immutable（webp 内容由 (id, w) 唯一决定）
@@ -260,9 +259,8 @@ export async function handleDownloadAttachment(c: Context): Promise<Response> {
   if (!isImageMime(row.mimeType) || forceDownload) {
     headers["Content-Disposition"] = encodeContentDispositionFilename(row.filename || "");
   }
-  // 同上：Buffer → Uint8Array 视图，避免 TS 5.x BodyInit 类型不兼容
-  const body = new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength);
-  return new Response(body, { headers });
+  // 同上：Buffer → Blob 包装，避免 TS 5.7+ Uint8Array<ArrayBufferLike> 不兼容 BodyInit
+  return new Response(new Blob([buffer], { type: headers["Content-Type"] }), { headers });
 }
 
 // ============================================================================
