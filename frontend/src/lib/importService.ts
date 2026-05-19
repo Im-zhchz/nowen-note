@@ -11,6 +11,7 @@ import TaskList from "@tiptap/extension-task-list";
 import TaskItem from "@tiptap/extension-task-item";
 import { Table, TableRow, TableHeader, TableCell } from "@tiptap/extension-table";
 import { common, createLowlight } from "lowlight";
+import { TextStyleKit } from "@/components/FontSizeExtension";
 
 const lowlight = createLowlight(common);
 
@@ -30,6 +31,9 @@ const tiptapExtensions = [
   TableRow,
   TableHeader,
   TableCell,
+  // TextStyle + Color + FontSize：与编辑器保持一致，否则导入近来的
+  // 带颜色/字号的 HTML 会被 generateJSON schema-filter 掉
+  ...TextStyleKit,
 ];
 
 export interface ImportFileInfo {

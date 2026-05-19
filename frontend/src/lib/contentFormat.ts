@@ -39,6 +39,7 @@ import { GFM } from "@lezer/markdown";
 import type { SyntaxNode } from "@lezer/common";
 import { MathInline, MathBlock } from "@/components/MathExtensions";
 import { FootnoteReference, FootnoteDefinition } from "@/components/FootnoteExtensions";
+import { TextStyleKit } from "@/components/FontSizeExtension";
 
 // ---------- 格式识别 ----------
 
@@ -134,6 +135,10 @@ function getTiptapExtensions() {
     // 脚注：与 TiptapEditor 对齐，generateHTML 时不能让 footnote 节点被过滤
     FootnoteReference,
     FootnoteDefinition,
+    // TextStyle + Color + FontSize：行内 <span style="color/font-size">
+    // 没有这三个扩展，generateHTML 时 textStyle mark 会被 schema 过滤掉
+    // → Turndown 拿不到 inline style → 切到 MD 后再切回 RTE 时颜色/字号丢失。
+    ...TextStyleKit,
   ];
   return _extensions;
 }
@@ -184,6 +189,41 @@ function getTurndown(): TurndownService {
   td.addRule("underline", {
     filter: ["u"] as any,
     replacement: (content) => `<u>${content}</u>`,
+  });
+
+  /**
+   * 行内字号 / 前景色：Tiptap 的 TextStyle + Color + FontSize 会渲染成
+   *   <span style="font-size:20px;color:#ef4444">…</span>
+   * Markdown 原生没有字号/前景色语法。Turndown 默认会丢掉 <span> 标签，
+   * 用户切到 MD 编辑器或导出 .md 后颜色/字号就消失了。
+   *
+   * 折中：CommonMark 允许 inline HTML，因此把这种 span **原样保留**为
+   * inline HTML。下游 markdownToHtml(@lezer/markdown) 遇到 `<span>` 会作为
+   * HTMLTag 透传，generateJSON 时 TextStyleKit 又能从 style 还原属性，
+   * 实现 RTE → MD → RTE 的颜色/字号无损往返。
+   *
+   * 安全考量：只透传 font-size / color / background-color 三个属性，
+   * 其它 style 一律丢弃，避免 onclick / expression() 等注入。
+   */
+  td.addRule("inlineTextStyle", {
+    filter: (node) => {
+      if (node.nodeName !== "SPAN") return false;
+      const el = node as HTMLElement;
+      const style = el.getAttribute("style") || "";
+      return /font-size\s*:|(?<!background-)color\s*:/i.test(style);
+    },
+    replacement: (content, node) => {
+      const el = node as HTMLElement;
+      const style = el.getAttribute("style") || "";
+      const safe: string[] = [];
+      const fs = style.match(/(?:^|;)\s*font-size\s*:\s*([^;]+)/i)?.[1]?.trim();
+      const fg = style.match(/(?:^|;)\s*color\s*:\s*([^;]+)/i)?.[1]?.trim();
+      if (fs) safe.push(`font-size:${fs}`);
+      if (fg) safe.push(`color:${fg}`);
+      if (!safe.length) return content;
+      const escaped = safe.join(";").replace(/"/g, "&quot;");
+      return `<span style="${escaped}">${content}</span>`;
+    },
   });
 
   /**
@@ -394,7 +434,8 @@ export function markdownToPlainText(md: string): string {
   text = text.replace(/!\[([^\]]*)\]\([^)]*\)/g, "$1");
   // 链接
   text = text.replace(/\[([^\]]+)\]\([^)]*\)/g, "$1");
-  // HTML 标签
+  // HTML 标签（含 <span style="color/font-size"> 这类 inline 样式包装：
+  // 仅剥标签，保留内部文字，避免全文搜索因为外观格式而漏命中）
   text = text.replace(/<[^>]+>/g, "");
   // 标题井号、引用符号、列表标记
   text = text.replace(/^\s{0,3}#{1,6}\s+/gm, "");

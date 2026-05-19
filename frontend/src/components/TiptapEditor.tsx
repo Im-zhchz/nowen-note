@@ -27,7 +27,8 @@ import {
   Code, FileCode, Sparkles, X, ZoomIn, ZoomOut, RotateCcw,
   Table2, Indent, Outdent, AlignLeft, AlignCenter, AlignRight, Trash2,
   FileType, Check, AlertCircle, Info, ArrowUp, Link as LinkIcon,
-  ExternalLink, Unlink2, Workflow, Sigma, BookOpen
+  ExternalLink, Unlink2, Workflow, Sigma, BookOpen,
+  Type, Palette, Eraser, ChevronDown,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { toast } from "@/lib/toast";
@@ -42,6 +43,12 @@ import { SlashCommandsMenu, getDefaultSlashCommands, createSlashExtension, creat
 import { MarkdownEnhancements } from "@/components/MarkdownEnhancements";
 import { MathExtensions } from "@/components/MathExtensions";
 import { FootnoteExtensions, nextFootnoteIdentifier } from "@/components/FootnoteExtensions";
+import {
+  TextStyleKit,
+  FONT_SIZE_PRESETS,
+  COLOR_PRESETS,
+  HIGHLIGHT_PRESETS,
+} from "@/components/FontSizeExtension";
 import CodeBlockView from "@/components/CodeBlockView";
 
 
@@ -731,6 +738,262 @@ function ToolbarDivider() {
 }
 
 /**
+ * 字号选择器（轻量 Popover）
+ * - 4 个预设档位 + 自定义 px 输入（8-96）
+ * - "清除"：移除当前选区的 fontSize 属性
+ * - 通过 onMouseDown preventDefault 防止编辑器 blur，保证 setMark 后选区还在
+ */
+interface FontSizePopoverProps {
+  editor: any;
+  iconSize?: number;
+  /** 仅用于气泡菜单，UI 紧凑一些 */
+  compact?: boolean;
+}
+function FontSizePopover({ editor, iconSize = 15, compact = false }: FontSizePopoverProps) {
+  const [open, setOpen] = useState(false);
+  const [custom, setCustom] = useState("");
+  const ref = useRef<HTMLDivElement | null>(null);
+  const currentSize: string | null = editor.getAttributes("textStyle")?.fontSize || null;
+
+  // 点击外部关闭
+  useEffect(() => {
+    if (!open) return;
+    const onDocDown = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener("mousedown", onDocDown);
+    return () => document.removeEventListener("mousedown", onDocDown);
+  }, [open]);
+
+  const apply = (size: string) => {
+    if (!size) return;
+    editor.chain().focus().setFontSize(size).run();
+    setOpen(false);
+  };
+  const clear = () => {
+    editor.chain().focus().unsetFontSize().run();
+    setOpen(false);
+  };
+  const applyCustom = () => {
+    const raw = custom.trim();
+    if (!raw) return;
+    // 用户只输了数字 → 默认 px
+    const size = /^\d+(\.\d+)?$/.test(raw) ? `${raw}px` : raw;
+    apply(size);
+    setCustom("");
+  };
+
+  const btnSize = compact ? 14 : iconSize;
+  return (
+    <div ref={ref} className="relative" onMouseDown={(e) => e.preventDefault()}>
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        title={`${currentSize ? `字号: ${currentSize}` : "字号"}`}
+        className={cn(
+          "p-1.5 rounded-md transition-colors flex items-center gap-0.5",
+          currentSize
+            ? "bg-accent-primary/20 text-accent-primary"
+            : "text-tx-secondary hover:bg-app-hover hover:text-tx-primary",
+        )}
+      >
+        <Type size={btnSize} />
+        <ChevronDown size={10} className="opacity-60" />
+      </button>
+      {open && (
+        <div className="absolute top-full left-0 mt-1 z-50 w-44 p-2 rounded-lg shadow-lg bg-app-elevated border border-app-border">
+          <div className="text-[11px] text-tx-tertiary px-1 pb-1">预设</div>
+          <div className="grid grid-cols-2 gap-1">
+            {FONT_SIZE_PRESETS.map((p) => (
+              <button
+                key={p.key}
+                type="button"
+                onClick={() => apply(p.value)}
+                className={cn(
+                  "px-2 py-1 text-xs rounded text-left hover:bg-app-hover",
+                  currentSize === p.value && "bg-accent-primary/15 text-accent-primary",
+                )}
+              >
+                <span className="block leading-tight" style={{ fontSize: p.value }}>{p.label}</span>
+                <span className="text-[10px] text-tx-tertiary">{p.value}</span>
+              </button>
+            ))}
+          </div>
+          <div className="text-[11px] text-tx-tertiary px-1 pt-2 pb-1">自定义 (8–96 px)</div>
+          <div className="flex gap-1">
+            <input
+              type="text"
+              inputMode="numeric"
+              placeholder="如 18 或 18px"
+              value={custom}
+              onChange={(e) => setCustom(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  applyCustom();
+                }
+              }}
+              className="flex-1 px-2 py-1 text-xs rounded border border-app-border bg-app-surface focus:outline-none focus:ring-1 focus:ring-accent-primary"
+            />
+            <button
+              type="button"
+              onClick={applyCustom}
+              className="px-2 py-1 text-xs rounded bg-accent-primary text-white hover:opacity-90"
+            >
+              <Check size={12} />
+            </button>
+          </div>
+          <div className="border-t border-app-border my-2" />
+          <button
+            type="button"
+            onClick={clear}
+            className="w-full px-2 py-1 text-xs rounded text-tx-secondary hover:bg-app-hover flex items-center gap-1"
+          >
+            <Eraser size={12} />
+            清除字号
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * 颜色 / 高亮选择器（双 Tab）
+ * - 前景色：基于 TextStyle + Color 扩展（setColor / unsetColor）
+ * - 背景色：基于 Highlight multicolor 扩展（setHighlight {color} / unsetHighlight）
+ * - 12 色 swatch + <input type="color"> 自定义
+ */
+interface ColorPopoverProps {
+  editor: any;
+  iconSize?: number;
+  compact?: boolean;
+}
+function ColorPopover({ editor, iconSize = 15, compact = false }: ColorPopoverProps) {
+  const [open, setOpen] = useState(false);
+  const [tab, setTab] = useState<"fg" | "bg">("fg");
+  const ref = useRef<HTMLDivElement | null>(null);
+  const fgColor: string | null = editor.getAttributes("textStyle")?.color || null;
+  const bgColor: string | null = editor.getAttributes("highlight")?.color || null;
+  const isActive = !!fgColor || !!bgColor;
+
+  useEffect(() => {
+    if (!open) return;
+    const onDocDown = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener("mousedown", onDocDown);
+    return () => document.removeEventListener("mousedown", onDocDown);
+  }, [open]);
+
+  const applyColor = (c: string) => {
+    if (tab === "fg") editor.chain().focus().setColor(c).run();
+    else editor.chain().focus().setHighlight({ color: c }).run();
+    setOpen(false);
+  };
+  const clearColor = () => {
+    if (tab === "fg") editor.chain().focus().unsetColor().run();
+    else editor.chain().focus().unsetHighlight().run();
+    setOpen(false);
+  };
+
+  const swatches = tab === "fg" ? COLOR_PRESETS : HIGHLIGHT_PRESETS;
+  const current = tab === "fg" ? fgColor : bgColor;
+  const btnSize = compact ? 14 : iconSize;
+
+  return (
+    <div ref={ref} className="relative" onMouseDown={(e) => e.preventDefault()}>
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        title={isActive ? `颜色: ${fgColor || ""} ${bgColor ? "背景: " + bgColor : ""}`.trim() : "颜色"}
+        className={cn(
+          "p-1.5 rounded-md transition-colors flex items-center gap-0.5",
+          isActive
+            ? "bg-accent-primary/20 text-accent-primary"
+            : "text-tx-secondary hover:bg-app-hover hover:text-tx-primary",
+        )}
+      >
+        <span className="relative inline-flex items-center">
+          <Palette size={btnSize} />
+          {/* 当前色提示横条 */}
+          <span
+            className="absolute -bottom-0.5 left-0 right-0 h-0.5 rounded-full"
+            style={{ background: fgColor || "transparent" }}
+          />
+        </span>
+        <ChevronDown size={10} className="opacity-60" />
+      </button>
+      {open && (
+        <div className="absolute top-full left-0 mt-1 z-50 w-56 p-2 rounded-lg shadow-lg bg-app-elevated border border-app-border">
+          {/* Tab */}
+          <div className="flex gap-1 mb-2 p-0.5 rounded bg-app-surface">
+            <button
+              type="button"
+              onClick={() => setTab("fg")}
+              className={cn(
+                "flex-1 px-2 py-1 text-xs rounded transition-colors",
+                tab === "fg" ? "bg-app-elevated shadow-sm" : "text-tx-tertiary hover:text-tx-primary",
+              )}
+            >
+              文字
+            </button>
+            <button
+              type="button"
+              onClick={() => setTab("bg")}
+              className={cn(
+                "flex-1 px-2 py-1 text-xs rounded transition-colors",
+                tab === "bg" ? "bg-app-elevated shadow-sm" : "text-tx-tertiary hover:text-tx-primary",
+              )}
+            >
+              背景
+            </button>
+          </div>
+          {/* Swatches */}
+          <div className="grid grid-cols-6 gap-1.5">
+            {swatches.map((c) => (
+              <button
+                key={c}
+                type="button"
+                onClick={() => applyColor(c)}
+                title={c}
+                className={cn(
+                  "w-7 h-7 rounded border transition-transform hover:scale-110",
+                  current?.toLowerCase() === c.toLowerCase()
+                    ? "border-accent-primary ring-2 ring-accent-primary/40"
+                    : "border-app-border",
+                )}
+                style={{ background: c }}
+              />
+            ))}
+          </div>
+          {/* 自定义颜色 */}
+          <div className="flex items-center gap-2 mt-2">
+            <label className="flex items-center gap-1.5 px-2 py-1 text-xs rounded border border-app-border hover:bg-app-hover cursor-pointer">
+              <input
+                type="color"
+                value={current || (tab === "fg" ? "#ef4444" : "#fef9c3")}
+                onChange={(e) => applyColor(e.target.value)}
+                className="w-4 h-4 p-0 border-0 bg-transparent cursor-pointer"
+              />
+              <span className="text-tx-secondary">自定义</span>
+            </label>
+            <button
+              type="button"
+              onClick={clearColor}
+              className="ml-auto px-2 py-1 text-xs rounded text-tx-secondary hover:bg-app-hover flex items-center gap-1"
+            >
+              <Eraser size={12} />
+              清除
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
  * TiptapEditor props 契约：完全继承 NoteEditorProps，保证和 MarkdownEditor 100% 对齐。
  * 若需要 Tiptap 独有的 prop，请在此处 extends 扩展，而非另起炉灶。
  */
@@ -1010,6 +1273,12 @@ export default forwardRef<NoteEditorHandle, TiptapEditorProps>(function TiptapEd
       ...MathExtensions,
       // 脚注：行内 [^id] 引用 + 块级 [^id]: content 定义
       ...FootnoteExtensions,
+      // TextStyle + Color + FontSize：任意字号 + 任意前景色，落地为 <span style>
+      // 三件套必须放在所有 mark 扩展之后：避免影响 StarterKit 的 mark 优先级
+      // 与 importService / exportService / contentFormat / youdaoNoteService 的
+      // extensions 列表保持一致，否则 generateHTML/JSON 时 textStyle 会被
+      // schema 过滤掉 → 字号/颜色丢失
+      ...TextStyleKit,
     ],
     content: parseContent(note.content),
     editable,
@@ -2686,13 +2955,12 @@ export default forwardRef<NoteEditorHandle, TiptapEditorProps>(function TiptapEd
         >
           <Strikethrough size={iconSize} />
         </ToolbarButton>
-        <ToolbarButton
-          onClick={() => editor.chain().focus().toggleHighlight().run()}
-          isActive={editor.isActive("highlight")}
-          title={t('tiptap.highlight')}
-        >
-          <Highlighter size={iconSize} />
-        </ToolbarButton>
+        {/* 字号 / 颜色：基于 TextStyle + Color + FontSize 三件套，
+            实际渲染为 <span style="font-size:..;color:..">；
+            背景色复用 Highlight multicolor，由 ColorPopover 的「背景」Tab 暴露。
+            原先单独的 Highlighter 切换按钮被 ColorPopover 覆盖，移除以避免重复。 */}
+        <FontSizePopover editor={editor} iconSize={iconSize} />
+        <ColorPopover editor={editor} iconSize={iconSize} />
         <ToolbarButton
           onClick={openLinkEditor}
           isActive={editor.isActive("link")}
@@ -2997,13 +3265,9 @@ export default forwardRef<NoteEditorHandle, TiptapEditorProps>(function TiptapEd
           >
             <Strikethrough size={14} />
           </ToolbarButton>
-          <ToolbarButton
-            onClick={() => editor.chain().focus().toggleHighlight().run()}
-            isActive={editor.isActive("highlight")}
-            title={t('tiptap.highlight')}
-          >
-            <Highlighter size={14} />
-          </ToolbarButton>
+          {/* 字号 + 颜色 / 背景色：选区气泡同步暴露，移动端常用 */}
+          <FontSizePopover editor={editor} iconSize={14} compact />
+          <ColorPopover editor={editor} iconSize={14} compact />
           <ToolbarButton
             onClick={() => editor.chain().focus().toggleCode().run()}
             isActive={editor.isActive("code")}
@@ -3025,6 +3289,25 @@ export default forwardRef<NoteEditorHandle, TiptapEditorProps>(function TiptapEd
             title={t('tiptap.codeBlock')}
           >
             <FileCode size={14} />
+          </ToolbarButton>
+          {/* 清除全部 inline 文本格式（Mod-Shift-X 同等效果） */}
+          <ToolbarButton
+            onClick={() =>
+              editor
+                .chain()
+                .focus()
+                .unsetMark("textStyle")
+                .unsetMark("highlight")
+                .unsetMark("bold")
+                .unsetMark("italic")
+                .unsetMark("underline")
+                .unsetMark("strike")
+                .unsetMark("code")
+                .run()
+            }
+            title={t('tiptap.clearFormat') || "清除格式 (Ctrl+Shift+X)"}
+          >
+            <Eraser size={14} />
           </ToolbarButton>
           {!isGuest && (
             <>

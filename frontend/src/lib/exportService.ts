@@ -13,6 +13,7 @@ import TaskItem from "@tiptap/extension-task-item";
 import { Table, TableRow, TableHeader, TableCell } from "@tiptap/extension-table";
 import { common, createLowlight } from "lowlight";
 import { api, resolveAttachmentUrl } from "./api";
+import { TextStyleKit } from "@/components/FontSizeExtension";
 
 // TipTap 扩展列表（需与 importService / 编辑器保持一致，否则某些节点会被吞掉）
 const lowlight = createLowlight(common);
@@ -31,6 +32,10 @@ const tiptapExtensions = [
   TableRow,
   TableHeader,
   TableCell,
+  // TextStyle + Color + FontSize：取保导出 HTML 时保留 inline color / font-size，
+  // 否则 generateHTML 会把 textStyle mark 从 schema 过滤 → 导出的 .md/.html
+  // 丢颜色字号。
+  ...TextStyleKit,
 ];
 
 /**

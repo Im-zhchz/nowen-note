@@ -56,6 +56,7 @@ import {
   importNotes,
   markdownToSimpleHtml,
 } from "./importService";
+import { TextStyleKit } from "@/components/FontSizeExtension";
 
 const lowlight = createLowlight(common);
 
@@ -74,6 +75,8 @@ const tiptapExtensions = [
   TableRow,
   TableHeader,
   TableCell,
+  // TextStyle + Color + FontSize：与编辑器保持一致
+  ...TextStyleKit,
 ];
 
 // ============================================================

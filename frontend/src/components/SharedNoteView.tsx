@@ -1397,6 +1397,23 @@ function renderNode(node: any): string {
             case "highlight":
               text = `<mark>${text}</mark>`;
               break;
+            case "textStyle": {
+              // 字号 / 前景色：渲染为 <span style="font-size:..;color:..">
+              // 与编辑器侧 FontSizeExtension 的 renderHTML 输出保持一致
+              const styles: string[] = [];
+              const fs = mark.attrs?.fontSize;
+              const color = mark.attrs?.color;
+              if (fs && /^[\d.]+(px|em|rem|%)$/.test(String(fs))) {
+                styles.push(`font-size:${fs}`);
+              }
+              if (color && /^[#a-zA-Z0-9(),.\s%]+$/.test(String(color))) {
+                styles.push(`color:${color}`);
+              }
+              if (styles.length) {
+                text = `<span style="${escapeHtml(styles.join(";"))}">${text}</span>`;
+              }
+              break;
+            }
           }
         }
       }

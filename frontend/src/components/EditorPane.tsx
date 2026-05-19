@@ -38,6 +38,14 @@ import {
   makeFetchLatestNoteVersion,
   isAborted,
 } from "@/lib/optimisticLockApi";
+import { enqueue as enqueueOfflineMutation } from "@/lib/offlineQueue";
+import {
+  saveDraft,
+  loadDraft,
+  clearDraft,
+  shouldOfferRestore,
+  type NoteDraft,
+} from "@/lib/draftStorage";
 
 // ---------------------------------------------------------------------------
 // 编辑器模式切换（MD vs Tiptap）
@@ -412,6 +420,75 @@ export default function EditorPane() {
     lastActiveIdRef.current = nextId;
   }, [activeNote?.id]);
 
+  // ─── P2-5: 当前编辑器模式 ref（供 handleUpdate 同步写草稿用） ───────────────
+  const editorModeRef = useRef<EditorMode>(editorMode);
+  useEffect(() => { editorModeRef.current = editorMode; }, [editorMode]);
+
+  // ─── P1-4: 连续保存失败计数 + toast 节流时间戳 ────────────────────────────────
+  // 保存成功 / 切笔记时归零；连续 ≥2 次失败 + 距上次 toast 超 30s 才弹一次
+  const consecutiveSaveFailRef = useRef<number>(0);
+  const lastSaveFailToastAtRef = useRef<Record<string, number>>({});
+
+  // ─── P1-3: 页面被卸载 / 隐藏时强制把当前编辑器内容写入本地草稿 + 离线队列 ──────
+  // 触发场景：移动端 webview 被系统回收、刷新、关 Tab、切到后台被杀。
+  // 不能依赖异步 PUT（pagehide 后 fetch 会被中止），只能写 localStorage 同步落盘：
+  //   1) saveDraft 写本地草稿（下次打开同笔记可恢复）
+  //   2) enqueue 写离线队列（下次进 app 自动 flush）
+  useEffect(() => {
+    const flushToLocal = () => {
+      const note = activeNoteRef.current;
+      if (!note || note.isLocked) return;
+      let snap: { content: string; contentText: string } | null = null;
+      try {
+        snap = editorHandleRef.current?.getSnapshot?.() ?? null;
+      } catch { /* ignore */ }
+      if (!snap || typeof snap.content !== "string") return;
+      // 1) 草稿（同步、零网络依赖）
+      try {
+        saveDraft({
+          noteId: note.id,
+          editorMode: editorModeRef.current,
+          content: snap.content,
+          contentText: snap.contentText || "",
+          title: note.title,
+          baseVersion: note.version,
+          savedAt: Date.now(),
+        });
+      } catch { /* ignore */ }
+      // 2) 离线队列（下次启动 flush）
+      try {
+        enqueueOfflineMutation({
+          type: "updateNote",
+          noteId: note.id,
+          url: `/notes/${note.id}`,
+          method: "PUT",
+          body: {
+            title: note.title,
+            content: snap.content,
+            contentText: snap.contentText,
+            version: note.version,
+          },
+        });
+      } catch { /* ignore */ }
+    };
+
+    const onPageHide = () => flushToLocal();
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "hidden") flushToLocal();
+    };
+    // beforeunload 在桌面浏览器关闭/刷新时触发；移动端不一定可靠，故组合 pagehide
+    const onBeforeUnload = () => flushToLocal();
+
+    window.addEventListener("pagehide", onPageHide);
+    window.addEventListener("beforeunload", onBeforeUnload);
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => {
+      window.removeEventListener("pagehide", onPageHide);
+      window.removeEventListener("beforeunload", onBeforeUnload);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+    };
+  }, []);
+
   // 使用 ref 追踪最新的 activeNote，避免 handleUpdate 闭包引用过期
   const activeNoteRef = useRef(activeNote);
   activeNoteRef.current = activeNote;
@@ -423,6 +500,72 @@ export default function EditorPane() {
   const [remoteUpdate, setRemoteUpdate] = useState<{ actorUserId?: string; version: number } | null>(null);
   /** 远程删除横幅 */
   const [remoteDelete, setRemoteDelete] = useState<{ actorUserId?: string; trashed?: boolean } | null>(null);
+
+  // ─── P2-5: 未保存草稿恢复提示 ──────────────
+  // 打开笔记时，如果本地有 baseVersion <= server.version 且 savedAt > server.updatedAt
+  // 的草稿，则弹出恢复提示。常见场景：上次弱网 / 崩溃退出后重新进入。
+  const [pendingDraft, setPendingDraft] = useState<NoteDraft | null>(null);
+  // handleUpdate 在下面才定义，这里用 ref 避免"使用未初始化变量"
+  const handleUpdateRef = useRef<
+    | ((data: { content?: string; contentText?: string; title: string }) => Promise<void>)
+    | null
+  >(null);
+
+  // 切换笔记时检测本地草稿
+  useEffect(() => {
+    setPendingDraft(null);
+    if (!activeNote || activeNote.isLocked) return;
+    let draft: NoteDraft | null = null;
+    try { draft = loadDraft(activeNote.id); } catch { draft = null; }
+    if (!draft) return;
+    if (
+      shouldOfferRestore(
+        draft,
+        activeNote.version,
+        activeNote.updatedAt,
+        activeNote.content,
+      )
+    ) {
+      setPendingDraft(draft);
+    } else {
+      // 实际内容已一致（或服务端更新） → 直接清掉草稿避免下次还提示
+      try { clearDraft(activeNote.id); } catch { /* ignore */ }
+    }
+  }, [activeNote?.id, activeNote?.version, activeNote?.updatedAt]);
+
+  /** 恢复草稿：把本地草稿内容写回 activeNote，让编辑器重新装载并触发 PUT */
+  const handleRestoreDraft = useCallback(async () => {
+    const draft = pendingDraft;
+    const note = activeNoteRef.current;
+    if (!draft || !note || draft.noteId !== note.id) return;
+    setPendingDraft(null);
+    // 直接把草稿写回 activeNote，编辑器会读取 note.content 重新装载
+    actions.setActiveNote({
+      ...note,
+      content: draft.content,
+      contentText: draft.contentText,
+      title: draft.title,
+    });
+    // 主动触发保存（走现有 putWithReconcile 路径，会自动处理冲突）
+    try {
+      await handleUpdateRef.current?.({
+        title: draft.title,
+        content: draft.content,
+        contentText: draft.contentText,
+      });
+      try { toast.success(t("editor.draftRestored") || "已恢复未保存的修改"); } catch {}
+    } catch {
+      // handleUpdate 内部已处理错误
+    }
+  }, [pendingDraft, actions, t]);
+
+  /** 丢弃草稿 */
+  const handleDiscardDraft = useCallback(() => {
+    const draft = pendingDraft;
+    if (!draft) return;
+    setPendingDraft(null);
+    try { clearDraft(draft.noteId); } catch { /* ignore */ }
+  }, [pendingDraft]);
 
   // ---------------------------------------------------------------------------
   // 当前登录用户信息
@@ -657,6 +800,24 @@ export default function EditorPane() {
   const handleUpdate = useCallback(async (data: { content?: string; contentText?: string; title: string }) => {
     const currentNote = activeNoteRef.current;
     if (!currentNote || currentNote.isLocked) return;
+
+    // ─── P2-5: 本地草稿双保险 ──────────────
+    // 每次 onUpdate fire 都**同步**写一份草稿到 localStorage，只要后面任何环节
+    // （PUT 失败 / fetch 挂死 / 页面被杀）丢了，下次打开同一笔记仍能从草稿恢复。
+    if (data.content !== undefined) {
+      try {
+        saveDraft({
+          noteId: currentNote.id,
+          editorMode: editorModeRef.current,
+          content: data.content,
+          contentText: data.contentText || "",
+          title: data.title,
+          baseVersion: currentNote.version,
+          savedAt: Date.now(),
+        });
+      } catch { /* ignore quota 等错误 */ }
+    }
+
     // Phase 2: 广播"我正在编辑"（1.5s 内无新输入则自动取消）
     try { flagEditing(); } catch {}
     actions.setSyncStatus("saving");
@@ -790,11 +951,54 @@ export default function EditorPane() {
         // 2秒后恢复 idle
         if (savedTimerRef.current) clearTimeout(savedTimerRef.current);
         savedTimerRef.current = setTimeout(() => actions.setSyncStatus("idle"), 2000);
+
+        // P2-5: 保存成功 → 清掉本地草稿，并重置连续失败计数
+        try { clearDraft(currentNote.id); } catch { /* ignore */ }
+        consecutiveSaveFailRef.current = 0;
       }
     } catch (err) {
       // 切笔记中断（putWithReconcile 内部标记为 aborted）不是真正的错误
       if (isAborted(err)) return;
       console.warn("[EditorPane] save failed:", err);
+
+      // ─── P0-1 兜底入队：弱网 / 服务端不可达使 save 抛错时， ──────────────
+      // 把编辑器当前最新 snapshot 填入离线队列，等网络恢复后自动 flush。
+      // 这一步使用户"在弱网下继续输入的内容"不会因为 saveInflight 生命周期
+      // 结束而被遗忘 — 即使 api.ts 的上游拦截未调用 handleOfflineEnqueue
+      // （例如 fetch 返回 4xx 但不在 retryable 名单中）也能提供一道保护。
+      try {
+        const snap = editorHandleRef.current?.getSnapshot?.();
+        if (snap && typeof snap.content === "string") {
+          enqueueOfflineMutation({
+            type: "updateNote",
+            noteId: currentNote.id,
+            url: `/notes/${currentNote.id}`,
+            method: "PUT",
+            body: {
+              title: data.title,
+              content: snap.content,
+              contentText: snap.contentText,
+              version: currentNote.version,
+            },
+          });
+        }
+      } catch (queueErr) {
+        console.warn("[EditorPane] enqueue offline fallback failed:", queueErr);
+      }
+
+      // P1-4: 连续两次保存失败 → toast 提醒用户"内容未丢，已暂存本地"
+      // 节流：同一笔记 30s 内只提醒一次，避免刷屏
+      try {
+        consecutiveSaveFailRef.current += 1;
+        const noteId = currentNote.id;
+        const now = Date.now();
+        const last = lastSaveFailToastAtRef.current[noteId] || 0;
+        if (consecutiveSaveFailRef.current >= 2 && now - last > 30000) {
+          lastSaveFailToastAtRef.current[noteId] = now;
+          toast.error(t("editor.saveFailedDraftKept") || "网络不稳，内容已暂存本地，等网络恢复后会自动上传");
+        }
+      } catch { /* ignore */ }
+
       actions.setSyncStatus("error");
     }
     })();
@@ -809,6 +1013,11 @@ export default function EditorPane() {
       }
     }
   }, [actions, flagEditing]);
+
+  // 保持 handleUpdateRef 总是指向最新 handleUpdate（供 P2-5 草稿恢复调用）
+  useEffect(() => {
+    handleUpdateRef.current = handleUpdate;
+  }, [handleUpdate]);
 
   // 手动触发同步：重新保存当前编辑器内容
   const handleManualSync = useCallback(async () => {
@@ -1733,6 +1942,37 @@ export default function EditorPane() {
               trashed={remoteDelete.trashed}
               onDismiss={handleAckRemoteDelete}
             />
+          )}
+          {pendingDraft && (
+            <div
+              className="absolute top-2 left-2 right-2 z-30 px-3 py-2 rounded-md bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 text-amber-900 dark:text-amber-100 shadow-sm flex items-center justify-between gap-2"
+              role="alert"
+            >
+              <div className="text-sm leading-snug">
+                {t("editor.draftFound") || "检测到未保存的修改"}
+                <span className="ml-2 opacity-70">
+                  ({new Date(pendingDraft.savedAt).toLocaleString()})
+                </span>
+              </div>
+              <div className="flex items-center gap-2 shrink-0">
+                <Button
+                  size="sm"
+                  variant="default"
+                  className="h-7 px-2 text-xs"
+                  onClick={handleRestoreDraft}
+                >
+                  {t("editor.draftRestore") || "恢复"}
+                </Button>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  className="h-7 px-2 text-xs"
+                  onClick={handleDiscardDraft}
+                >
+                  {t("editor.draftDiscard") || "丢弃"}
+                </Button>
+              </div>
+            </div>
           )}
           {htmlPreviewMode ? (
             <HtmlPreviewPane

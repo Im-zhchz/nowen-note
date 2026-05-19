@@ -251,4 +251,67 @@ describe("RTE ↔ MD 回路（关键结构保留）", () => {
     // 至少含表头行 + 数据行
     expect((table.content || []).length).toBeGreaterThanOrEqual(2);
   });
+
+  // ---------------- TextStyle / Color / FontSize 回路 ----------------
+  // 这三个 mark 来自 @tiptap/extension-text-style + @tiptap/extension-color
+  // + 自写 FontSize 扩展。CommonMark 没有原生语法，需要 Turndown 把
+  // <span style="font-size:..;color:.."> 原样保留为 inline HTML，反向再
+  // 由 markdownToHtml 透传给 generateJSON 还原为 textStyle mark。
+
+  it("Tiptap→MD：textStyle 字号 + 颜色保留为 <span style>", () => {
+    const json = JSON.stringify({
+      type: "doc",
+      content: [
+        {
+          type: "paragraph",
+          content: [
+            {
+              type: "text",
+              marks: [
+                {
+                  type: "textStyle",
+                  attrs: { fontSize: "20px", color: "#ef4444" },
+                },
+              ],
+              text: "BIG RED",
+            },
+          ],
+        },
+      ],
+    });
+    const md = tiptapJsonToMarkdown(json);
+    expect(md).toContain("BIG RED");
+    expect(md.toLowerCase()).toContain("font-size:20px");
+    // 浏览器在 generateHTML 时会把 #ef4444 解析为 rgb(239, 68, 68)，二者等价
+    expect(md.toLowerCase().replace(/\s/g, "")).toMatch(
+      /color:(#ef4444|rgb\(239,68,68\))/,
+    );
+  });
+
+  it("MD→Tiptap JSON：<span style> 还原为 textStyle mark", () => {
+    const md = `普通 <span style="font-size:24px;color:#3b82f6">大蓝</span> 文字`;
+    const json = markdownToTiptapJSON(md);
+    // 找到带 textStyle mark 的 text 节点
+    const para = (json.content || []).find((b: any) => b.type === "paragraph");
+    expect(para).toBeTruthy();
+    const styledText = (para.content || []).find((c: any) =>
+      c?.marks?.some((m: any) => m.type === "textStyle"),
+    );
+    expect(styledText).toBeTruthy();
+    expect(styledText.text).toContain("大蓝");
+    const ts = styledText.marks.find((m: any) => m.type === "textStyle");
+    expect(ts.attrs?.fontSize).toBe("24px");
+    // color 解析依赖浏览器的 style 解析行为，放宽匹配
+    expect(String(ts.attrs?.color).toLowerCase().replace(/\s/g, "")).toMatch(
+      /(#3b82f6|rgb\(59,130,246\))/,
+    );
+  });
+
+  it("markdownToPlainText：剥掉 <span style> 标签但保留文本", () => {
+    const md = '前 <span style="color:red">红色</span> 后';
+    const text = markdownToPlainText(md);
+    expect(text).toContain("红色");
+    expect(text).not.toContain("<span");
+    expect(text).not.toContain("style=");
+  });
 });

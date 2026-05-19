@@ -407,6 +407,23 @@ async function request<T>(url: string, options?: RequestOptions): Promise<T> {
   }
 
   let res: Response;
+  // ─── P0-2: 全局 30s 超时 ──────────────
+  // 弱网下 fetch 不会主动失败，可能挂死几十秒甚至几分钟，期间用户继续输入
+  // 但 syncStatus 一直是 "saving"，新内容也没机会再触发保存。
+  // 用 AbortController 设 30s 硬上限：超时即抛 AbortError → 走 isNetworkError
+  // 兜底入队，不影响其他正常请求。
+  // 注意：调用方传入的 signal 仍然生效，二者用 "linked controller" 模式合并。
+  const linkedController = new AbortController();
+  const userSignal = (restOptions as any)?.signal as AbortSignal | undefined;
+  if (userSignal) {
+    if (userSignal.aborted) linkedController.abort();
+    else userSignal.addEventListener("abort", () => linkedController.abort(), { once: true });
+  }
+  // 写入类请求才设超时（GET/读类不设，长轮询场景另行处理）；GET 也保留兜底但更长
+  const TIMEOUT_MS = (method === "GET" || method === "HEAD") ? 60000 : 30000;
+  const timeoutId = setTimeout(() => {
+    try { linkedController.abort(); } catch { /* ignore */ }
+  }, TIMEOUT_MS);
   try {
     // P0-3: 自动注入 X-Connection-Id（如果 WebSocket 已连接）。
     // 后端 notes PUT 路由据此从 note:updated 广播中排除发起者连接，
@@ -429,7 +446,7 @@ async function request<T>(url: string, options?: RequestOptions): Promise<T> {
       ...restOptions?.headers,
     });
     try {
-      res = await fetch(fullUrl, { ...restOptions, headers: buildHeaders(true) });
+      res = await fetch(fullUrl, { ...restOptions, signal: linkedController.signal, headers: buildHeaders(true) });
     } catch (firstErr: any) {
       // 兜底：当后端 CORS allowHeaders 没把 X-Connection-Id 加进白名单时，
       //   带它的请求会在 OPTIONS 预检阶段直接被浏览器/WebView 拦下，抛
@@ -440,7 +457,7 @@ async function request<T>(url: string, options?: RequestOptions): Promise<T> {
       //   只在 connId 存在时才尝试，否则跳过直接走原错误路径，避免无谓重试。
       if (connId) {
         try {
-          res = await fetch(fullUrl, { ...restOptions, headers: buildHeaders(false) });
+          res = await fetch(fullUrl, { ...restOptions, signal: linkedController.signal, headers: buildHeaders(false) });
           // eslint-disable-next-line no-console
           console.warn(
             "[api] retry without X-Connection-Id succeeded — backend CORS likely missing this header in allowHeaders. Disabling injection for this session.",
@@ -448,24 +465,45 @@ async function request<T>(url: string, options?: RequestOptions): Promise<T> {
           // 关闭后续注入。注意只关一个会话内的注入，不写 storage（升级后端后下次重启即恢复）。
           try { (window as any).__nowenGetConnectionId = () => null; } catch { /* ignore */ }
         } catch (retryErr: any) {
-          if (!_skipOfflineQueue && _shouldEnqueue(url, method, retryErr)) {
-            return handleOfflineEnqueue<T>(url, method, restOptions?.body as string | undefined);
+          // 用户主动 abort（非超时） → 原样抛
+          if (retryErr?.name === "AbortError" && userSignal?.aborted) throw retryErr;
+          // 超时（linkedController.abort 触发） → 当作网络错误入队
+          const isTimeout = retryErr?.name === "AbortError";
+          if (!_skipOfflineQueue && (isTimeout || _shouldEnqueue(url, method, retryErr))) {
+            if (_shouldEnqueue(url, method, isTimeout ? new TypeError("timeout") : retryErr)) {
+              return handleOfflineEnqueue<T>(url, method, restOptions?.body as string | undefined);
+            }
           }
           throw retryErr;
         }
       } else {
-        if (!_skipOfflineQueue && _shouldEnqueue(url, method, firstErr)) {
-          return handleOfflineEnqueue<T>(url, method, restOptions?.body as string | undefined);
+        // 用户主动 abort → 原样抛
+        if (firstErr?.name === "AbortError" && userSignal?.aborted) throw firstErr;
+        // 超时 → 视为网络错误
+        const isTimeout = firstErr?.name === "AbortError";
+        if (!_skipOfflineQueue) {
+          const enqueueErr = isTimeout ? new TypeError("timeout") : firstErr;
+          if (_shouldEnqueue(url, method, enqueueErr)) {
+            return handleOfflineEnqueue<T>(url, method, restOptions?.body as string | undefined);
+          }
         }
         throw firstErr;
       }
     }
   } catch (fetchErr: any) {
     // fetch 抛出 = 网络不可达（TypeError: Failed to fetch 等）
-    if (!_skipOfflineQueue && _shouldEnqueue(url, method, fetchErr)) {
-      return handleOfflineEnqueue<T>(url, method, restOptions?.body as string | undefined);
+    // 用户主动 abort → 原样抛
+    if (fetchErr?.name === "AbortError" && userSignal?.aborted) throw fetchErr;
+    const isTimeout = fetchErr?.name === "AbortError";
+    if (!_skipOfflineQueue) {
+      const enqueueErr = isTimeout ? new TypeError("timeout") : fetchErr;
+      if (_shouldEnqueue(url, method, enqueueErr)) {
+        return handleOfflineEnqueue<T>(url, method, restOptions?.body as string | undefined);
+      }
     }
     throw fetchErr;
+  } finally {
+    clearTimeout(timeoutId);
   }
 
   // 401 / 403 + ACCOUNT_DISABLED：会话已失效（token 无效、用户被禁用、tokenVersion 被吊销等），
@@ -507,10 +545,18 @@ async function request<T>(url: string, options?: RequestOptions): Promise<T> {
       if (typeof err.currentVersion === "number") error.currentVersion = err.currentVersion;
     }
 
-    // ─── 5xx 时入队离线重试 ──────────────
+    // ─── 弱网/服务端不稳定状态码入队离线重试 ──────────────
+    // 覆盖：5xx（服务端故障）+ 408（请求超时）+ 425（Too Early）+ 429（限流）。
+    // 这些都不是"用户行为不合法"的错误，重试有意义。
+    // 4xx 中 400/401/403/404/409/422 不入队（参数错 / 鉴权失效 / 冲突，应让上层处理）。
+    const isRetryable =
+      res.status >= 500 ||
+      res.status === 408 ||
+      res.status === 425 ||
+      res.status === 429;
     if (
       !_skipOfflineQueue &&
-      res.status >= 500 &&
+      isRetryable &&
       _shouldEnqueue(url, method, error)
     ) {
       return handleOfflineEnqueue<T>(url, method, restOptions?.body as string | undefined);

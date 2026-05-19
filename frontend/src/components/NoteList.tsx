@@ -919,9 +919,13 @@ const NoteCard = React.memo(React.forwardRef<HTMLDivElement, {
   return (
     <motion.div
       ref={ref}
-      initial={{ opacity: 0, y: 4 }}
-      animate={{ opacity: 1, y: 0 }}
-      exit={{ opacity: 0, y: -4 }}
+      // 仅做轻量淡入。早期版本用了 y:4 → y:0 的位移，会造成切换笔记本时
+      // 整列卡片"先在面板底部出现再上移"的错觉（尤其当 list 项很少、
+      // 列表内容贴近底部时尤为明显）。这里去掉 y 位移，让卡片就地淡入。
+      initial={{ opacity: 0 }}
+      animate={{ opacity: 1 }}
+      exit={{ opacity: 0 }}
+      transition={{ duration: 0.12, ease: "easeOut" }}
       onClick={onClick}
       onContextMenu={onContextMenu}
       draggable={draggable}
@@ -1073,6 +1077,18 @@ function VirtualNoteList({
   const [scrollTop, setScrollTop] = useState(0);
   const [containerHeight, setContainerHeight] = useState(600);
 
+  // 切换笔记本/搜索条件/筛选/排序时，notes 引用会整体替换。此时若不复位
+  // scrollTop，浏览器会把"上一组列表"的滚动位置原样保留下来，新列表只显示
+  // 中下部分，配合 framer-motion 的进入动画，肉眼看上去就像"列表先从面板
+  // 底部冒出来再爬到顶部"。这里强制把视口拉回顶部，并清零内部 scrollTop
+  // 状态，保证新列表立即从首条开始呈现。
+  useEffect(() => {
+    if (containerRef.current) {
+      containerRef.current.scrollTop = 0;
+    }
+    setScrollTop(0);
+  }, [notes]);
+
   // 监听容器尺寸变化
   useEffect(() => {
     const container = containerRef.current;
@@ -1180,6 +1196,10 @@ export default function NoteList() {
     ghostEl: HTMLDivElement | null;
   } | null>(null);
   const noteCardRefs = useRef<Map<string, HTMLDivElement>>(new Map());
+  // 非虚拟列表分支用 Radix ScrollArea 包裹，需要在切换筛选条件时把内部 viewport
+  // 滚动复位。Radix 的 ScrollArea forwardRef 暴露的是 Root 节点，真正的滚动容器
+  // 是它内部带 data-radix-scroll-area-viewport 的子节点。
+  const scrollAreaRef = useRef<HTMLDivElement>(null);
   const { t } = useTranslation();
 
   // Phase 2: 加载分享状态
@@ -1351,6 +1371,24 @@ export default function NoteList() {
     setSelectedIds(new Set());
     setLastClickedId(null);
   }, [state.viewMode, state.selectedNotebookId, state.searchQuery, state.selectedTagId, dateFilter]);
+
+  // 切换笔记本/视图/搜索/标签/日期/排序 时把非虚拟列表的 ScrollArea 滚动复位到顶。
+  // 否则 Radix ScrollArea 会保留前一组列表的 scrollTop，新列表立刻渲染时整组卡片
+  // 视觉上"贴在面板下方再爬上来"，配合卡片自身的淡入动画体感很差。
+  useEffect(() => {
+    const root = scrollAreaRef.current;
+    if (!root) return;
+    const viewport = root.querySelector<HTMLElement>("[data-radix-scroll-area-viewport]");
+    if (viewport) viewport.scrollTop = 0;
+  }, [
+    state.viewMode,
+    state.selectedNotebookId,
+    state.searchQuery,
+    state.selectedTagId,
+    dateFilter,
+    sortPref.by,
+    sortPref.dir,
+  ]);
 
   // 全局 ESC 清空多选（多选状态下）
   useEffect(() => {
@@ -2527,7 +2565,7 @@ export default function NoteList() {
             noteCardRefs={noteCardRefs}
           />
         ) : (
-        <ScrollArea className="flex-1 min-h-0">
+        <ScrollArea ref={scrollAreaRef} className="flex-1 min-h-0">
         <div className="px-2 pb-2 space-y-1">
           <AnimatePresence>
             {sortedNotes.map((note) => (
