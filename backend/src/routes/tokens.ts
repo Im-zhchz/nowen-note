@@ -17,12 +17,17 @@ import {
   initApiTokensTable,
   isValidScope,
   API_TOKEN_PREFIX,
+  pruneTokenUsage,
 } from "../lib/api-tokens";
 
 const app = new Hono();
 
 // 保证表存在（幂等）
 initApiTokensTable(getDb());
+
+// 启动时顶掏一次超过 90 天的 usage 记录。
+// 个人部署场景下表增长极慢，启动时调用一次已足够。
+pruneTokenUsage(getDb());
 
 /** 列出当前用户的 token（明文字段永远不返回） */
 app.get("/", (c) => {
@@ -132,9 +137,101 @@ app.post("/", async (c) => {
   );
 });
 
-/** 吊销 token（软删，保留审计） */
-app.delete("/:id", (c) => {
+/**
+ * GET /api/tokens/usage?days=7
+ * ---------------------------------------------------------------------------
+ * 返回当前用户所有 token 的使用统计：
+ *   - total: 近 days 天总调用
+ *   - prevTotal: 再往前 days 天总调用（用于环比同比）
+ *   - series: 近 days 天逐天调用量（补零，升序）
+ *   - byToken: 近 days 天按 token 聚合的调用量（降序）
+ *
+ * 只会返回当前用户名下的 token 数据，不包含其他用户。
+ */
+app.get("/usage", (c) => {
   const userId = c.req.header("X-User-Id")!;
+  const daysParam = parseInt(c.req.query("days") || "7", 10);
+  // 限制在 1–90，超出范围默认 7
+  const days =
+    Number.isFinite(daysParam) && daysParam >= 1 && daysParam <= 90 ? daysParam : 7;
+
+  const db = getDb();
+  // 生成今天、本期起点、上期起点（均 UTC）
+  const today = new Date();
+  const todayDay = today.toISOString().slice(0, 10);
+  const startDay = new Date(today.getTime() - (days - 1) * 86400_000)
+    .toISOString()
+    .slice(0, 10);
+  const prevStartDay = new Date(today.getTime() - (days * 2 - 1) * 86400_000)
+    .toISOString()
+    .slice(0, 10);
+  const prevEndDay = new Date(today.getTime() - days * 86400_000)
+    .toISOString()
+    .slice(0, 10);
+
+  // 近 days 天逐日聚合（仅本用户的 token）
+  const dailyRows = db
+    .prepare(
+      `SELECT u.day AS day, SUM(u.count) AS count
+       FROM api_token_usage u
+       JOIN api_tokens t ON t.id = u.tokenId
+       WHERE t.userId = ? AND u.day >= ? AND u.day <= ?
+       GROUP BY u.day
+       ORDER BY u.day ASC`,
+    )
+    .all(userId, startDay, todayDay) as Array<{ day: string; count: number }>;
+
+  // 上期总量（环比计算用）
+  const prevTotalRow = db
+    .prepare(
+      `SELECT COALESCE(SUM(u.count), 0) AS total
+       FROM api_token_usage u
+       JOIN api_tokens t ON t.id = u.tokenId
+       WHERE t.userId = ? AND u.day >= ? AND u.day <= ?`,
+    )
+    .get(userId, prevStartDay, prevEndDay) as { total: number };
+
+  // 按 token 聚合（仅本用户的 token）
+  const byTokenRows = db
+    .prepare(
+      `SELECT t.id AS tokenId, t.name AS name, COALESCE(SUM(u.count), 0) AS count
+       FROM api_tokens t
+       LEFT JOIN api_token_usage u
+         ON u.tokenId = t.id AND u.day >= ? AND u.day <= ?
+       WHERE t.userId = ?
+       GROUP BY t.id
+       HAVING count > 0
+       ORDER BY count DESC`,
+    )
+    .all(startDay, todayDay, userId) as Array<{
+    tokenId: string;
+    name: string;
+    count: number;
+  }>;
+
+  // 将 dailyRows 按 day 建索引，然后连续补零
+  const dailyMap = new Map<string, number>();
+  for (const r of dailyRows) dailyMap.set(r.day, r.count);
+  const series: Array<{ day: string; count: number }> = [];
+  for (let i = days - 1; i >= 0; i--) {
+    const d = new Date(today.getTime() - i * 86400_000)
+      .toISOString()
+      .slice(0, 10);
+    series.push({ day: d, count: dailyMap.get(d) || 0 });
+  }
+  const total = series.reduce((s, x) => s + x.count, 0);
+
+  return c.json({
+    days,
+    total,
+    prevTotal: prevTotalRow.total || 0,
+    series,
+    byToken: byTokenRows,
+  });
+});
+
+/** 吵销 token（软删，保留审计） */
+app.delete("/:id", (c) => {  const userId = c.req.header("X-User-Id")!;
   const id = c.req.param("id");
   const db = getDb();
   const row = db

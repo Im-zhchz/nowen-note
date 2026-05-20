@@ -2059,7 +2059,23 @@ export default function NoteList() {
             actions.refreshNotebooks();
             actions.refreshNotes();
           })
-          .catch(console.error);
+          .catch((err: any) => {
+            // v14：父笔记本已被软删 → 后端拒绝直接恢复，需要用户先选一个新笔记本。
+            // 当前最小修复：toast 提示并刷新回收站列表（被乐观删掉的项会重新出现）。
+            // 后续若做"还原到指定笔记本"UI，可在此打开笔记本选择器再走 PUT
+            // 带 notebookId 重试。
+            if (err?.code === "NOTEBOOK_TRASHED") {
+              toast.warning(
+                err?.message ||
+                  t("noteList.restoreNotebookTrashed") ||
+                  "原笔记本已删除，请先在「所有笔记」选择一个新的笔记本作为还原位置",
+              );
+              actions.refreshNotes();
+              return;
+            }
+            console.error(err);
+            actions.refreshNotes();
+          });
         break;
       }
       case "delete_permanent": {
@@ -2316,9 +2332,28 @@ export default function NoteList() {
               )}
             </button>
           )}
-          <Button variant="ghost" size="icon" className="h-8 w-8" onClick={handleCreateNote}>
-            <Plus size={18} />
-          </Button>
+          {state.viewMode === "trash" ? (
+            // 回收站视图下用"一键清空"按钮替换"新建"——后者在回收站语义不通且会被禁止；
+            // 通过自定义事件复用 Sidebar 已有的清空确认弹窗（含锁定检测 / 体量统计 / VACUUM 提示）。
+            <Button
+              variant="ghost"
+              size="icon"
+              className="h-8 w-8 text-accent-danger hover:bg-accent-danger/10"
+              title={t('sidebar.emptyTrash')}
+              aria-label={t('sidebar.emptyTrash')}
+              onClick={() => {
+                try {
+                  window.dispatchEvent(new CustomEvent("nowen:open-empty-trash"));
+                } catch { /* ignore */ }
+              }}
+            >
+              <Trash2 size={18} />
+            </Button>
+          ) : (
+            <Button variant="ghost" size="icon" className="h-8 w-8" onClick={handleCreateNote}>
+              <Plus size={18} />
+            </Button>
+          )}
           {/* 排序下拉（移动端） */}
           {showSortMenu && (
             <SortMenu
@@ -2375,9 +2410,28 @@ export default function NoteList() {
               )}
             </button>
           )}
-          <Button variant="ghost" size="icon" className="h-7 w-7" onClick={handleCreateNote}>
-            <Plus size={15} />
-          </Button>
+          {state.viewMode === "trash" ? (
+            // 回收站视图：将"+"换成"一键清空回收站"——破坏性操作做红色降级 + 标题提示，
+            // 复用 Sidebar 已有的确认弹窗（自定义事件解耦，避免重复实现 80 行清空逻辑）。
+            <Button
+              variant="ghost"
+              size="icon"
+              className="h-7 w-7 text-accent-danger hover:bg-accent-danger/10"
+              title={t('sidebar.emptyTrash')}
+              aria-label={t('sidebar.emptyTrash')}
+              onClick={() => {
+                try {
+                  window.dispatchEvent(new CustomEvent("nowen:open-empty-trash"));
+                } catch { /* ignore */ }
+              }}
+            >
+              <Trash2 size={15} />
+            </Button>
+          ) : (
+            <Button variant="ghost" size="icon" className="h-7 w-7" onClick={handleCreateNote}>
+              <Plus size={15} />
+            </Button>
+          )}
           {/* 排序下拉（桌面端） */}
           {showSortMenu && (
             <SortMenu

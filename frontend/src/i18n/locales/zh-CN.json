@@ -124,7 +124,7 @@
     "settings": "设置",
     "logout": "退出登录",
     "deleteNotebookTitle": "删除笔记本",
-    "deleteNotebookConfirm": "确定要删除「{{name}}」吗？该笔记本下的所有笔记也将被删除，此操作不可撤销。",
+    "deleteNotebookConfirm": "确定要删除「{{name}}」吗？该笔记本及其子笔记本下的所有笔记将被移入回收站，你可以从回收站恢复或永久删除。",
     "deleteNoteConfirm": "确定要删除这篇笔记吗？此操作将把笔记移入回收站。",
     "deleteNoteTitle": "删除笔记",
     "confirmDelete": "确认删除",
@@ -204,7 +204,8 @@
     "bulkAiNoEligible": "没有可处理的笔记（空白或已锁定的不参与）",
     "bulkAiTooMany": "单次最多处理 {{limit}} 条，请分批操作",
     "bulkAiCrossWs": "所选笔记跨多个工作区，请分别操作",
-    "multiSelectHint": "Ctrl/Cmd 点击多选，Shift 点击范围选择"
+    "multiSelectHint": "Ctrl/Cmd 点击多选，Shift 点击范围选择",
+    "restoreNotebookTrashed": "原笔记本已删除，请先还原或重建一个笔记本后再重试"
   },
   "editor": {
     "selectNote": "选择一条笔记开始编辑",
@@ -415,7 +416,9 @@
     "appearance": "外观设置",
     "ai": "AI 助手",
     "security": "账号安全",
+    "tokens": "访问令牌",
     "users": "用户管理",
+    "workspaces": "工作区管理",
     "dataManagement": "数据管理",
     "siteIdentity": "站点标识",
     "siteIdentityDesc": "自定义你的工作台名称和浏览器标签页图标",
@@ -603,6 +606,49 @@
     "fieldPersonalExportEnabledDesc": "关闭后，该用户将无法从个人空间导出笔记本或全量笔记（不影响工作区导出；管理员账号不受此开关约束）。",
     "fieldPersonalImportEnabled": "允许导入笔记到个人空间",
     "fieldPersonalImportEnabledDesc": "关闭后，该用户将无法把笔记导入到个人空间（不影响工作区导入；管理员账号不受此开关约束）。"
+  },
+  "workspaceSwitcher": {
+    "contextMenu": {
+      "manageMembers": "管理成员",
+      "edit": "编辑工作区",
+      "delete": "删除工作区"
+    }
+  },
+  "workspaceManagement": {
+    "title": "工作区管理",
+    "description": "查看并管理系统内全部工作区，管理员可跨用户编辑、删除任意工作区",
+    "total": "共 {{count}} 个工作区",
+    "loadFailed": "加载工作区列表失败",
+    "refresh": "刷新",
+    "noResult": "没有匹配的工作区",
+    "searchPlaceholder": "搜索名称 / 描述 / 所有者",
+    "colName": "工作区",
+    "colOwner": "所有者",
+    "colMembers": "成员",
+    "colNotebooks": "笔记本",
+    "colCreatedAt": "创建时间",
+    "colActions": "操作",
+    "members": "{{count}} 人",
+    "notebooks": "{{count}} 本",
+    "ownerUnknown": "（未知用户）",
+    "edit": "编辑工作区",
+    "editTitle": "编辑工作区 {{name}}",
+    "fieldName": "名称",
+    "fieldDescription": "描述",
+    "fieldIcon": "图标（emoji）",
+    "save": "保存",
+    "saveSuccess": "已更新工作区",
+    "saveFailed": "保存失败",
+    "delete": "删除工作区",
+    "deleteTitle": "删除工作区 {{name}}",
+    "deleteConfirmHint": "删除后，该工作区下的笔记本与笔记会被归还到所有者「{{owner}}」的个人空间，工作区成员关系与邀请码会被清除。此操作不可撤销。",
+    "deleteConfirmHintNoOwner": "删除后，该工作区下的笔记本与笔记会被归还到所有者的个人空间，工作区成员关系与邀请码会被清除。此操作不可撤销。",
+    "deleteSummaryMembers": "成员",
+    "deleteSummaryNotebooks": "笔记本",
+    "confirmDelete": "确认删除",
+    "deleteSuccess": "工作区已删除",
+    "deleteFailed": "删除失败",
+    "iconPlaceholder": "🏢"
   },
   "dataManager": {
     "title": "数据管理",
@@ -1362,5 +1408,82 @@
     "minutesAgo": "{{n}}分钟前",
     "hoursAgo": "{{n}}小时前",
     "daysAgo": "{{n}}天前"
+  },
+  "tokens": {
+    "title": "个人访问令牌",
+    "subtitle": "为第三方应用（如书签同步、命令行工具）创建专属访问令牌，可随时单独吊销，无需更换密码。",
+    "banner": "令牌等同于密码：明文仅在创建时显示一次，请立即妥善保存。若怀疑泄漏，立刻吊销并重新创建即可。",
+    "createAction": "创建令牌",
+    "loading": "加载中...",
+    "loadFail": "加载失败",
+    "revoke": "吊销",
+    "revokeConfirmTitle": "确定吊销此令牌？",
+    "revokeConfirmDesc": "使用该令牌的所有应用（含「{{name}}」）将立即失去访问权限。此操作不可撤销。",
+    "revokeSuccess": "令牌「{{name}}」已吊销",
+    "revokeFail": "吊销失败",
+    "neverExpires": "永不过期",
+    "timeJustNow": "刚刚",
+    "timeMinAgo": "{{n}} 分钟前",
+    "timeHourAgo": "{{n}} 小时前",
+    "timeDayAgo": "{{n}} 天前",
+    "empty": {
+      "title": "还没有访问令牌",
+      "desc": "创建一个令牌即可让第三方应用（如书签首页同步、CLI 工具）安全访问您的笔记，无需透露密码。",
+      "cta": "立即创建"
+    },
+    "status": {
+      "active": "可用",
+      "expired": "已过期",
+      "revoked": "已吊销"
+    },
+    "row": {
+      "created": "创建",
+      "expires": "过期",
+      "lastUsed": "最近使用",
+      "revokedAt": "吊销于"
+    },
+    "create": {
+      "title": "创建访问令牌",
+      "subtitle": "明文令牌只会显示这一次，请在窗口关闭前完成复制。",
+      "nameLabel": "名称",
+      "namePlaceholder": "例如：NOWEN 书签同步",
+      "nameHint": "用于您日后识别此令牌的用途，不会泄漏给第三方。",
+      "scopesLabel": "权限范围",
+      "selectAll": "全选",
+      "clearAll": "清空",
+      "expiresLabel": "过期时间",
+      "daysPreset": "{{n}} 天",
+      "neverExpiresHint": "永不过期的令牌请妥善保管，建议至少选择一个有限期。",
+      "errName": "请填写令牌名称",
+      "errScopes": "请至少选择一个权限范围",
+      "submit": "创建令牌",
+      "fail": "创建失败"
+    },
+    "created": {
+      "title": "令牌已创建",
+      "warning": "这是您唯一一次能看到完整令牌的机会。",
+      "warningDesc": "关闭此窗口后，明文将永久无法再次查看。请立即复制并妥善保存。",
+      "tokenLabel": "您的访问令牌",
+      "tokenHint": "点击输入框可全选，或直接点「复制」按钮。",
+      "copy": "复制",
+      "copied": "已复制",
+      "copyFail": "复制失败，请手动选中复制",
+      "closeConfirmTitle": "确定要关闭吗？",
+      "closeConfirmDesc": "此令牌的明文将永久无法再次查看。请确认您已妥善保存。",
+      "closeAnyway": "我已保存，关闭",
+      "done": "完成"
+    },
+    "usage": {
+      "title": "使用概览",
+      "subtitle": "汇总你所有令牌的调用情况",
+      "daysLabel": "{{n}} 天",
+      "loading": "加载统计...",
+      "loadFail": "统计加载失败",
+      "callsUnit": "次调用",
+      "compareHint": "对比上一个 {{n}} 天周期",
+      "chartAria": "每日令牌调用量柱状图",
+      "topTitle": "活跃令牌排行",
+      "empty": "过去 {{n}} 天还没有任何令牌调用。让你的应用开始干活吧 ✨"
+    }
   }
 }

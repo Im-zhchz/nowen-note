@@ -9,7 +9,18 @@
  */
 import React, { useEffect, useRef, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { Home, Building2, Plus, ChevronDown, Users, LogIn, X } from "lucide-react";
+import {
+  Plus,
+  ChevronDown,
+  Users,
+  LogIn,
+  X,
+  Pencil,
+  Trash2,
+  AlertTriangle,
+  Loader2,
+} from "lucide-react";
+import { useTranslation } from "react-i18next";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { api, getCurrentWorkspace, setCurrentWorkspace } from "@/lib/api";
@@ -17,6 +28,8 @@ import { Workspace } from "@/types";
 import { toast } from "@/lib/toast";
 import { cn } from "@/lib/utils";
 import MembersPanel from "@/components/MembersPanel";
+import ContextMenu, { ContextMenuItem } from "@/components/ContextMenu";
+import { useContextMenu } from "@/hooks/useContextMenu";
 
 interface WorkspaceSwitcherProps {
   /** 切换后父组件触发的回调，通常是 reload 数据 */
@@ -25,13 +38,18 @@ interface WorkspaceSwitcherProps {
 }
 
 export default function WorkspaceSwitcher({ onWorkspaceChange, collapsed }: WorkspaceSwitcherProps) {
+  const { t } = useTranslation();
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
   const [current, setCurrent] = useState<string>(getCurrentWorkspace());
   const [open, setOpen] = useState(false);
   const [showCreate, setShowCreate] = useState(false);
   const [showJoin, setShowJoin] = useState(false);
   const [showMembers, setShowMembers] = useState<string | null>(null);
+  const [isAdmin, setIsAdmin] = useState(false);
+  const [editing, setEditing] = useState<Workspace | null>(null);
+  const [deleting, setDeleting] = useState<Workspace | null>(null);
   const ref = useRef<HTMLDivElement>(null);
+  const { menu, menuRef, openMenu, closeMenu } = useContextMenu();
 
   const loadWorkspaces = async () => {
     try {
@@ -44,6 +62,22 @@ export default function WorkspaceSwitcher({ onWorkspaceChange, collapsed }: Work
 
   useEffect(() => {
     loadWorkspaces();
+  }, []);
+
+  // 系统管理员（users.role='admin'）：可对任意工作区右键编辑/删除——后端中间件已对其旁路。
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .getMe()
+      .then((u) => {
+        if (!cancelled) setIsAdmin((u as any)?.role === "admin");
+      })
+      .catch(() => {
+        if (!cancelled) setIsAdmin(false);
+      });
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   // 点击外部关闭下拉
@@ -73,15 +107,131 @@ export default function WorkspaceSwitcher({ onWorkspaceChange, collapsed }: Work
   const displayName = current === "personal" ? "个人空间" : currentWs?.name || "个人空间";
   const displayIcon = current === "personal" ? "🏠" : currentWs?.icon || "🏢";
 
+  // 在入口按钮（展开/收起态）上右键当前工作区时，直接弹出对应右键菜单。
+  // 个人空间没有可管理选项，不弹菜单（避免空菜单）。
+  const handleEntryContextMenu = (e: React.MouseEvent) => {
+    if (current === "personal") return;
+    const target = workspaces.find((w) => w.id === current);
+    if (!target) return;
+    const canManage = target.role === "owner" || target.role === "admin" || isAdmin;
+    const canEditDelete = target.role === "owner" || isAdmin;
+    if (!canManage && !canEditDelete) return;
+    e.preventDefault();
+    e.stopPropagation();
+    openMenu(e, target.id, "workspace");
+  };
+
   if (collapsed) {
     return (
-      <button
-        className="w-full flex items-center justify-center p-2 rounded-lg hover:bg-accent transition-colors"
-        title={displayName}
-        onClick={() => setOpen(true)}
-      >
-        <span className="text-xl">{displayIcon}</span>
-      </button>
+      <>
+        <button
+          className="w-full flex items-center justify-center p-2 rounded-lg hover:bg-accent transition-colors"
+          title={displayName}
+          onClick={() => setOpen(true)}
+          onContextMenu={handleEntryContextMenu}
+        >
+          <span className="text-xl">{displayIcon}</span>
+        </button>
+        {/* 收起态下右键菜单及其衍生弹窗复用展开态分支同一份渲染逻辑，避免代码冗余 */}
+        {renderContextMenuAndDialogs()}
+      </>
+    );
+  }
+
+  function renderContextMenuAndDialogs() {
+    return (
+      <>
+        {showMembers && (
+          <MembersPanel
+            workspaceId={showMembers}
+            onClose={() => {
+              setShowMembers(null);
+              loadWorkspaces();
+            }}
+          />
+        )}
+        {(() => {
+          if (!menu.isOpen || menu.targetType !== "workspace" || !menu.targetId) return null;
+          const target = workspaces.find((w) => w.id === menu.targetId);
+          if (!target) return null;
+          const canManage = target.role === "owner" || target.role === "admin" || isAdmin;
+          const canEditDelete = target.role === "owner" || isAdmin;
+          const items: ContextMenuItem[] = [];
+          if (canManage) {
+            items.push({
+              id: "members",
+              label: t("workspaceSwitcher.contextMenu.manageMembers", "管理成员"),
+              icon: <Users className="w-3.5 h-3.5" />,
+            });
+          }
+          if (canEditDelete) {
+            if (items.length > 0) items.push({ id: "sep1", label: "", separator: true });
+            items.push({
+              id: "edit",
+              label: t("workspaceSwitcher.contextMenu.edit", "编辑工作区"),
+              icon: <Pencil className="w-3.5 h-3.5" />,
+            });
+            items.push({
+              id: "delete",
+              label: t("workspaceSwitcher.contextMenu.delete", "删除工作区"),
+              icon: <Trash2 className="w-3.5 h-3.5" />,
+              danger: true,
+            });
+          }
+          if (items.length === 0) return null;
+          return (
+            <ContextMenu
+              isOpen={menu.isOpen}
+              x={menu.x}
+              y={menu.y}
+              items={items}
+              menuRef={menuRef}
+              header={target.name}
+              onAction={(actionId) => {
+                closeMenu();
+                if (actionId === "members") {
+                  setShowMembers(target.id);
+                } else if (actionId === "edit") {
+                  setEditing(target);
+                } else if (actionId === "delete") {
+                  setDeleting(target);
+                }
+              }}
+            />
+          );
+        })()}
+        {editing && (
+          <EditWorkspaceDialog
+            workspace={editing}
+            onClose={() => setEditing(null)}
+            onSaved={() => {
+              setEditing(null);
+              loadWorkspaces();
+            }}
+          />
+        )}
+        {deleting && (
+          <DeleteWorkspaceDialog
+            workspace={deleting}
+            onClose={() => setDeleting(null)}
+            onDeleted={() => {
+              const removedId = deleting.id;
+              setDeleting(null);
+              if (current === removedId) {
+                setCurrent("personal");
+                setCurrentWorkspace("personal");
+                onWorkspaceChange?.("personal");
+                window.dispatchEvent(
+                  new CustomEvent("nowen:workspace-changed", {
+                    detail: { workspaceId: "personal" },
+                  }),
+                );
+              }
+              loadWorkspaces();
+            }}
+          />
+        )}
+      </>
     );
   }
 
@@ -90,6 +240,7 @@ export default function WorkspaceSwitcher({ onWorkspaceChange, collapsed }: Work
       <div ref={ref} className="relative">
         <button
           onClick={() => setOpen((v) => !v)}
+          onContextMenu={handleEntryContextMenu}
           className={cn(
             "w-full flex items-center gap-2 px-3 py-2 rounded-lg border border-border",
             "bg-background hover:bg-accent transition-colors text-sm",
@@ -137,13 +288,24 @@ export default function WorkspaceSwitcher({ onWorkspaceChange, collapsed }: Work
                     active={current === w.id}
                     onClick={() => switchTo(w.id)}
                     onManage={
-                      w.role === "owner" || w.role === "admin"
+                      w.role === "owner" || w.role === "admin" || isAdmin
                         ? () => {
                             setOpen(false);
                             setShowMembers(w.id);
                           }
                         : undefined
                     }
+                    onContextMenu={(e) => {
+                      // 只有 owner / 工作区 admin / 系统管理员 才有右键菜单。
+                      // 注意：这里**不**主动 setOpen(false)——之前那样写会导致
+                      // 下拉立即收起、用户视觉上看到"菜单弹出但下拉消失"的割裂
+                      // 体验。下拉与右键菜单本就互不重叠（菜单跟随鼠标，下拉
+                      // 锚定按钮），完全可以共存；用户做完动作（点菜单项 / 点空白）
+                      // 后下拉会自然关闭。
+                      if (w.role === "owner" || w.role === "admin" || isAdmin) {
+                        openMenu(e, w.id, "workspace");
+                      }
+                    }}
                   />
                 ))}
               </div>
@@ -196,15 +358,7 @@ export default function WorkspaceSwitcher({ onWorkspaceChange, collapsed }: Work
         />
       )}
 
-      {showMembers && (
-        <MembersPanel
-          workspaceId={showMembers}
-          onClose={() => {
-            setShowMembers(null);
-            loadWorkspaces();
-          }}
-        />
-      )}
+      {renderContextMenuAndDialogs()}
     </>
   );
 }
@@ -217,6 +371,7 @@ function WorkspaceItem({
   active,
   onClick,
   onManage,
+  onContextMenu,
 }: {
   icon: string;
   name: string;
@@ -224,6 +379,7 @@ function WorkspaceItem({
   active: boolean;
   onClick: () => void;
   onManage?: () => void;
+  onContextMenu?: (e: React.MouseEvent) => void;
 }) {
   return (
     <div
@@ -232,6 +388,7 @@ function WorkspaceItem({
         active ? "bg-accent" : "hover:bg-accent/60",
       )}
       onClick={onClick}
+      onContextMenu={onContextMenu}
     >
       <span className="text-lg">{icon}</span>
       <div className="flex-1 min-w-0">
@@ -382,6 +539,159 @@ function JoinWorkspaceDialog({
           </Button>
           <Button onClick={handleJoin} disabled={loading}>
             {loading ? "加入中..." : "加入"}
+          </Button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+/* ========== 编辑工作区对话框 ========== */
+function EditWorkspaceDialog({
+  workspace,
+  onClose,
+  onSaved,
+}: {
+  workspace: Workspace;
+  onClose: () => void;
+  onSaved: () => void;
+}) {
+  const { t } = useTranslation();
+  const [name, setName] = useState(workspace.name);
+  const [description, setDescription] = useState(workspace.description || "");
+  const [icon, setIcon] = useState(workspace.icon || "🏢");
+  const [loading, setLoading] = useState(false);
+
+  const handleSave = async () => {
+    const trimmed = name.trim();
+    if (!trimmed) {
+      toast.error(t("workspaceManagement.fieldName", "名称"));
+      return;
+    }
+    const payload: { name?: string; description?: string; icon?: string } = {};
+    if (trimmed !== workspace.name) payload.name = trimmed;
+    if (description !== (workspace.description || "")) payload.description = description;
+    if (icon !== (workspace.icon || "🏢")) payload.icon = icon;
+    if (Object.keys(payload).length === 0) {
+      onClose();
+      return;
+    }
+    setLoading(true);
+    try {
+      await api.updateWorkspace(workspace.id, payload);
+      toast.success(t("workspaceManagement.saveSuccess", "已保存"));
+      onSaved();
+    } catch (e: any) {
+      toast.error(e?.message || t("workspaceManagement.saveFailed", "保存失败"));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <Modal
+      title={t("workspaceManagement.editTitle", { name: workspace.name, defaultValue: `编辑：${workspace.name}` })}
+      onClose={() => !loading && onClose()}
+    >
+      <div className="space-y-3">
+        <div>
+          <label className="text-sm mb-1 block">
+            {t("workspaceManagement.fieldIcon", "图标")}
+          </label>
+          <Input
+            value={icon}
+            maxLength={4}
+            onChange={(e) => setIcon(e.target.value)}
+            placeholder="🏢"
+            className="w-20 text-center text-lg"
+          />
+        </div>
+        <div>
+          <label className="text-sm mb-1 block">
+            {t("workspaceManagement.fieldName", "名称")}{" "}
+            <span className="text-destructive">*</span>
+          </label>
+          <Input value={name} onChange={(e) => setName(e.target.value)} autoFocus />
+        </div>
+        <div>
+          <label className="text-sm mb-1 block">
+            {t("workspaceManagement.fieldDescription", "描述")}
+          </label>
+          <Input
+            value={description}
+            onChange={(e) => setDescription(e.target.value)}
+          />
+        </div>
+        <div className="flex justify-end gap-2 pt-2">
+          <Button variant="outline" onClick={onClose} disabled={loading}>
+            {t("common.cancel", "取消")}
+          </Button>
+          <Button onClick={handleSave} disabled={loading || !name.trim()}>
+            {loading && <Loader2 className="w-3 h-3 animate-spin mr-1" />}
+            {t("workspaceManagement.save", "保存")}
+          </Button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+/* ========== 删除工作区对话框 ========== */
+function DeleteWorkspaceDialog({
+  workspace,
+  onClose,
+  onDeleted,
+}: {
+  workspace: Workspace;
+  onClose: () => void;
+  onDeleted: () => void;
+}) {
+  const { t } = useTranslation();
+  const [loading, setLoading] = useState(false);
+
+  const handleDelete = async () => {
+    setLoading(true);
+    try {
+      await api.deleteWorkspace(workspace.id);
+      toast.success(t("workspaceManagement.deleteSuccess", "已删除"));
+      onDeleted();
+    } catch (e: any) {
+      toast.error(e?.message || t("workspaceManagement.deleteFailed", "删除失败"));
+      setLoading(false);
+    }
+  };
+
+  return (
+    <Modal
+      title={t("workspaceManagement.deleteTitle", {
+        name: workspace.name,
+        defaultValue: `删除：${workspace.name}`,
+      })}
+      onClose={() => !loading && onClose()}
+    >
+      <div className="space-y-4 text-sm">
+        <div className="p-3 rounded-lg bg-red-50/60 dark:bg-red-500/10 border border-red-200 dark:border-red-500/30 flex items-start gap-2">
+          <AlertTriangle className="w-4 h-4 text-red-500 mt-0.5 shrink-0" />
+          <p className="text-xs text-red-700 dark:text-red-300 leading-relaxed">
+            {t(
+              "workspaceManagement.deleteConfirmHintNoOwner",
+              "删除后该工作区下的笔记本将归还到所有者的个人空间，邀请码、成员关系会被清除，此操作不可撤销。",
+            )}
+          </p>
+        </div>
+
+        <div className="flex justify-end gap-2 pt-1">
+          <Button variant="outline" onClick={onClose} disabled={loading}>
+            {t("common.cancel", "取消")}
+          </Button>
+          <Button
+            variant="destructive"
+            onClick={handleDelete}
+            disabled={loading}
+            className="bg-red-600 hover:bg-red-700 text-white"
+          >
+            {loading && <Loader2 className="w-3 h-3 animate-spin mr-1" />}
+            {t("workspaceManagement.confirmDelete", "确认删除")}
           </Button>
         </div>
       </div>

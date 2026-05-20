@@ -48,6 +48,15 @@ export interface Workspace {
   notebookCount?: number;
 }
 
+/**
+ * 系统管理员"工作区管理"面板用：在 Workspace 之上额外携带 owner 的展示信息。
+ * 后端 GET /workspaces/all 返回此结构。
+ */
+export interface WorkspaceAdminItem extends Workspace {
+  ownerUsername?: string;
+  ownerName?: string;
+}
+
 export interface WorkspaceMember {
   workspaceId: string;
   userId: string;

@@ -8,9 +8,6 @@ import {
   hasPermission,
   buildVisibilityWhere,
 } from "../middleware/acl";
-import { deleteAttachmentFilesByNoteIds } from "./attachments";
-import { reclaimSpace } from "../lib/reclaimSpace";
-import { yDestroyDoc } from "../services/yjs";
 
 const app = new Hono();
 
@@ -30,18 +27,25 @@ app.get("/", (c) => {
 
   // noteCount 采用「递归口径」：每个笔记本的徽标数 = 自身直属笔记 + 所有子孙笔记本下的笔记
   // 通过递归 CTE 建立 ancestor → descendant 映射，再 JOIN notes 计数
+  //
+  // 软删除过滤（v14 起）：
+  //   - 主 WHERE 加 nb.isDeleted = 0：软删的笔记本不再出现在侧边栏；
+  //   - 递归 CTE 内的 notebooks 也加 isDeleted = 0：避免子孙笔记本被父级软删
+  //     后从 nb_tree 里漏掉父子链；
+  //   - notes 计数已经过滤了 isTrashed=0，配合上面的笔记本过滤后，软删笔记本
+  //     里被一并 isTrashed=1 的笔记不会再贡献徽标计数。
   if (workspaceId === "personal") {
     rows = db
       .prepare(
         `
         WITH RECURSIVE nb_tree(ancestorId, descendantId) AS (
           SELECT id, id FROM notebooks
-          WHERE userId = ? AND workspaceId IS NULL
+          WHERE userId = ? AND workspaceId IS NULL AND isDeleted = 0
           UNION ALL
           SELECT t.ancestorId, n.id
           FROM nb_tree t
           INNER JOIN notebooks n ON n.parentId = t.descendantId
-          WHERE n.userId = ? AND n.workspaceId IS NULL
+          WHERE n.userId = ? AND n.workspaceId IS NULL AND n.isDeleted = 0
         )
         SELECT nb.*, COALESCE(nc.noteCount, 0) AS noteCount
         FROM notebooks nb
@@ -52,7 +56,7 @@ app.get("/", (c) => {
           WHERE notes.userId = ? AND notes.isTrashed = 0 AND notes.workspaceId IS NULL
           GROUP BY t.ancestorId
         ) nc ON nb.id = nc.notebookId
-        WHERE nb.userId = ? AND nb.workspaceId IS NULL
+        WHERE nb.userId = ? AND nb.workspaceId IS NULL AND nb.isDeleted = 0
         ORDER BY nb.sortOrder ASC
       `,
       )
@@ -66,12 +70,12 @@ app.get("/", (c) => {
       .prepare(
         `
         WITH RECURSIVE nb_tree(ancestorId, descendantId) AS (
-          SELECT id, id FROM notebooks WHERE workspaceId = ?
+          SELECT id, id FROM notebooks WHERE workspaceId = ? AND isDeleted = 0
           UNION ALL
           SELECT t.ancestorId, n.id
           FROM nb_tree t
           INNER JOIN notebooks n ON n.parentId = t.descendantId
-          WHERE n.workspaceId = ?
+          WHERE n.workspaceId = ? AND n.isDeleted = 0
         )
         SELECT nb.*, COALESCE(nc.noteCount, 0) AS noteCount
         FROM notebooks nb
@@ -82,7 +86,7 @@ app.get("/", (c) => {
           WHERE notes.isTrashed = 0 AND notes.workspaceId = ?
           GROUP BY t.ancestorId
         ) nc ON nb.id = nc.notebookId
-        WHERE nb.workspaceId = ?
+        WHERE nb.workspaceId = ? AND nb.isDeleted = 0
         ORDER BY nb.sortOrder ASC
       `,
       )
@@ -94,12 +98,12 @@ app.get("/", (c) => {
         `
         WITH RECURSIVE nb_tree(ancestorId, descendantId) AS (
           SELECT id, id FROM notebooks
-          WHERE userId = ? AND workspaceId IS NULL
+          WHERE userId = ? AND workspaceId IS NULL AND isDeleted = 0
           UNION ALL
           SELECT t.ancestorId, n.id
           FROM nb_tree t
           INNER JOIN notebooks n ON n.parentId = t.descendantId
-          WHERE n.userId = ? AND n.workspaceId IS NULL
+          WHERE n.userId = ? AND n.workspaceId IS NULL AND n.isDeleted = 0
         )
         SELECT nb.*, COALESCE(nc.noteCount, 0) AS noteCount
         FROM notebooks nb
@@ -110,7 +114,7 @@ app.get("/", (c) => {
           WHERE notes.userId = ? AND notes.isTrashed = 0 AND notes.workspaceId IS NULL
           GROUP BY t.ancestorId
         ) nc ON nb.id = nc.notebookId
-        WHERE nb.userId = ? AND nb.workspaceId IS NULL
+        WHERE nb.userId = ? AND nb.workspaceId IS NULL AND nb.isDeleted = 0
         ORDER BY nb.sortOrder ASC
       `,
       )
@@ -132,6 +136,21 @@ app.post("/", async (c) => {
     const role = getUserWorkspaceRole(workspaceId, userId);
     if (!hasRole(role, "editor")) {
       return c.json({ error: "您在该工作区无创建权限" }, 403);
+    }
+  }
+
+  // v14：父笔记本若已被软删（在回收站里），不允许在其下创建子笔记本——
+  // 否则新建的子笔记本会立刻 "看不见"（被父级 isDeleted 过滤掉）。
+  if (body.parentId) {
+    const parent = db
+      .prepare("SELECT isDeleted FROM notebooks WHERE id = ?")
+      .get(body.parentId) as { isDeleted: number } | undefined;
+    if (!parent) return c.json({ error: "父笔记本不存在" }, 404);
+    if (parent.isDeleted === 1) {
+      return c.json(
+        { error: "父笔记本已删除，无法在其下创建", code: "PARENT_NOTEBOOK_TRASHED" },
+        400,
+      );
     }
   }
 
@@ -169,12 +188,22 @@ app.put("/:id/move", async (c) => {
     return c.json({ error: "forbidden" }, 403);
   }
 
+  // v14：禁止操作已软删（在回收站）的笔记本——视同不存在
+  const cur = db
+    .prepare("SELECT isDeleted FROM notebooks WHERE id = ?")
+    .get(id) as { isDeleted: number } | undefined;
+  if (!cur || cur.isDeleted === 1) {
+    return c.json({ error: "notebook not found" }, 404);
+  }
+
   if (newParentId !== undefined && newParentId !== null) {
     if (newParentId === id) {
       return c.json({ error: "cannot move notebook into itself" }, 400);
     }
     const parent = db
-      .prepare("SELECT id, userId, workspaceId FROM notebooks WHERE id = ?")
+      .prepare(
+        "SELECT id, userId, workspaceId FROM notebooks WHERE id = ? AND isDeleted = 0",
+      )
       .get(newParentId) as { id: string; userId: string; workspaceId: string | null } | undefined;
     if (!parent) return c.json({ error: "target parent not found" }, 404);
 
@@ -255,6 +284,14 @@ app.put("/:id", async (c) => {
     return c.json({ error: "forbidden" }, 403);
   }
 
+  // v14：已软删的笔记本视同不存在，禁止重命名 / 改图标 / 改父级
+  const cur = db
+    .prepare("SELECT isDeleted FROM notebooks WHERE id = ?")
+    .get(id) as { isDeleted: number } | undefined;
+  if (!cur || cur.isDeleted === 1) {
+    return c.json({ error: "notebook not found" }, 404);
+  }
+
   db.prepare(
     `
     UPDATE notebooks SET name = COALESCE(?, name), icon = COALESCE(?, icon),
@@ -277,6 +314,20 @@ app.put("/:id", async (c) => {
 });
 
 // 删除笔记本
+//
+// v14 起改为「软删除 + 笔记进回收站」语义：
+//   - 不再 DELETE FROM notebooks（避免 ON DELETE CASCADE 把笔记直接物理删除，
+//     导致回收站里看不到这些笔记）；
+//   - 当前笔记本及其全部子孙笔记本一并 isDeleted=1，从侧边栏消失；
+//   - 这些笔记本下的所有 notes 标记 isTrashed=1，进入回收站，等用户从回收站
+//     永久删除时再走 reclaimSpace。
+//
+// 注：
+//   - attachments 物理文件、Y.Doc 内存房间不在此处清理——笔记还在回收站，
+//     用户可能恢复，过早删文件会让恢复出来的笔记图片裂掉。统一推迟到
+//     /notes/trash/empty 与 /notes/:id（永久删除）路径处理。
+//   - 因为没有真删任何行，也不需要 reclaimSpace；磁盘体量在用户清空回收站
+//     时才发生显著变化，行为符合直觉。
 app.delete("/:id", (c) => {
   const db = getDb();
   const userId = c.req.header("X-User-Id") || "";
@@ -287,76 +338,90 @@ app.delete("/:id", (c) => {
     return c.json({ error: "forbidden" }, 403);
   }
 
-  // ⚠ notebooks 的 FK 是 ON DELETE CASCADE，删笔记本会连带把该笔记本（以及
-  // 所有后代笔记本）下的全部 notes 都删掉。注意 DB 级 CASCADE **只处理 DB
-  // 行**：attachments 的物理文件、Y.Doc 内存实例需要我们手动清理。
-  //
-  // 额外的"存储占用不降"根因也在这里：大量笔记和附件被删后，SQLite 的
-  // free page 不会自动归还给 OS，.db 文件尺寸纹丝不动。删完后统一
-  // reclaimSpace() 一下。
-  //
-  // 采集待删 note id：递归查出当前笔记本及其所有后代笔记本下的笔记。
-  // 用递归 CTE 避免应用层多次查询。
-  let affectedNoteIds: string[] = [];
+  // 已经是软删态：幂等返回成功，避免重复点击导致 trashedAt 抖动。
+  const cur = db
+    .prepare("SELECT isDeleted FROM notebooks WHERE id = ?")
+    .get(id) as { isDeleted: number } | undefined;
+  if (!cur) return c.json({ error: "notebook not found" }, 404);
+  if (cur.isDeleted === 1) {
+    return c.json({ success: true, removedNoteCount: 0, alreadyDeleted: true });
+  }
+
+  // 递归收集当前笔记本 + 所有子孙笔记本 id（限定 isDeleted=0，避免把之前已软删
+  // 的某个分支再次 "重新软删" 把 trashedAt 覆盖掉）。
+  let nbIds: string[] = [];
   try {
-    affectedNoteIds = (db
+    nbIds = (db
       .prepare(
         `WITH RECURSIVE sub(id) AS (
-           SELECT id FROM notebooks WHERE id = ?
+           SELECT id FROM notebooks WHERE id = ? AND isDeleted = 0
            UNION ALL
            SELECT n.id FROM notebooks n JOIN sub ON n.parentId = sub.id
+           WHERE n.isDeleted = 0
          )
-         SELECT n.id FROM notes n WHERE n.notebookId IN (SELECT id FROM sub)`,
+         SELECT id FROM sub`,
       )
       .all(id) as { id: string }[]).map((r) => r.id);
   } catch (e) {
-    console.warn("[notebooks.delete] collect affected noteIds failed:", (e as Error).message);
+    console.warn(
+      "[notebooks.delete] collect descendant notebookIds failed:",
+      (e as Error).message,
+    );
+  }
+  if (nbIds.length === 0) nbIds = [id]; // 兜底
+
+  // 收集所有受影响的笔记 id（仅未在回收站的；已经 isTrashed=1 的不动 trashedAt）
+  let trashedNoteIds: string[] = [];
+  try {
+    const placeholders = nbIds.map(() => "?").join(",");
+    trashedNoteIds = (db
+      .prepare(
+        `SELECT id FROM notes
+          WHERE notebookId IN (${placeholders}) AND isTrashed = 0`,
+      )
+      .all(...nbIds) as { id: string }[]).map((r) => r.id);
+  } catch (e) {
+    console.warn(
+      "[notebooks.delete] collect noteIds failed:",
+      (e as Error).message,
+    );
   }
 
-  // 估算释放字节数（只算一次；DELETE 后这些行就查不到了）
-  let freedBytesEstimate = 0;
-  let removedFiles = 0;
-  if (affectedNoteIds.length > 0) {
-    try {
-      const placeholders = affectedNoteIds.map(() => "?").join(",");
-      const attBytes = db
-        .prepare(
-          `SELECT COALESCE(SUM(size), 0) AS bytes FROM attachments WHERE noteId IN (${placeholders})`,
-        )
-        .get(...affectedNoteIds) as { bytes: number } | undefined;
-      freedBytesEstimate += attBytes?.bytes || 0;
-      const noteBytes = db
-        .prepare(
-          `SELECT COALESCE(SUM(
-             COALESCE(LENGTH(content), 0) +
-             COALESCE(LENGTH(contentText), 0) +
-             COALESCE(LENGTH(title), 0)
-           ), 0) AS bytes FROM notes WHERE id IN (${placeholders})`,
-        )
-        .get(...affectedNoteIds) as { bytes: number } | undefined;
-      freedBytesEstimate += noteBytes?.bytes || 0;
-    } catch { /* 估算失败不阻塞 */ }
+  // 一个事务内：标记笔记本 isDeleted=1 + 把直属未回收的笔记移入回收站
+  const placeholders = nbIds.map(() => "?").join(",");
+  const tx = db.transaction(() => {
+    db.prepare(
+      `UPDATE notebooks
+          SET isDeleted = 1,
+              deletedAt = datetime('now'),
+              updatedAt = datetime('now')
+        WHERE id IN (${placeholders}) AND isDeleted = 0`,
+    ).run(...nbIds);
 
-    // 必须在 DELETE 之前清理磁盘附件（否则 CASCADE 后 path 就查不到了）。
-    try {
-      removedFiles = deleteAttachmentFilesByNoteIds(affectedNoteIds);
-    } catch (e) {
-      console.warn("[notebooks.delete] deleteAttachmentFilesByNoteIds failed:", (e as Error).message);
+    if (trashedNoteIds.length > 0) {
+      const noteIn = trashedNoteIds.map(() => "?").join(",");
+      db.prepare(
+        `UPDATE notes
+            SET isTrashed = 1,
+                trashedAt = datetime('now'),
+                updatedAt = datetime('now')
+          WHERE id IN (${noteIn})`,
+      ).run(...trashedNoteIds);
     }
+  });
+
+  try {
+    tx();
+  } catch (e) {
+    console.error("[notebooks.delete] soft-delete tx failed:", (e as Error).message);
+    return c.json({ error: "删除失败" }, 500);
   }
 
-  db.prepare("DELETE FROM notebooks WHERE id = ?").run(id);
-
-  // 释放内存 Y.Doc（DB 里 note_yupdates/ysnapshots 已随 CASCADE 清理）
-  for (const nid of affectedNoteIds) {
-    try { yDestroyDoc(nid); } catch { /* ignore */ }
-  }
-
-  // 真正让 .db / .db-wal 文件缩小。小量删除走 incremental_vacuum；
-  // 批量（≥ 阈值，默认 50MB）额外 VACUUM 碎片整理一次。
-  reclaimSpace(db, { freedBytesEstimate, tag: "notebooks.delete" });
-
-  return c.json({ success: true, removedNoteCount: affectedNoteIds.length, removedFiles });
+  return c.json({
+    success: true,
+    softDeletedNotebookCount: nbIds.length,
+    trashedNoteCount: trashedNoteIds.length,
+  });
 });
 
 export default app;

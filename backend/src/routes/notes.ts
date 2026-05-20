@@ -324,10 +324,19 @@ app.post("/", async (c) => {
   // 如果指定了 notebookId，必须对其有 write 权限，并从笔记本继承 workspaceId
   let inheritedWorkspaceId: string | null = null;
   if (body.notebookId) {
-    const nb = db.prepare("SELECT workspaceId FROM notebooks WHERE id = ?").get(body.notebookId) as
-      | { workspaceId: string | null }
+    const nb = db
+      .prepare("SELECT workspaceId, isDeleted FROM notebooks WHERE id = ?")
+      .get(body.notebookId) as
+      | { workspaceId: string | null; isDeleted: number }
       | undefined;
     if (!nb) return c.json({ error: "笔记本不存在" }, 404);
+    // v14：软删的笔记本在回收站里等待永久清理，不允许下发新笔记。
+    if (nb.isDeleted === 1) {
+      return c.json(
+        { error: "笔记本已删除，无法在其下创建笔记", code: "NOTEBOOK_TRASHED" },
+        400,
+      );
+    }
     inheritedWorkspaceId = nb.workspaceId;
 
     const { permission } = resolveNotebookPermission(body.notebookId, userId);
@@ -465,10 +474,21 @@ app.put("/:id", async (c) => {
   //       也归一到 null 再比较，避免 "null !== undefined" 的字符串假阳性。
   let newWorkspaceId: string | null | undefined = undefined;
   if (body.notebookId !== undefined) {
-    const nb = db.prepare("SELECT workspaceId FROM notebooks WHERE id = ?").get(body.notebookId) as
-      | { workspaceId: string | null }
+    const nb = db
+      .prepare("SELECT workspaceId, isDeleted FROM notebooks WHERE id = ?")
+      .get(body.notebookId) as
+      | { workspaceId: string | null; isDeleted: number }
       | undefined;
     if (!nb) return c.json({ error: "目标笔记本不存在" }, 404);
+    // v14：不允许移到软删的笔记本。这个分支也负责拦住
+    // "从回收站恢复笔记「顺便指向原父」" 的场景——还原之前前端会
+    // 明确传一个未被软删的 notebookId。
+    if (nb.isDeleted === 1) {
+      return c.json(
+        { error: "目标笔记本已删除", code: "NOTEBOOK_TRASHED" },
+        400,
+      );
+    }
     newWorkspaceId = nb.workspaceId;
 
     // ★ 严格空间隔离：源/目标必须同 workspace（都为 null = 个人空间 也算同）
@@ -592,6 +612,59 @@ app.put("/:id", async (c) => {
   if (body.isLocked !== undefined) { fields.push("isLocked = ?"); params.push(body.isLocked); }
   if (body.isArchived !== undefined) { fields.push("isArchived = ?"); params.push(body.isArchived); }
   if (body.isTrashed !== undefined) {
+    // v14：从回收站恢复笔记时（isTrashed=1 → 0），若其父笔记本被软删，
+    // 还原后笔记会「看不见」（被侧边栏 isDeleted=0 过滤）。
+    //
+    // 用户预期 = macOS Notes 的"还原文件夹"语义：
+    //   恢复笔记 ⇒ 顺带把它的整条祖先笔记本链一起从笔记本回收站里取出来。
+    //
+    // 我们这样做：
+    //   1) 查到当前笔记的 notebookId 及该笔记本的 isDeleted 状态；
+    //   2) 若 isDeleted=1，沿 parentId 向上递归把所有还在软删态的祖先笔记本
+    //      统一标记为 isDeleted=0、deletedAt=NULL；
+    //   3) 然后正常完成笔记 isTrashed=0 的还原。
+    // 这样用户一次操作即可恢复"笔记 + 笔记本树"，无 dead-end。
+    if (body.isTrashed === 0 && body.notebookId === undefined) {
+      try {
+        const cur = db
+          .prepare(
+            `SELECT nb.id AS nbId, nb.isDeleted FROM notes n
+               JOIN notebooks nb ON nb.id = n.notebookId
+              WHERE n.id = ?`,
+          )
+          .get(id) as { nbId: string; isDeleted: number } | undefined;
+        if (cur && cur.isDeleted === 1) {
+          // 收集需要一并恢复的祖先笔记本 id（含自身），仅限当前是软删的
+          const restoreIds = (db
+            .prepare(
+              `WITH RECURSIVE anc(id) AS (
+                 SELECT id FROM notebooks WHERE id = ? AND isDeleted = 1
+                 UNION ALL
+                 SELECT n.id FROM notebooks n
+                   JOIN anc ON n.id = (SELECT parentId FROM notebooks WHERE id = anc.id)
+                  WHERE n.isDeleted = 1
+               )
+               SELECT id FROM anc`,
+            )
+            .all(cur.nbId) as { id: string }[]).map((r) => r.id);
+          if (restoreIds.length > 0) {
+            const placeholders = restoreIds.map(() => "?").join(",");
+            db.prepare(
+              `UPDATE notebooks
+                  SET isDeleted = 0,
+                      deletedAt = NULL,
+                      updatedAt = datetime('now')
+                WHERE id IN (${placeholders})`,
+            ).run(...restoreIds);
+          }
+        }
+      } catch (e) {
+        console.warn(
+          "[notes.put] auto-restore ancestor notebooks failed:",
+          (e as Error).message,
+        );
+      }
+    }
     fields.push("isTrashed = ?"); params.push(body.isTrashed);
     if (body.isTrashed) { fields.push("trashedAt = datetime('now')"); }
   }

@@ -1139,11 +1139,15 @@ export default function Sidebar({ variant = "mobile" }: { variant?: "desktop" | 
     setMoveNbTarget(null);
   };
 
-  // 删除笔记本
+  // 删除笔记本（v14 起：软删除 — 笔记本及其子孙隐藏，下属笔记进回收站）
   const handleDeleteConfirm = async () => {
     if (!deleteTarget) return;
-    await api.deleteNotebook(deleteTarget.id).catch(console.error);
-    // 递归收集被删除笔记本及其所有子孙笔记本的 ID
+    try {
+      await api.deleteNotebook(deleteTarget.id);
+    } catch (err) {
+      console.error("[Sidebar] deleteNotebook failed:", err);
+    }
+    // 递归收集被软删除笔记本及其所有子孙笔记本的 ID（前端乐观更新，不等下次拉取）
     const idsToRemove = new Set<string>();
     const collectChildren = (parentId: string) => {
       idsToRemove.add(parentId);
@@ -1159,6 +1163,15 @@ export default function Sidebar({ variant = "mobile" }: { variant?: "desktop" | 
       actions.setSelectedNotebook(null);
       actions.setViewMode("all");
     }
+    // v14：触发笔记列表刷新——正在浏览回收站视图的用户能立刻看到刚被软删的
+    // 笔记；其他视图刷新后也能正确反映"消失的笔记"。同时通知文件管理 / 数据
+    // 管理刷新空间统计。
+    try { actions.refreshNotes(); } catch { /* ignore */ }
+    try {
+      window.dispatchEvent(
+        new CustomEvent("nowen:storage-changed", { detail: { reason: "notebook-deleted" } }),
+      );
+    } catch { /* ignore */ }
     setDeleteTarget(null);
   };
 
@@ -1178,6 +1191,15 @@ export default function Sidebar({ variant = "mobile" }: { variant?: "desktop" | 
       toast.error(err?.message || t('sidebar.emptyTrashFailed'));
     }
   };
+
+  // 允许其他视图（NoteList 回收站标题栏的"一键清空"按钮）通过自定义事件
+  // 直接复用 Sidebar 已实现的清空逻辑（含 lock 检测 / 体量统计 / VACUUM 提示），
+  // 避免在 NoteList 重复实现一份 80 行复杂逻辑。
+  useEffect(() => {
+    const onOpenEmptyTrash = () => { void openEmptyTrashConfirm(); };
+    window.addEventListener("nowen:open-empty-trash", onOpenEmptyTrash);
+    return () => window.removeEventListener("nowen:open-empty-trash", onOpenEmptyTrash);
+  }, []);
 
   const handleEmptyTrashConfirm = async () => {
     if (emptyingTrash) return;

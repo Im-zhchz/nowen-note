@@ -1,14 +1,16 @@
 import React, { useState, useRef, useEffect, useCallback } from "react";
 import { createPortal } from "react-dom";
 import { motion, AnimatePresence } from "framer-motion";
-import { Palette, Shield, Database, X, Settings, Camera, Save, Loader2, Trash2, Upload, Type, Check, ChevronDown, Globe, Bot, Users, Info, ExternalLink, Heart, Sparkles, RefreshCw, Wrench, ZoomIn } from "lucide-react";
+import { Palette, Shield, Database, X, Settings, Camera, Save, Loader2, Trash2, Upload, Type, Check, ChevronDown, Globe, Bot, Users, Info, ExternalLink, Heart, Sparkles, RefreshCw, Wrench, ZoomIn, Key, Building2 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import ThemeToggle from "@/components/ThemeToggle";
 import SkinSwitcher from "@/components/SkinSwitcher";
 import SecuritySettings from "@/components/SecuritySettings";
+import TokenManagement from "@/components/TokenManagement";
 import DataManager from "@/components/DataManager";
 import AISettingsPanel from "@/components/AISettingsPanel";
 import UserManagement from "@/components/UserManagement";
+import WorkspaceManagement from "@/components/WorkspaceManagement";
 import WhatsNewModal from "@/components/WhatsNewModal";
 import { useSiteSettings, BUILTIN_FONTS, getBuiltinFontName } from "@/hooks/useSiteSettings";
 import { api } from "@/lib/api";
@@ -16,7 +18,7 @@ import { isDesktop, checkForUpdates, onUpdaterStatus, getReleaseChannel, isPorta
 import { CustomFont } from "@/types";
 import { cn } from "@/lib/utils";
 
-type TabId = "appearance" | "ai" | "security" | "data" | "users" | "developer" | "about";
+type TabId = "appearance" | "ai" | "security" | "tokens" | "data" | "users" | "workspaces" | "developer" | "about";
 
 interface SettingsModalProps {
   onClose: () => void;
@@ -1112,7 +1114,11 @@ const SettingsModal = React.forwardRef<HTMLDivElement, SettingsModalProps>(
     { id: "appearance" as const, label: t('settings.appearance'), icon: Palette },
     { id: "ai" as const, label: t('settings.ai'), icon: Bot },
     { id: "security" as const, label: t('settings.security'), icon: Shield },
+    // 【个人访问令牌】任意登录用户都可管理自己的 token；与 security 同为"账号安全"类别，
+    // 不需要 isAdmin 判定。
+    { id: "tokens" as const, label: t('settings.tokens', { defaultValue: '访问令牌' }), icon: Key },
     ...(isAdmin ? [{ id: "users" as const, label: t('settings.users'), icon: Users }] : []),
+    ...(isAdmin ? [{ id: "workspaces" as const, label: t('settings.workspaces'), icon: Building2 }] : []),
     // 「数据管理」面板：
     //   - 管理员：展示三个一级 tab（个人空间 / 工作区 / 系统），包含跨用户/全库范围
     //     的高危操作（备份、灾难恢复、工厂重置、SQLite 文件级导入导出等）；
@@ -1293,10 +1299,12 @@ const SettingsModal = React.forwardRef<HTMLDivElement, SettingsModalProps>(
                     </div>
                   }
                 >
-                  {activeTab === "appearance" && <AppearancePanel />}
-                  {activeTab === "ai" && <AISettingsPanel />}
-                  {activeTab === "security" && <SecuritySettings />}
+            {activeTab === "appearance" && <AppearancePanel />}
+            {activeTab === "ai" && <AISettingsPanel />}
+            {activeTab === "security" && <SecuritySettings />}
+            {activeTab === "tokens" && <TokenManagement />}
                   {activeTab === "users" && isAdmin && <UserManagement currentUserId={currentUser?.id ?? null} />}
+                  {activeTab === "workspaces" && isAdmin && <WorkspaceManagement />}
                   {/* data tab 对所有用户可见：DataManager 内部会按 isAdmin 自动分流
                        —— 管理员看到完整三 scope；普通用户只看"个人空间"的导出/导入。 */}
                   {activeTab === "data" && <DataManager />}

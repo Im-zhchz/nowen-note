@@ -221,6 +221,13 @@ export function requireNotebookPermission(min: Permission) {
 
 /**
  * 中间件工厂：要求用户是某工作区的成员，且角色满足 min
+ *
+ * 系统管理员旁路：
+ *   - users.role = 'admin' 的系统管理员视同任意工作区的 owner，可越过所有
+ *     "工作区角色"门槛（编辑信息 / 删除空间 / 管成员 / 管邀请 / 改 features）。
+ *   - 这是"运维兜底"语义：管理员在「设置 → 工作区管理」里需要能跨工作区
+ *     维护任意一个空间。普通成员之间的角色关系不受影响。
+ *   - 不写入 workspace_members，不改变成员清单；只是放行本次请求。
  */
 export function requireWorkspaceRole(min: WorkspaceRole) {
   return async (c: Context, next: Next) => {
@@ -228,6 +235,14 @@ export function requireWorkspaceRole(min: WorkspaceRole) {
     const workspaceId =
       c.req.param("workspaceId") || c.req.param("id") || c.req.query("workspaceId") || "";
     if (!workspaceId) return c.json({ error: "缺少工作区 ID" }, 400);
+
+    // 系统管理员直通：以 owner 身份执行后续逻辑
+    if (isSystemAdmin(userId)) {
+      c.set("workspaceRole" as any, "owner");
+      c.set("isSystemAdminBypass" as any, true);
+      await next();
+      return;
+    }
 
     const role = getUserWorkspaceRole(workspaceId, userId);
     if (!hasRole(role, min)) {

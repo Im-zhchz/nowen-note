@@ -3,26 +3,32 @@
  *
  * 端点：
  *   GET    /api/workspaces                - 当前用户可访问的所有工作区
+ *   GET    /api/workspaces/all            - [系统管理员] 所有工作区（运维面板用）
  *   POST   /api/workspaces                - 创建工作区
- *   GET    /api/workspaces/:id            - 查看工作区详情
- *   PUT    /api/workspaces/:id            - 更新工作区（仅 owner/admin）
- *   DELETE /api/workspaces/:id            - 删除工作区（仅 owner）
+ *   GET    /api/workspaces/:id            - 查看工作区详情（系统管理员旁路）
+ *   PUT    /api/workspaces/:id            - 更新工作区（owner/admin / 系统管理员）
+ *   DELETE /api/workspaces/:id            - 删除工作区（owner / 系统管理员）
  *
- *   GET    /api/workspaces/:id/members    - 成员列表
- *   PUT    /api/workspaces/:id/members/:userId  - 修改成员角色（仅 owner/admin）
- *   DELETE /api/workspaces/:id/members/:userId  - 移除成员（仅 owner/admin）
+ *   GET    /api/workspaces/:id/members    - 成员列表（系统管理员旁路）
+ *   PUT    /api/workspaces/:id/members/:userId  - 修改成员角色（owner/admin / 系统管理员）
+ *   DELETE /api/workspaces/:id/members/:userId  - 移除成员（owner/admin / 系统管理员）
  *   POST   /api/workspaces/:id/leave      - 主动退出工作区
  *
- *   POST   /api/workspaces/:id/invites    - 生成邀请码（仅 owner/admin）
- *   GET    /api/workspaces/:id/invites    - 查看邀请码列表
+ *   POST   /api/workspaces/:id/invites    - 生成邀请码（owner/admin / 系统管理员）
+ *   GET    /api/workspaces/:id/invites    - 查看邀请码列表（owner/admin / 系统管理员）
  *   DELETE /api/workspaces/:id/invites/:inviteId - 撤销邀请码
  *   POST   /api/workspaces/join           - 使用邀请码加入
+ *
+ * 系统管理员（users.role='admin'）通过 requireWorkspaceRole 内的旁路逻辑，
+ * 视同任意工作区的 owner，可执行所有写操作；这是"运维兜底"语义。
  */
 import { Hono } from "hono";
 import { v4 as uuid } from "uuid";
 import { getDb } from "../db/schema";
 import {
   getUserWorkspaceRole,
+  isSystemAdmin,
+  requireAdmin,
   requireWorkspaceRole,
   resolveWorkspaceFeatures,
   WorkspaceRole,
@@ -65,6 +71,29 @@ app.get("/", (c) => {
   return c.json(rows);
 });
 
+// 系统管理员：列出所有工作区（包含自己未加入的），用于"工作区管理"面板
+//   - 必须放在 /:id 之前，否则会被 :id 路由吃掉
+//   - 返回字段比 GET / 多 ownerName / ownerUsername，便于列表渲染
+app.get("/all", requireAdmin, (c) => {
+  const db = getDb();
+  const rows = db
+    .prepare(
+      `
+      SELECT w.*,
+             u.username AS ownerUsername,
+             COALESCE(NULLIF(u.displayName, ''), u.username) AS ownerName,
+             (SELECT COUNT(*) FROM workspace_members WHERE workspaceId = w.id) AS memberCount,
+             (SELECT COUNT(*) FROM notebooks WHERE workspaceId = w.id) AS notebookCount
+      FROM workspaces w
+      LEFT JOIN users u ON u.id = w.ownerId
+      ORDER BY w.createdAt ASC
+      `,
+    )
+    .all();
+
+  return c.json(rows);
+});
+
 // 创建工作区
 app.post("/", async (c) => {
   const db = getDb();
@@ -99,7 +128,9 @@ app.get("/:id", (c) => {
   const userId = c.req.header("X-User-Id") || "";
   const id = c.req.param("id");
 
-  const role = getUserWorkspaceRole(id, userId);
+  // 系统管理员可访问任意工作区（视同 owner）
+  const sysAdmin = isSystemAdmin(userId);
+  const role = sysAdmin ? "owner" : getUserWorkspaceRole(id, userId);
   if (!role) return c.json({ error: "无权访问该工作区" }, 403);
 
   const ws = db.prepare("SELECT * FROM workspaces WHERE id = ?").get(id);
@@ -182,7 +213,8 @@ app.get("/:id/members", (c) => {
   const userId = c.req.header("X-User-Id") || "";
   const id = c.req.param("id");
 
-  const role = getUserWorkspaceRole(id, userId);
+  // 系统管理员视同 owner，允许查看任意工作区成员列表
+  const role = isSystemAdmin(userId) ? "owner" : getUserWorkspaceRole(id, userId);
   if (!role) return c.json({ error: "无权访问该工作区" }, 403);
 
   const members = db
@@ -407,8 +439,8 @@ app.get("/:id/features", (c) => {
   const userId = c.req.header("X-User-Id") || "";
   const id = c.req.param("id");
 
-  // 任何成员都可以读（侧边栏需要据此决定显隐）
-  const role = getUserWorkspaceRole(id, userId);
+  // 任何成员都可以读（侧边栏需要据此决定显隐）；系统管理员旁路
+  const role = isSystemAdmin(userId) ? "owner" : getUserWorkspaceRole(id, userId);
   if (!role) return c.json({ error: "无权访问该工作区" }, 403);
 
   const features = resolveWorkspaceFeatures(id);

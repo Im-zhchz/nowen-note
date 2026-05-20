@@ -139,6 +139,21 @@ function initSchema(db: Database.Database) {
     );
 
     -- 笔记本表 (支持无限层级)
+    --
+    -- 软删除字段（v14 起新增）：
+    --   isDeleted = 1  → 笔记本本身被"放入回收站"。该笔记本及其所有子孙笔记
+    --                    本会被一并标 isDeleted=1；这些笔记本下的笔记会被
+    --                    isTrashed=1 移入回收站。
+    --   deletedAt      → 软删时间，用于"30 天后自动彻底清理"等策略（暂未启用）。
+    --
+    -- 为什么不直接 DELETE FROM notebooks？
+    --   notes.notebookId FK 是 ON DELETE CASCADE，物理删笔记本会把回收站里
+    --   还在等待用户"反悔恢复"的笔记一起带走，违反"删除笔记本前先把笔记移入
+    --   回收站"的产品语义（参考 macOS Notes / 印象笔记）。改成软删后：
+    --     * 笔记本只是被隐藏，FK 关系完整；
+    --     * 用户清空回收站 / 永久删除单条笔记时，notes 行才被物理删。
+    --     * 用户从回收站恢复笔记 → 校验父笔记本 isDeleted=0；若父已软删，
+    --       前端引导用户选择新笔记本。
     CREATE TABLE IF NOT EXISTS notebooks (
       id TEXT PRIMARY KEY,
       userId TEXT NOT NULL,
@@ -149,11 +164,20 @@ function initSchema(db: Database.Database) {
       color TEXT,
       sortOrder INTEGER DEFAULT 0,
       isExpanded INTEGER DEFAULT 1,
+      isDeleted INTEGER NOT NULL DEFAULT 0,
+      deletedAt TEXT,
       createdAt TEXT NOT NULL DEFAULT (datetime('now')),
       updatedAt TEXT NOT NULL DEFAULT (datetime('now')),
       FOREIGN KEY (userId) REFERENCES users(id) ON DELETE CASCADE,
       FOREIGN KEY (parentId) REFERENCES notebooks(id) ON DELETE CASCADE
     );
+
+    -- 软删笔记本的过滤索引（idx_notebooks_isDeleted）由 migrations.ts v14
+    -- 单独负责建立。原因与 idx_ai_chat_msg_conv / idx_note_embeddings_user_ws
+    -- 同构：对 v13 及以前的老库，notebooks 表里没有 isDeleted 列，CREATE TABLE
+    -- IF NOT EXISTS 不会补列，紧接着在这里建索引会抛 "no such column: isDeleted"，
+    -- 早于 runMigrations，v14 的 ALTER TABLE 根本来不及跑 —— 死锁。
+    -- v14 迁移会先 ALTER 补列再建索引，对全新库（首次启动也跑 v14）幂等。
 
     -- 笔记表
     CREATE TABLE IF NOT EXISTS notes (

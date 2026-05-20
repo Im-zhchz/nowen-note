@@ -1,4 +1,4 @@
-import { Notebook, Note, NoteListItem, Tag, SearchResult, User, UserPublicInfo, Task, TaskStats, TaskFilter, CustomFont, MindMap, MindMapListItem, Diary, DiaryTimeline, DiaryStats, Share, ShareInfo, SharedNoteContent, NoteVersion, ShareComment, Workspace, WorkspaceMember, WorkspaceInvite, WorkspaceRole, WorkspaceFeatures, FileItem, FileDetail, FileListResponse, FileStats, FileSortKey, FileCategory, FileFilter, FileMyUploadsRef } from "@/types";
+import { Notebook, Note, NoteListItem, Tag, SearchResult, User, UserPublicInfo, Task, TaskStats, TaskFilter, CustomFont, MindMap, MindMapListItem, Diary, DiaryTimeline, DiaryStats, Share, ShareInfo, SharedNoteContent, NoteVersion, ShareComment, Workspace, WorkspaceAdminItem, WorkspaceMember, WorkspaceInvite, WorkspaceRole, WorkspaceFeatures, FileItem, FileDetail, FileListResponse, FileStats, FileSortKey, FileCategory, FileFilter, FileMyUploadsRef } from "@/types";
 import {
   shouldEnqueue as _shouldEnqueue,
   enqueue as _enqueue,
@@ -2088,6 +2088,11 @@ export const api = {
 
   // ========== Workspaces (Phase 1 多用户协作) ==========
   getWorkspaces: () => request<Workspace[]>("/workspaces"),
+  /**
+   * 系统管理员：列出所有工作区（含 ownerName / ownerUsername），用于
+   * 「设置 → 工作区管理」面板。后端用 requireAdmin 闸门，普通用户调用会 403。
+   */
+  listAllWorkspaces: () => request<WorkspaceAdminItem[]>("/workspaces/all"),
   getWorkspace: (id: string) => request<Workspace>(`/workspaces/${id}`),
   createWorkspace: (data: { name: string; description?: string; icon?: string }) =>
     request<Workspace>("/workspaces", { method: "POST", body: JSON.stringify(data) }),
@@ -2622,6 +2627,82 @@ export const api = {
         totalAttachmentBytes: number;
         graceHours: number;
       }>(`/attachments/_orphans/scan?graceHours=${encodeURIComponent(graceHours)}`),
+  },
+
+  // ============================================================
+  // Personal API Tokens（个人访问令牌）管理
+  // ------------------------------------------------------------
+  // 设计原则（与后端 backend/src/routes/tokens.ts 对应）：
+  //   - 列表只返回元信息（名称 / scopes / 过期 / 最近使用），永远不返回明文；
+  //   - 创建后**只此一次**返回明文（response.token），UI 必须立刻让用户复制；
+  //   - 吊销是软删除（保留审计字段 revokedAt），列表里仍可见但状态为"已吊销"；
+  //   - 后端禁止用 API Token 自己再创建 Token（防止权限自我增殖）。
+  // ============================================================
+  tokens: {
+    /** GET /api/tokens — 列出当前用户的所有 token + 服务端支持的 scope 集合 */
+    list: () =>
+      request<{
+        tokens: Array<{
+          id: string;
+          name: string;
+          scopes: string[];
+          /** ISO 字符串 / null 表示永不过期 */
+          expiresAt: string | null;
+          lastUsedAt: string | null;
+          lastUsedIp: string | null;
+          createdAt: string;
+          /** ISO 字符串 / null 表示尚未吊销（软删除标记） */
+          revokedAt: string | null;
+        }>;
+        availableScopes: readonly string[];
+      }>("/tokens"),
+
+    /**
+     * POST /api/tokens — 创建新的 Personal API Token
+     *
+     * **注意**：返回的 `token` 字段是明文，**仅此一次**！UI 必须立即提示用户复制。
+     * - 不传 expiresAt 和 expiresInDays → 永不过期（用户可随时手动吊销）
+     * - expiresInDays 优先于 expiresAt（便于"30/90/365 天"快选 UI）
+     */
+    create: (payload: {
+      name: string;
+      scopes: string[];
+      /** 二选一：指定天数 30/90/365 等，或者直接给 ISO 时间 */
+      expiresInDays?: number;
+      expiresAt?: string | null;
+    }) =>
+      request<{
+        id: string;
+        name: string;
+        scopes: string[];
+        expiresAt: string | null;
+        createdAt: string;
+        token: string;
+        warning: string;
+      }>("/tokens", { method: "POST", body: JSON.stringify(payload) }),
+
+    /** DELETE /api/tokens/:id — 吊销 token（软删，保留审计） */
+    revoke: (id: string) =>
+      request<{ success: boolean; alreadyRevoked?: boolean }>(`/tokens/${encodeURIComponent(id)}`, {
+        method: "DELETE",
+      }),
+
+    /**
+     * GET /api/tokens/usage?days=N — 个人 token 使用统计
+     *
+     * 用于 TokenManagement 顶部的"使用概览"卡片：
+     *   - total / prevTotal 用于显示总量 + 环比变化
+     *   - series 是补零后的逐日折线/柱状图数据
+     *   - byToken 已按 count 降序，前端取前 N 即可
+     */
+    usage: (days: 7 | 14 | 30 | 90 = 7) =>
+      request<{
+        days: number;
+        total: number;
+        prevTotal: number;
+        series: Array<{ day: string; count: number }>;
+        byToken: Array<{ tokenId: string; name: string; count: number }>;
+      }>(`/tokens/usage?days=${days}`),
   },
 };
 

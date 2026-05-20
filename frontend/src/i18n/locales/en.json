@@ -117,7 +117,7 @@
     "settings": "Settings",
     "logout": "Logout",
     "deleteNotebookTitle": "Delete Notebook",
-    "deleteNotebookConfirm": "Are you sure you want to delete \"{{name}}\"? All notes in this notebook will also be deleted. This action cannot be undone.",
+    "deleteNotebookConfirm": "Are you sure you want to delete \"{{name}}\"? All notes in this notebook and its sub-notebooks will be moved to Trash. You can restore them or delete permanently from there.",
     "deleteNoteConfirm": "Are you sure you want to delete this note? It will be moved to trash.",
     "deleteNoteTitle": "Delete Note",
     "confirmDelete": "Confirm Delete",
@@ -197,7 +197,8 @@
     "bulkAiNoEligible": "No eligible notes (empty or locked are skipped)",
     "bulkAiTooMany": "Up to {{limit}} notes per batch; please split into smaller batches",
     "bulkAiCrossWs": "Selected notes span multiple workspaces; please operate per workspace",
-    "multiSelectHint": "Ctrl/Cmd-click to multi-select, Shift-click for range"
+    "multiSelectHint": "Ctrl/Cmd-click to multi-select, Shift-click for range",
+    "restoreNotebookTrashed": "The original notebook has been deleted. Please restore or create a notebook first, then try again."
   },
   "editor": {
     "selectNote": "Select a note to start editing",
@@ -408,7 +409,9 @@
     "appearance": "Appearance",
     "ai": "AI Assistant",
     "security": "Security",
+    "tokens": "Access Tokens",
     "users": "Users",
+    "workspaces": "Workspaces",
     "dataManagement": "Data",
     "siteIdentity": "Site Identity",
     "siteIdentityDesc": "Customize your workspace name and browser tab icon",
@@ -596,6 +599,49 @@
     "fieldPersonalExportEnabledDesc": "When disabled, this user cannot export notebooks or all notes from their personal space (workspace exports are unaffected; admin accounts always bypass this).",
     "fieldPersonalImportEnabled": "Allow importing into personal space",
     "fieldPersonalImportEnabledDesc": "When disabled, this user cannot import notes into their personal space (workspace imports are unaffected; admin accounts always bypass this)."
+  },
+  "workspaceSwitcher": {
+    "contextMenu": {
+      "manageMembers": "Manage members",
+      "edit": "Edit workspace",
+      "delete": "Delete workspace"
+    }
+  },
+  "workspaceManagement": {
+    "title": "Workspace Management",
+    "description": "Browse and manage all workspaces. Admins can edit or delete any workspace across users.",
+    "total": "{{count}} workspace(s) in total",
+    "loadFailed": "Failed to load workspaces",
+    "refresh": "Refresh",
+    "noResult": "No matching workspaces",
+    "searchPlaceholder": "Search name / description / owner",
+    "colName": "Workspace",
+    "colOwner": "Owner",
+    "colMembers": "Members",
+    "colNotebooks": "Notebooks",
+    "colCreatedAt": "Created",
+    "colActions": "Actions",
+    "members": "{{count}}",
+    "notebooks": "{{count}}",
+    "ownerUnknown": "(unknown)",
+    "edit": "Edit workspace",
+    "editTitle": "Edit workspace {{name}}",
+    "fieldName": "Name",
+    "fieldDescription": "Description",
+    "fieldIcon": "Icon (emoji)",
+    "save": "Save",
+    "saveSuccess": "Workspace updated",
+    "saveFailed": "Failed to save",
+    "delete": "Delete workspace",
+    "deleteTitle": "Delete workspace {{name}}",
+    "deleteConfirmHint": "After deletion, notebooks and notes in this workspace will be moved back to the personal space of owner \"{{owner}}\". Members and invite codes will be removed. This action cannot be undone.",
+    "deleteConfirmHintNoOwner": "After deletion, notebooks and notes in this workspace will be moved back to the owner's personal space. Members and invite codes will be removed. This action cannot be undone.",
+    "deleteSummaryMembers": "Members",
+    "deleteSummaryNotebooks": "Notebooks",
+    "confirmDelete": "Confirm delete",
+    "deleteSuccess": "Workspace deleted",
+    "deleteFailed": "Failed to delete",
+    "iconPlaceholder": "🏢"
   },
   "dataManager": {
     "title": "Data Management",
@@ -1353,5 +1399,82 @@
     "minutesAgo": "{{n}}m ago",
     "hoursAgo": "{{n}}h ago",
     "daysAgo": "{{n}}d ago"
+  },
+  "tokens": {
+    "title": "Personal Access Tokens",
+    "subtitle": "Create dedicated tokens for third-party apps (bookmark sync, CLI tools). Each can be revoked independently — no need to change your password.",
+    "banner": "Tokens are equivalent to passwords. The plaintext is shown only once at creation — save it immediately. If you suspect a leak, revoke and create a new one.",
+    "createAction": "Create Token",
+    "loading": "Loading...",
+    "loadFail": "Failed to load",
+    "revoke": "Revoke",
+    "revokeConfirmTitle": "Revoke this token?",
+    "revokeConfirmDesc": "Any application using this token (including “{{name}}”) will lose access immediately. This action cannot be undone.",
+    "revokeSuccess": "Token “{{name}}” has been revoked",
+    "revokeFail": "Failed to revoke",
+    "neverExpires": "Never expires",
+    "timeJustNow": "just now",
+    "timeMinAgo": "{{n}}m ago",
+    "timeHourAgo": "{{n}}h ago",
+    "timeDayAgo": "{{n}}d ago",
+    "empty": {
+      "title": "No access tokens yet",
+      "desc": "Create a token to let third-party apps (such as the bookmark home sync or CLI tools) access your notes securely — without revealing your password.",
+      "cta": "Create one now"
+    },
+    "status": {
+      "active": "Active",
+      "expired": "Expired",
+      "revoked": "Revoked"
+    },
+    "row": {
+      "created": "Created",
+      "expires": "Expires",
+      "lastUsed": "Last used",
+      "revokedAt": "Revoked at"
+    },
+    "create": {
+      "title": "Create access token",
+      "subtitle": "The plaintext token will only be shown once. Please copy it before closing the window.",
+      "nameLabel": "Name",
+      "namePlaceholder": "e.g. NOWEN bookmark sync",
+      "nameHint": "For your own future reference. Not exposed to third parties.",
+      "scopesLabel": "Scopes",
+      "selectAll": "Select all",
+      "clearAll": "Clear",
+      "expiresLabel": "Expiration",
+      "daysPreset": "{{n}} days",
+      "neverExpiresHint": "Tokens that never expire need extra care. Setting an expiration is strongly recommended.",
+      "errName": "Please enter a token name",
+      "errScopes": "Please select at least one scope",
+      "submit": "Create token",
+      "fail": "Failed to create"
+    },
+    "created": {
+      "title": "Token created",
+      "warning": "This is the only time you can see the full token.",
+      "warningDesc": "Once you close this window, the plaintext can never be retrieved again. Copy and save it now.",
+      "tokenLabel": "Your access token",
+      "tokenHint": "Click the input to select all, or use the Copy button.",
+      "copy": "Copy",
+      "copied": "Copied",
+      "copyFail": "Copy failed, please select and copy manually",
+      "closeConfirmTitle": "Close anyway?",
+      "closeConfirmDesc": "The plaintext of this token will be permanently unavailable. Please confirm you have saved it.",
+      "closeAnyway": "I have saved it, close",
+      "done": "Done"
+    },
+    "usage": {
+      "title": "Usage Overview",
+      "subtitle": "Aggregated calls across all your tokens",
+      "daysLabel": "{{n}}d",
+      "loading": "Loading stats...",
+      "loadFail": "Failed to load stats",
+      "callsUnit": "calls",
+      "compareHint": "vs. previous {{n}}-day window",
+      "chartAria": "Daily token call volume bar chart",
+      "topTitle": "Most active tokens",
+      "empty": "No token calls in the past {{n}} days. Time to put your apps to work ✨"
+    }
   }
 }

@@ -1139,12 +1139,60 @@ export const MIGRATIONS: Migration[] = [
       db.exec(`DROP TABLE share_comments;`);
       db.exec(`ALTER TABLE share_comments_new RENAME TO share_comments;`);
 
-      // 6) 重建索引（注意 RENAME 后 SQLite 自动迁移索引到新表名，但因为
-      //    我们是 DROP 老表后 RENAME，老索引已随老表 DROP 一并删除——必须重建）
-      db.exec(`
-        CREATE INDEX IF NOT EXISTS idx_share_comments_note ON share_comments(noteId);
-        CREATE INDEX IF NOT EXISTS idx_share_comments_guest_ip ON share_comments(guestIpHash, createdAt);
-      `);
+    },
+  },
+  // ==========================================================================
+  // v14：notebooks 软删除 — 删除笔记本时把笔记移入回收站，而非 CASCADE 物理删除
+  // --------------------------------------------------------------------------
+  // 背景（用户反馈的 bug）：
+  //   - 用户删除笔记本后，回收站里**看不到**那些笔记；重启容器后才显示，再删
+  //     又看不到。
+  //   - 根因：notebooks DELETE 接口走 `DELETE FROM notebooks WHERE id = ?`，
+  //     而 notes.notebookId FK 是 ON DELETE CASCADE → 笔记本下所有笔记**直
+  //     接被物理删除**，永远不会进回收站。
+  //   - "重启后能看到"的诡异现象其实是另一种路径产生的：用户先把单条笔记
+  //     移到回收站（isTrashed=1），然后又删了它的父笔记本——CASCADE 顺手
+  //     把回收站里的这条笔记也带走了。前端列表缓存 + 重启 → 命中/失命中，
+  //     表现为时灵时不灵。
+  //
+  // 方案（与本次代码改动一起生效）：
+  //   1) notebooks 加 isDeleted / deletedAt 列（软删标记）。
+  //   2) 删除笔记本时：
+  //        a. 递归把该笔记本及全部子孙笔记本 isDeleted=1；
+  //        b. 把这些笔记本下所有 notes 也置为 isTrashed=1（进回收站）；
+  //        c. **不再 DELETE FROM notebooks** → CASCADE 不触发，回收站里的
+  //           笔记安全保留，等用户从回收站永久删除时才走 reclaimSpace。
+  //   3) 笔记本列表查询、权限解析、移动 / 重命名 / 选作创建目标等所有路径
+  //      统一加 isDeleted = 0 过滤，已软删的笔记本视同不存在。
+  //   4) 从回收站恢复笔记（isTrashed=0）时校验父笔记本 isDeleted=0；
+  //      若父已软删，返回 NOTEBOOK_TRASHED 让前端引导用户选择新笔记本。
+  //
+  // 数据兼容性：
+  //   - ALTER TABLE ADD COLUMN，老库存量笔记本 isDeleted 自动为 0 → 全部
+  //     可见，行为与 v13 完全一致，零数据风险。
+  //   - 索引 idx_notebooks_isDeleted 用 IF NOT EXISTS 幂等。
+  //
+  // 回滚：
+  //   回到 v13 程序时新列被忽略（旧代码不读 isDeleted），新列残留无副作用；
+  //   但用户从 v14 起放进"笔记本回收站"的笔记本会重新被旧代码视作"正常笔记
+  //   本"显示出来——可接受。
+  {
+    version: 14,
+    name: "notebooks-soft-delete",
+    up: (db) => {
+      const cols = db.prepare("PRAGMA table_info(notebooks)").all() as { name: string }[];
+      if (cols.length === 0) return; // 表本身不存在（极端情况）
+      if (!cols.some((c) => c.name === "isDeleted")) {
+        db.prepare(
+          "ALTER TABLE notebooks ADD COLUMN isDeleted INTEGER NOT NULL DEFAULT 0",
+        ).run();
+      }
+      if (!cols.some((c) => c.name === "deletedAt")) {
+        db.prepare("ALTER TABLE notebooks ADD COLUMN deletedAt TEXT").run();
+      }
+      db.exec(
+        "CREATE INDEX IF NOT EXISTS idx_notebooks_isDeleted ON notebooks(isDeleted);",
+      );
     },
   },
 ];
