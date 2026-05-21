@@ -1,6 +1,11 @@
 {
-  "generatedAt": "2026-05-20T09:17:49.989Z",
+  "generatedAt": "2026-05-21T09:54:55.353Z",
   "entries": [
+    {
+      "version": "1.1.5",
+      "date": "2026-05-21",
+      "body": "### ✨ 新增\n\n- **attachments**: 附件预览抽屉 + 本笔记附件目录面板 (df2e06f)\n- **editor**: 搜索替换面板 / docx 自研解析与导入 / 字号弹层优化等 (3a37905)\n- **about**: 新增'作者感言'板块及阅读弹窗 (82e872d)\n\n### 📝 文档\n\n- **readme**: add Author's Note link in header (6e5d863)"
+    },
     {
       "version": "1.1.4",
       "date": "2026-05-20",
@@ -45,11 +50,6 @@
       "version": "1.0.35",
       "date": "2026-05-11",
       "body": "### 🐛 修复\n\n- **db**: 修复老库启动崩溃 SqliteError: no such column: workspaceId (d445c10)\n- **release**: .fpk 产物只收集当前版本，避免 dist-fpk 历史堆积误传 (4e3bf3b)"
-    },
-    {
-      "version": "1.0.34",
-      "date": "2026-05-11",
-      "body": "### 🐛 修复\n\n- **db**: 修复老库启动崩溃 SqliteError: no such column: conversationId (984b1c4)\n- **electron**: 修复 Win 安装包启动报 ERR_DLOPEN_FAILED 的根因 (8d2da99)\n- **tasks**: 更新任务后同步刷新左侧分组计数（今天/未来7天/已逾期） (b39a825)\n- **tasks**: 修复待办按日期分组/展示的时区错位（今天/本周/逾期） (edcc285)"
     }
   ]
 }
