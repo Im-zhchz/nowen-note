@@ -122,6 +122,146 @@ export const LinkMarkdownRule = Extension.create({
 });
 
 /* -------------------------------------------------------------------------- */
+/*  Markdown 任务列表：行首 `- [ ] ` / `- [x] ` 自动转 taskList                */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * 任务列表自动转换：覆盖两种触发场景
+ *
+ * 场景 1：顶层空段落输入完整 `- [x] `（少见，多为粘贴）
+ * 场景 2（关键）：先输 `- ` 被 BulletList 转成 ul>li>p，再输 `[x] `
+ *   把整个 bulletList 升级为 taskList，所有 li 升级为 taskItem。
+ *
+ * 实现方式：用 `appendTransaction` 而非 input rule。
+ * 原因：在 ul>li>p 里，input rule 的触发被 prosemirror-inputrules 内部
+ * 的某些条件拦截掉了（实际验证 InputRule 在 listItem 内不可靠），
+ * 改成基于文档变化扫描的方式更鲁棒，对 IME / 粘贴 / 中文输入都通用。
+ *
+ * 性能：appendTransaction 只在 docChanged 时跑，且只扫"刚改动的范围"
+ * （tr.steps 的 mapping），开销 O(改动节点数)。
+ *
+ * `[x]` / `[X]` 都接受（GFM 兼容）。
+ */
+const TASK_PREFIX = /^(\[([ xX])\])\s+/;
+
+export const TaskListMarkdownRule = Extension.create({
+  name: "taskListMarkdownRule",
+  addProseMirrorPlugins() {
+    const editor = this.editor;
+    return [
+      new Plugin({
+        key: new PluginKey("taskListAutoConvert"),
+        appendTransaction: (transactions, _oldState, newState) => {
+          if (!transactions.some((tr) => tr.docChanged)) return null;
+
+          const schema = newState.schema;
+          const taskListType = schema.nodes.taskList;
+          const taskItemType = schema.nodes.taskItem;
+          const paragraphType = schema.nodes.paragraph;
+          const bulletListType = schema.nodes.bulletList;
+          const listItemType = schema.nodes.listItem;
+          if (!taskListType || !taskItemType || !paragraphType) return null;
+
+          // 找当前光标所在 paragraph，看它是否以 `[x] ` / `[ ] ` 起头。
+          // 只处理光标处的段落，避免误改其它内容；用户连续输入时每次
+          // 检查一次，足够覆盖"打到空格那一瞬间触发"的体验。
+          const sel = newState.selection;
+          if (!sel.empty) return null;
+          const $pos = sel.$from;
+          if ($pos.parent.type !== paragraphType) return null;
+          const text = $pos.parent.textContent;
+          const m = TASK_PREFIX.exec(text);
+          if (!m) return null;
+          const checked = m[2] === "x" || m[2] === "X";
+          const prefixLen = m[0].length; // 含末尾空格
+
+          let tr = newState.tr;
+
+          // 场景 2：在 bulletList > listItem > paragraph 内
+          if (
+            bulletListType
+            && listItemType
+            && $pos.depth >= 3
+            && $pos.node($pos.depth - 1).type === listItemType
+            && $pos.node($pos.depth - 2).type === bulletListType
+          ) {
+            const li = $pos.node($pos.depth - 1);
+            // 只在当前 li 的第一个 paragraph 触发，避免 li 里嵌套段落被误触
+            if (li.firstChild !== $pos.parent) return null;
+
+            const ul = $pos.node($pos.depth - 2);
+            const ulStart = $pos.before($pos.depth - 2);
+            const liIndex = $pos.index($pos.depth - 2);
+
+            const newItems: any[] = [];
+            ul.forEach((child, _offset, idx) => {
+              if (child.type !== listItemType) return;
+              if (idx === liIndex) {
+                // 当前 li：剥掉 `[x] ` 前缀，用剩余内容构造 taskItem
+                const firstP = child.firstChild;
+                if (!firstP || firstP.type !== paragraphType) {
+                  newItems.push(taskItemType.create({ checked }, child.content));
+                  return;
+                }
+                // 用 ProseMirror 的 sliceContent 直接切：firstP 内 prefixLen 之后的全部 inline
+                const remaining = firstP.content.cut(prefixLen);
+                const newP = paragraphType.create(null, remaining);
+                // 拼上 li 里 firstP 之后的兄弟（嵌套 list 等）
+                const tail: any[] = [];
+                child.content.forEach((c, _o, i) => {
+                  if (i > 0) tail.push(c);
+                });
+                newItems.push(taskItemType.create({ checked }, [newP, ...tail]));
+              } else {
+                newItems.push(taskItemType.create({ checked: false }, child.content));
+              }
+            });
+
+            if (newItems.length === 0) return null;
+            const newTaskList = taskListType.create(null, newItems);
+            tr = tr.replaceWith(ulStart, ulStart + ul.nodeSize, newTaskList);
+
+            // 把光标放到当前 taskItem 的 paragraph 末尾
+            // 新结构：taskList(start=ulStart) > taskItem[liIndex] > paragraph
+            // 计算光标位置：ulStart + 1(进 taskList) + sum(前面 taskItem.nodeSize) + 1(进 taskItem) + 1(进 paragraph) + remaining.size
+            let cursorPos = ulStart + 1;
+            for (let i = 0; i < liIndex; i++) cursorPos += newItems[i].nodeSize;
+            cursorPos += 2; // 进 taskItem + 进 paragraph
+            const remainingSize = (newItems[liIndex] as any).firstChild?.content.size ?? 0;
+            cursorPos += remainingSize;
+            tr = tr.setSelection(
+              (newState.selection.constructor as any).near(tr.doc.resolve(cursorPos)),
+            );
+            return tr;
+          }
+
+          // 场景 1：顶层 paragraph
+          if ($pos.depth === 1) {
+            const pStart = $pos.before(1);
+            const pEnd = $pos.after(1);
+            const remaining = $pos.parent.content.cut(prefixLen);
+            const newP = paragraphType.create(null, remaining);
+            const newTaskList = taskListType.create(
+              null,
+              taskItemType.create({ checked }, newP),
+            );
+            tr = tr.replaceWith(pStart, pEnd, newTaskList);
+            // 光标放到 taskItem 内段落末尾
+            const cursorPos = pStart + 3 + remaining.size;
+            tr = tr.setSelection(
+              (newState.selection.constructor as any).near(tr.doc.resolve(cursorPos)),
+            );
+            return tr;
+          }
+
+          return null;
+        },
+      }),
+    ];
+  },
+});
+
+/* -------------------------------------------------------------------------- */
 /*  Markdown 粘贴：纯文本 → HTML → ProseMirror                                */
 /* -------------------------------------------------------------------------- */
 
@@ -258,5 +398,6 @@ export const MarkdownEnhancements = [
   StrikeMarkdownRules,
   HighlightMarkdownRules,
   LinkMarkdownRule,
+  TaskListMarkdownRule,
   MarkdownPasteHandler,
 ];
