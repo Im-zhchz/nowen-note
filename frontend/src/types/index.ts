@@ -7,6 +7,14 @@ export interface User {
   role?: "admin" | "user";
   isDisabled?: 0 | 1 | number;
   /**
+   * 体验账号标记（v15）。
+   *   - 后端同名列 isDemo INTEGER (0/1)，返回时统一转为 boolean。
+   *   - 账号被标为体验账号后，后端会拒绝 修改密码 / 用户名 / 启停 2FA 的请求；
+   *     前端据此隐藏 SecuritySettings 里的相关入口，避免点击后才看到 403。
+   *   - 老后端未迁移补列时不下发该字段，前端允许 undefined，按 false 处理。
+   */
+  isDemo?: boolean;
+  /**
    * 个人空间导出/导入开关（v6 per-user 开关，从原来的全站 system_settings 下沉）。
    *   - 由管理员在「用户管理 → 编辑用户」里为每个用户独立控制；
    *   - 管理员本人不受此开关约束，后端 export 路由对 role=admin 无条件放行；

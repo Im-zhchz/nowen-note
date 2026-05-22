@@ -1195,6 +1195,35 @@ export const MIGRATIONS: Migration[] = [
       );
     },
   },
+
+  // --------------------------------------------------------------------------
+  // v15: users 增加 isDemo 体验账号标记
+  // --------------------------------------------------------------------------
+  // 背景：体验站点（note.nowen.cn）需要一个对外开放的 demo 账号，但这个账号
+  //   不能让用户改密码 / 改用户名 / 启停 2FA，否则下一个访客就进不来了。
+  //
+  // 设计：
+  //   - 在 users 表加一列 isDemo（0/1，默认 0）。
+  //   - 后端 auth/change-password、auth/2fa/* 入口在校验通过后追加判断：
+  //     若 isDemo=1 直接返回 403 "体验账号不允许修改账号信息"。
+  //   - /api/me、/auth/verify、/auth/login 返回的 user 对象都会带上 isDemo，
+  //     前端据此隐藏个人设置里的相关入口。
+  //   - 体验账号通过 SQL 手工标记：UPDATE users SET isDemo=1 WHERE username='demo';
+  //
+  // 兼容性：老库 ALTER ADD COLUMN 默认 0，对所有存量用户零影响。
+  {
+    version: 15,
+    name: "users-add-isDemo",
+    up: (db) => {
+      const cols = db.prepare("PRAGMA table_info(users)").all() as { name: string }[];
+      if (cols.length === 0) return;
+      if (!cols.some((c) => c.name === "isDemo")) {
+        db.prepare(
+          "ALTER TABLE users ADD COLUMN isDemo INTEGER NOT NULL DEFAULT 0",
+        ).run();
+      }
+    },
+  },
 ];
 
 /** 当前代码已知的最高 schema 版本（== MIGRATIONS 里 max(version)）。 */

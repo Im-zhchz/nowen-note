@@ -411,7 +411,7 @@ app.get("/api/me", (c) => {
   const userId = c.req.header("X-User-Id");
   const user = db
     .prepare(
-      `SELECT id, username, email, avatarUrl, displayName, role,
+      `SELECT id, username, email, avatarUrl, displayName, role, isDemo,
               personalExportEnabled, personalImportEnabled,
               createdAt
        FROM users WHERE id = ?`,
@@ -419,6 +419,7 @@ app.get("/api/me", (c) => {
     .get(userId) as any;
   if (user) {
     if (!user.role) user.role = "user";
+    user.isDemo = user.isDemo === 1;
     // v6：把 users.personalExport/ImportEnabled 以 boolean 形式下发，
     // 前端 Sidebar / DataManager 直接按布尔判定 UI 可见性。
     // 即使列缺失（例如旧库迁移失败），也兜底为 true，保持与 DEFAULT 1 一致。

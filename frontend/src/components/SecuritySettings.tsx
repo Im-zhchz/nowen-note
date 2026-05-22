@@ -14,6 +14,7 @@ import {
   LogOut,
   RefreshCw,
   Monitor,
+  Lock,
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { api, broadcastLogout, withSudo } from "@/lib/api";
@@ -25,12 +26,42 @@ import {
 /**
  * 顶层组件：组合账号/密码修改 + 2FA + 会话管理三个区块。
  * 这样后端的 Phase 6（2FA + session 管理）也有一个用户可见的入口。
+ *
+ * v15：体验账号（user.isDemo === true）隐藏“修改账号密码”和“两步验证”两个区块，
+ * 只保留“会话管理”，同时在顶部给出提示。
  */
 export default function SecuritySettings() {
+  const { t } = useTranslation();
+  const [isDemo, setIsDemo] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .getMe()
+      .then((u) => {
+        if (!cancelled) setIsDemo(!!(u as any)?.isDemo);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   return (
     <div className="space-y-10">
-      <PasswordSection />
-      <TwoFactorSection />
+      {isDemo && (
+        <div className="flex items-start gap-3 rounded-lg border border-amber-300/60 bg-amber-50 px-4 py-3 text-sm text-amber-800 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-300">
+          <Lock className="mt-0.5 h-4 w-4 flex-shrink-0" />
+          <div>
+            {t(
+              "securitySettings.demoLocked",
+              { defaultValue: "体验账号不允许修改账号密码、用户名或启用两步验证。如需完整体验，请注册个人账号。" },
+            )}
+          </div>
+        </div>
+      )}
+      {!isDemo && <PasswordSection />}
+      {!isDemo && <TwoFactorSection />}
       <SessionsSection />
     </div>
   );
