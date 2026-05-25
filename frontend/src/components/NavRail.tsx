@@ -32,7 +32,7 @@ import {
   BookOpen, Star, Trash2, ListTodo, BrainCircuit,
   Sparkles, NotebookPen, FolderOpen,
   Settings, LogOut, PanelLeftClose, PanelLeft, X,
-  Columns2, Columns3,
+  Columns2, Columns3, Cloud,
 } from "lucide-react";
 import { AnimatePresence } from "framer-motion";
 import { useTranslation } from "react-i18next";
@@ -41,7 +41,9 @@ import { api, broadcastLogout, getCurrentWorkspace } from "@/lib/api";
 import { ViewMode, WorkspaceFeatures } from "@/types";
 import { cn } from "@/lib/utils";
 import SettingsModal from "@/components/SettingsModal";
+import MigrationModal from "@/components/MigrationModal";
 import { useRailMode, nextRailMode, RailMode } from "@/hooks/useRailMode";
+import { isDesktop as isDesktopApp } from "@/lib/desktopBridge";
 
 type NavGroup = "workspace" | "modules" | "tools";
 
@@ -120,6 +122,8 @@ export default function NavRail({ variant = "desktop" }: { variant?: "desktop" |
   // 设置弹窗（与 Sidebar 内的 settings 入口逻辑一致——这里独占一份，
   // 因为 Sidebar 桌面变体不再渲染 Settings 入口）
   const [showSettings, setShowSettings] = useState(false);
+  // D-2：迁移向导弹窗。点"切换到云端"会先弹出，让用户选择是否把本地数据迁过去。
+  const [showMigration, setShowMigration] = useState(false);
 
   const items = features
     ? NAV_CONFIG.filter((it) => !it.feature || features[it.feature] !== false)
@@ -279,30 +283,73 @@ export default function NavRail({ variant = "desktop" }: { variant?: "desktop" |
           </span>
         )}
       </button>
-      <button
-        onClick={() => {
-          // L10: 广播给其他 tab 一起下线，与 Sidebar Footer 保持一致
-          broadcastLogout("user_logout");
-          window.location.reload();
-        }}
-        title={showLabel ? undefined : t('sidebar.logout')}
-        aria-label={t('sidebar.logout')}
-        className={cn(
-          itemBaseClass,
-          "text-tx-tertiary hover:text-accent-danger hover:bg-accent-danger/10",
-        )}
-      >
-        <LogOut size={16} />
-        {showLabel && (
-          <span className="text-[10px] leading-none mt-0.5 max-w-full truncate px-1">
-            {t('sidebar.logout')}
-          </span>
-        )}
-      </button>
+      {/*
+        D-1 / D-2：桌面端把"退出"替换为"切换到云端账号"。
+        理由：桌面端是零登录单机模式，没有传统意义上的退出。
+        D-1 行为：直接 reload 进登录页（用户如果有云端账号，自己重新登录一次）。
+        D-2 升级：先弹 MigrationModal，让用户**带着本地数据**登录到云端账号。
+          - 用户登录成功 → 自动迁移 → 写入云端 token → reload
+          - 用户取消    → 写入 prefer-cloud=1 → reload 进登录页（保留旧行为）
+        Web/移动端保持原本的退出登录行为。
+      */}
+      {isDesktopApp() ? (
+        <button
+          onClick={() => setShowMigration(true)}
+          title={showLabel ? undefined : t('sidebar.switchToCloud', '切换到云端账号')}
+          aria-label={t('sidebar.switchToCloud', '切换到云端账号')}
+          className={cn(
+            itemBaseClass,
+            "text-tx-tertiary hover:bg-app-hover hover:text-accent-primary",
+          )}
+        >
+          <Cloud size={16} />
+          {showLabel && (
+            <span className="text-[10px] leading-none mt-0.5 max-w-full truncate px-1">
+              {t('sidebar.switchToCloud', '切换云端')}
+            </span>
+          )}
+        </button>
+      ) : (
+        <button
+          onClick={() => {
+            // L10: 广播给其他 tab 一起下线，与 Sidebar Footer 保持一致
+            broadcastLogout("user_logout");
+            window.location.reload();
+          }}
+          title={showLabel ? undefined : t('sidebar.logout')}
+          aria-label={t('sidebar.logout')}
+          className={cn(
+            itemBaseClass,
+            "text-tx-tertiary hover:text-accent-danger hover:bg-accent-danger/10",
+          )}
+        >
+          <LogOut size={16} />
+          {showLabel && (
+            <span className="text-[10px] leading-none mt-0.5 max-w-full truncate px-1">
+              {t('sidebar.logout')}
+            </span>
+          )}
+        </button>
+      )}
 
       {/* Settings Modal（Rail 自持一份，与 Sidebar 互不影响） */}
       <AnimatePresence>
         {showSettings && <SettingsModal onClose={() => setShowSettings(false)} />}
+        {showMigration && (
+          <MigrationModal
+            onClose={() => {
+              // 迁移完成 → reload 进入云端模式（MigrationModal 已写好 token & url）
+              setShowMigration(false);
+              window.location.reload();
+            }}
+            onCancel={() => {
+              // 取消 = 关弹窗，保持当前（本地）模式不动。
+              // 不 reload、不清 token，避免出现"主页 → 闪登录页 → 主页"的抖动。
+              // 若用户确实想去云端，再次点"切换云端"即可，或在登录页手动走流程。
+              setShowMigration(false);
+            }}
+          />
+        )}
       </AnimatePresence>
     </div>
   );

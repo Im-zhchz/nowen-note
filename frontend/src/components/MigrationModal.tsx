@@ -1,0 +1,455 @@
+/**
+ * MigrationModal —— 桌面端 "切换到云端账号" 时的迁移向导弹窗
+ *
+ * 步骤：
+ *   1. step="login"      ：让用户填云端地址 + 账号密码，登录拿到 cloudToken
+ *   2. step="confirm"    ：给出"将要迁移 X 个笔记到云端账号 Y"的确认
+ *   3. step="running"    ：调用 runLightMigration，显示进度
+ *   4. step="success"    ：写入 server-url + cloudToken，提示"即将刷新"，自动 reload
+ *   5. step="error"      ：展示报错，提供"返回上一步"
+ *
+ * 设计：组件**不复用 LoginPage**——LoginPage 是全屏页面、自带 i18n 和 2FA 逻辑，
+ *      硬塞进弹窗会打架。这里只做最小登录表单（用户名+密码），不支持 2FA。
+ *      若用户云端账号开了 2FA，引导他先关闭 2FA 再迁移（弹窗里有提示）。
+ *
+ * 不做的事：
+ *   - 不支持注册（迁移目标必须是已存在的云端账号）
+ *   - 不持久化云端密码（仅内存）
+ *   - 不并发：D-2 只有 export+import 两个串行 IO，无需并发
+ */
+
+import { useState } from "react";
+import { createPortal } from "react-dom";
+import { motion } from "framer-motion";
+import { Cloud, Loader2, AlertCircle, CheckCircle2, ArrowRight } from "lucide-react";
+import { runLightMigration, runAttachmentMigration, rollbackMigration, MigrationProgress, MigrationError } from "@/lib/migrationEngine";
+import { getServerUrl as getLocalServerUrl } from "@/lib/api";
+
+type Step = "login" | "confirm" | "running" | "success" | "error";
+
+export default function MigrationModal({
+  onClose,
+  onCancel,
+}: {
+  /** 迁移成功后调用——通常做 reload */
+  onClose: () => void;
+  /** 用户点"取消" / "稍后再说"——不做 reload，仅关弹窗 */
+  onCancel: () => void;
+}) {
+  const [step, setStep] = useState<Step>("login");
+  const [cloudUrl, setCloudUrl] = useState("");
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [cloudToken, setCloudToken] = useState("");
+  const [cloudUserDisplay, setCloudUserDisplay] = useState("");
+  const [progress, setProgress] = useState<MigrationProgress>({
+    phase: "export",
+    ratio: 0,
+    message: "",
+  });
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  // D-3 附件阶段的结果摘要（失败了哪些，成功 / 总量）
+  const [attSummary, setAttSummary] = useState<{
+    total: number;
+    succeeded: number;
+    failed: Array<{ id: string; filename: string; reason: string }>;
+  } | null>(null);
+  // 回滚提示：迁移失败后是否已成功清理云端脱不到的那部分数据
+  const [rollbackInfo, setRollbackInfo] = useState<
+    | { state: "running" | "done" | "failed"; removed?: Record<string, number>; error?: string }
+    | null
+  >(null);
+
+  // 本地 endpoint：当前页面就是本地后端代理对象，token 是 localStorage 里的本地 token。
+  const localBaseUrl = getLocalServerUrl() || ""; // 桌面零登录态下为空，等同于"同源"
+  const localToken = localStorage.getItem("nowen-token") || "";
+
+  function normalizeCloudUrl(raw: string): string {
+    const t = raw.trim().replace(/\/+$/, "");
+    if (!t) return "";
+    return /^https?:\/\//i.test(t) ? t : `http://${t}`;
+  }
+
+  async function handleLogin() {
+    setError("");
+    const url = normalizeCloudUrl(cloudUrl);
+    if (!url) {
+      setError("请填写云端服务器地址");
+      return;
+    }
+    if (!username || !password) {
+      setError("请填写账号和密码");
+      return;
+    }
+    setBusy(true);
+    try {
+      const res = await fetch(`${url}/api/auth/login`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username, password }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setError(data?.error || `登录失败 (${res.status})`);
+        return;
+      }
+      if (data.requires2FA) {
+        // 暂不支持 2FA；引导用户关闭后再迁移
+        setError("当前云端账号启用了二步验证，迁移向导暂不支持。请先在 Web 端关闭二步验证或单独导出/导入。");
+        return;
+      }
+      if (!data.token) {
+        setError("登录响应缺少 token");
+        return;
+      }
+      setCloudToken(data.token);
+      setCloudUrl(url);
+      setCloudUserDisplay(data.user?.username || username);
+      setStep("confirm");
+    } catch (e: any) {
+      setError(e?.message || "网络错误，请检查云端地址");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleStart() {
+    setStep("running");
+    setError("");
+    setAttSummary(null);
+    setRollbackInfo(null);
+
+    // 云端 endpoint 提取，后面 catch 里会复用
+    const cloud = { baseUrl: cloudUrl, token: cloudToken };
+    // 收集"已写入云端的资源 ID"——任何阶段抛错都能拿它们去调 /rollback
+    let lightIdMap: { notebooks: Record<string, string>; notes: Record<string, string>; tags: Record<string, string> } | null = null;
+    let attIdMap: Record<string, string> = {};
+
+    try {
+      // ===== D-2：轻量数据迁移 =====
+      // 改进进度显示：D-2 占总进度 0~30%（它二样快），D-3 占 30~100%（附件上传耗时）
+      const lightResult = await runLightMigration({
+        local: { baseUrl: localBaseUrl, token: localToken },
+        cloud,
+        onProgress: (p) =>
+          setProgress({
+            ...p,
+            ratio: p.ratio * 0.3,
+            message: `[数据] ${p.message}`,
+          }),
+      });
+      lightIdMap = lightResult.idMap;
+
+      // ===== D-3：附件 + content 重写 =====
+      // noteIdMap 是"本地旧→云端新"，D-3 附件阶段需要用它判断附件位置。
+      const attResult = await runAttachmentMigration({
+        local: { baseUrl: localBaseUrl, token: localToken },
+        cloud,
+        noteIdMap: lightResult.idMap.notes,
+        onProgress: (p) =>
+          setProgress({
+            ...p,
+            ratio: 0.3 + p.ratio * 0.7,
+            message:
+              p.phase === "rewrite"
+                ? `[重写] ${p.message}`
+                : p.phase === "done"
+                ? p.message
+                : `[附件] ${p.message}`,
+          }),
+      });
+      attIdMap = attResult.idMap;
+
+      setAttSummary({
+        total: attResult.total,
+        succeeded: attResult.succeeded,
+        failed: attResult.failed,
+      });
+
+      // 写入云端凭证：让下次启动直接进入云端模式
+      try {
+        localStorage.setItem("nowen-server-url", cloudUrl);
+        localStorage.setItem("nowen-token", cloudToken);
+        localStorage.removeItem("nowen-prefer-cloud");
+      } catch { /* ignore */ }
+      setStep("success");
+      // 有失败附件时，延长到6s，让用户看清楚；全部成功则2s
+      const wait = attResult.failed.length > 0 ? 6000 : 2000;
+      setTimeout(() => onClose(), wait);
+    } catch (e) {
+      const stageMap: Record<string, string> = {
+        export: "本地导出",
+        import: "云端导入",
+        attachments: "附件迁移",
+        rewrite: "内容重写",
+      };
+      const msg = e instanceof MigrationError
+        ? `${stageMap[e.stage] || e.stage}失败：${e.message}`
+        : (e instanceof Error ? e.message : String(e));
+      setError(msg);
+      setStep("error");
+
+      // 失败回滚：只要 import-light 走到了那一步（lightIdMap 不为 null）就需要清理云端。
+      // export 失败走不到这里。rollback 本身失败不决定 UI——仅 console + 提示。
+      if (lightIdMap) {
+        setRollbackInfo({ state: "running" });
+        const r = await rollbackMigration({
+          cloud,
+          notebookIds: Object.values(lightIdMap.notebooks),
+          noteIds: Object.values(lightIdMap.notes),
+          tagIds: Object.values(lightIdMap.tags),
+          attachmentIds: Object.values(attIdMap),
+        });
+        setRollbackInfo(
+          r.ok
+            ? { state: "done", removed: r.removed }
+            : { state: "failed", error: r.error },
+        );
+      }
+    }
+  }
+  // 遮罩定位：必须 createPortal 到 document.body。
+  //   原因：MigrationModal 是从 NavRail 里调用的，NavRail 祖先链上有 framer-motion 的
+  //   transform/will-change 属性。按 CSS 规范，祖先元素有 transform 时会创建新的 containing
+  //   block，导致后代 `position: fixed` 不再相对于 viewport 定位，而是被限在祖先容器内
+  //   ——表现为遮罩只能覆盖左侧侧边栏区域，右侧大片区域透明。
+  //   SettingsModal 里的 ImageLightbox 是同样场景、同样解法。
+  // 候选1+6：卡片改为不透明纯色背景，避免透出底层模糊内容；同时把宽度从 max-w-md→max-w-lg、内边距 p-6→p-7，缓解内容拥挤
+  const overlay = "fixed inset-0 z-[200] flex items-center justify-center p-4 bg-black/60 backdrop-blur-md";
+  const card = "w-full max-w-lg bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-xl shadow-2xl p-7";
+
+  return createPortal(
+    <motion.div
+      className={overlay}
+      initial={{ opacity: 0 }}
+      animate={{ opacity: 1 }}
+      exit={{ opacity: 0 }}
+      onClick={(e) => e.target === e.currentTarget && step !== "running" && onCancel()}
+    >
+      <motion.div
+        className={card}
+        initial={{ scale: 0.95, opacity: 0 }}
+        animate={{ scale: 1, opacity: 1 }}
+        exit={{ scale: 0.95, opacity: 0 }}
+      >
+        {step === "login" && (
+          <>
+            {/* 候选7：图标加大到 22 + 标题加粗到 font-bold，提升标题视觉权重 */}
+            <div className="flex items-center gap-2.5 mb-4">
+              <Cloud className="text-indigo-500" size={22} />
+              <h2 className="text-lg font-bold text-zinc-900 dark:text-zinc-100">登录云端账号</h2>
+            </div>
+            {/* 候选2：说明文字提高对比度（zinc-600/zinc-400 比 tx-secondary 更清晰），并加大下边距 */}
+            <p className="text-sm text-zinc-600 dark:text-zinc-400 mb-5 leading-relaxed">
+              登录后，可将本地数据迁移到云端账号下；本地数据会保留作为备份。
+            </p>
+            {/*
+              autoComplete + name 双管齐下，关闭 Edge/Chrome 内嵌密码管理器气泡。
+              为什么这里要关：迁移弹窗是"一次性"账号录入，不需要被记住；而气泡 z-index
+              高于 webview 内容，会覆盖在 modal 卡片上，造成视觉错位（截图里那块蓝色矩形）。
+              密码框使用 "new-password"——比 "off" 在 Chromium 上更可靠地阻止建议条。
+            */}
+            {/* 候选3+4：输入框改为白底/zinc-300 边框，加 focus:ring 高亮反馈；候选6：space-y-3→space-y-3.5 略增间距 */}
+            <div className="space-y-3.5">
+              <input
+                type="text"
+                name="nowen-cloud-url"
+                autoComplete="off"
+                placeholder="服务器地址（如 http://192.168.1.10:3001）"
+                value={cloudUrl}
+                onChange={(e) => setCloudUrl(e.target.value)}
+                className="w-full px-3.5 py-2.5 bg-white dark:bg-zinc-800 border border-zinc-300 dark:border-zinc-700 rounded-lg text-zinc-900 dark:text-zinc-100 placeholder:text-zinc-400 dark:placeholder:text-zinc-500 text-sm outline-none transition-all focus:ring-2 focus:ring-indigo-500/30 focus:border-indigo-500 disabled:opacity-50"
+                disabled={busy}
+              />
+              <input
+                type="text"
+                name="nowen-cloud-username"
+                autoComplete="off"
+                placeholder="用户名"
+                value={username}
+                onChange={(e) => setUsername(e.target.value)}
+                className="w-full px-3.5 py-2.5 bg-white dark:bg-zinc-800 border border-zinc-300 dark:border-zinc-700 rounded-lg text-zinc-900 dark:text-zinc-100 placeholder:text-zinc-400 dark:placeholder:text-zinc-500 text-sm outline-none transition-all focus:ring-2 focus:ring-indigo-500/30 focus:border-indigo-500 disabled:opacity-50"
+                disabled={busy}
+              />
+              <input
+                type="password"
+                name="nowen-cloud-password"
+                autoComplete="new-password"
+                placeholder="密码"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && handleLogin()}
+                className="w-full px-3.5 py-2.5 bg-white dark:bg-zinc-800 border border-zinc-300 dark:border-zinc-700 rounded-lg text-zinc-900 dark:text-zinc-100 placeholder:text-zinc-400 dark:placeholder:text-zinc-500 text-sm outline-none transition-all focus:ring-2 focus:ring-indigo-500/30 focus:border-indigo-500 disabled:opacity-50"
+                disabled={busy}
+              />
+            </div>
+            {error && (
+              <div className="mt-3 flex items-start gap-2 text-sm text-accent-danger bg-accent-danger/10 p-2 rounded-md">
+                <AlertCircle size={16} className="mt-0.5 shrink-0" />
+                <span>{error}</span>
+              </div>
+            )}
+            {/* 候选8：取消按钮去掉 border 改为弱化的文字按钮，让主按钮 "下一步" 视觉权重突出 */}
+            {/* 候选5：主按钮加 hover 变深、shadow、过渡；候选6：mt-5→mt-6 */}
+            <div className="flex justify-end gap-2 mt-6">
+              <button
+                onClick={onCancel}
+                disabled={busy}
+                className="px-4 py-2 text-sm text-zinc-600 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800 rounded-lg transition-colors disabled:opacity-50"
+              >
+                取消
+              </button>
+              <button
+                onClick={handleLogin}
+                disabled={busy}
+                className="px-5 py-2 text-sm font-medium bg-indigo-500 hover:bg-indigo-600 text-white rounded-lg shadow-md hover:shadow-lg flex items-center gap-1.5 transition-all disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:bg-indigo-500 disabled:shadow-md"
+              >
+                {busy && <Loader2 size={14} className="animate-spin" />}
+                下一步
+              </button>
+            </div>
+          </>
+        )}
+
+        {step === "confirm" && (
+          <>
+            <div className="flex items-center gap-2 mb-4">
+              <ArrowRight className="text-accent-primary" size={20} />
+              <h2 className="text-lg font-semibold text-tx-primary">确认迁移</h2>
+            </div>
+            <div className="space-y-2 text-sm text-tx-secondary mb-4">
+              <p>登录成功，账号：<span className="text-tx-primary font-medium">{cloudUserDisplay}</span></p>
+              <p>即将把本地全部笔记本、笔记、标签复制到该账号下。</p>
+              <ul className="list-disc list-inside text-xs text-tx-tertiary mt-2 space-y-1">
+                <li>本地数据保留，作为备份</li>
+                <li>笔记里的图片 / 附件也会一起上传到云端</li>
+                <li>包含笔记的历史版本记录</li>
+                <li>如果中途失败，已写入云端的部分会自动撤销</li>
+              </ul>
+            </div>
+            <div className="flex justify-end gap-2 mt-5">
+              <button
+                onClick={() => setStep("login")}
+                className="px-4 py-2 text-sm text-tx-secondary hover:bg-app-hover rounded-md"
+              >
+                上一步
+              </button>
+              <button
+                onClick={handleStart}
+                className="px-4 py-2 text-sm bg-accent-primary text-white rounded-md"
+              >
+                开始迁移
+              </button>
+            </div>
+          </>
+        )}
+
+        {step === "running" && (
+          <>
+            <div className="flex items-center gap-2 mb-4">
+              <Loader2 className="text-accent-primary animate-spin" size={20} />
+              <h2 className="text-lg font-semibold text-tx-primary">正在迁移…</h2>
+            </div>
+            <div className="space-y-3">
+              <div className="h-2 bg-app-input rounded-full overflow-hidden">
+                <div
+                  className="h-full bg-accent-primary transition-all duration-300"
+                  style={{ width: `${Math.round(progress.ratio * 100)}%` }}
+                />
+              </div>
+              <p className="text-sm text-tx-secondary">{progress.message}</p>
+              <p className="text-xs text-tx-tertiary">请勿关闭窗口，迁移期间需要保持网络连接。</p>
+            </div>
+          </>
+        )}
+
+        {step === "success" && (
+          <>
+            <div className="flex items-center gap-2 mb-4">
+              <CheckCircle2 className="text-green-500" size={20} />
+              <h2 className="text-lg font-semibold text-tx-primary">迁移完成</h2>
+            </div>
+            <p className="text-sm text-tx-secondary">
+              数据已写入云端账号。即将刷新进入云端工作台…
+            </p>
+            {attSummary && attSummary.total > 0 && (
+              <div className="mt-3 text-xs text-tx-tertiary">
+                附件：{attSummary.succeeded} / {attSummary.total} 成功
+                {attSummary.failed.length > 0 && (
+                  <details className="mt-2">
+                    <summary className="cursor-pointer text-accent-danger">
+                      {attSummary.failed.length} 个附件迁移失败（点击展开）
+                    </summary>
+                    <ul className="mt-1 max-h-32 overflow-auto pl-4 list-disc text-tx-secondary">
+                      {attSummary.failed.slice(0, 20).map((f) => (
+                        <li key={f.id} className="break-words">
+                          {f.filename}：{f.reason}
+                        </li>
+                      ))}
+                      {attSummary.failed.length > 20 && (
+                        <li>… 其余 {attSummary.failed.length - 20} 个未列出</li>
+                      )}
+                    </ul>
+                  </details>
+                )}
+              </div>
+            )}
+          </>
+        )}
+
+        {step === "error" && (
+          <>
+            <div className="flex items-center gap-2 mb-4">
+              <AlertCircle className="text-accent-danger" size={20} />
+              <h2 className="text-lg font-semibold text-tx-primary">迁移失败</h2>
+            </div>
+            <div className="bg-accent-danger/10 text-accent-danger p-3 rounded-md text-sm break-words">
+              {error}
+            </div>
+            {rollbackInfo && (
+              <div className="mt-2 text-xs">
+                {rollbackInfo.state === "running" && (
+                  <span className="text-tx-tertiary">
+                    <Loader2 size={12} className="inline animate-spin mr-1" />
+                    正在撤销云端已写入的部分…
+                  </span>
+                )}
+                {rollbackInfo.state === "done" && rollbackInfo.removed && (
+                  <span className="text-green-500">
+                    已撤销云端已写入的数据（
+                    {rollbackInfo.removed.notebooks ?? 0} 个笔记本 / {rollbackInfo.removed.notes ?? 0} 篇笔记 / {rollbackInfo.removed.attachments ?? 0} 个附件
+                    ）。
+                  </span>
+                )}
+                {rollbackInfo.state === "failed" && (
+                  <span className="text-accent-danger">
+                    自动撤销未完成：{rollbackInfo.error || "未知错误"}。请手动检查云端账号是否有本次迁移残留的重复数据。
+                  </span>
+                )}
+              </div>
+            )}
+            <p className="text-xs text-tx-tertiary mt-2">
+              本地数据完整保留，可重新尝试。如果反复失败，请先用"导出 zip"功能手动备份。
+            </p>
+            <div className="flex justify-end gap-2 mt-5">
+              <button
+                onClick={onCancel}
+                className="px-4 py-2 text-sm text-tx-primary border border-app-border hover:bg-app-hover rounded-md"
+              >
+                关闭
+              </button>
+              <button
+                onClick={() => { setError(""); setStep("confirm"); }}
+                className="px-4 py-2 text-sm bg-accent-primary text-white rounded-md"
+              >
+                重试
+              </button>
+            </div>
+          </>
+        )}
+      </motion.div>
+    </motion.div>,
+    document.body
+  );
+}
