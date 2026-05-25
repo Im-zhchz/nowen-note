@@ -900,15 +900,9 @@ if [ "$HAS_UPK" = "1" ]; then
         warn "upk 打包阶段会失败，请先放置 ugcli 可执行文件"
     fi
 
-    # 镜像名默认与 fpk 同 repo + v 前缀版本号（与 release.sh 推送的 tag 对齐）
-    if [ -z "$UPK_IMAGE_REF" ]; then
-        # FPK_DOCKERHUB_REPO 上面已经处理过了，这里直接复用
-        if [ -z "$FPK_DOCKERHUB_REPO" ]; then
-            FPK_DOCKERHUB_REPO="${DOCKERHUB_REPO:-$DEFAULT_IMAGE_NAME}"
-        fi
-        UPK_IMAGE_REF="${FPK_DOCKERHUB_REPO}:v${VERSION}"
-    fi
-    info "upk 镜像地址: ${C_GREEN}${UPK_IMAGE_REF}${C_RESET}（构建号: ${UPK_BUILD_NO}）"
+    # 注意：UPK_IMAGE_REF 的默认值依赖 ${VERSION}，但此时 VERSION 还可能为空
+    # （交互/--yes 模式下要等到后面 "询问/采用建议版本号" 那一段才赋值）。
+    # 因此这里只校验工具链，真正的镜像 ref 拼接放到 VERSION 确认之后再做。
 fi
 
 # Lite 版完全复用 PC 端的 electron-builder 链路，但走 builder.lite.config.js，
@@ -1152,6 +1146,21 @@ EOF
     if version_exists_anywhere "$VERSION"; then
         die "版本 ${VERSION_TAG} 在 本地 / GitHub / Docker Hub 中已存在，拒绝覆盖"
     fi
+fi
+
+# -------------------- UPK 镜像 ref 兜底拼接（依赖 VERSION，必须放到这之后） --------------------
+# 这里拼接 UPK_IMAGE_REF 的默认值：与 fpk 同 repo + v 前缀版本号，与 release.sh
+# 推送的 docker tag 对齐。命令行 --upk-image / 环境变量 UPK_IMAGE_REF 已显式传值时
+# 不覆盖。之所以放到 VERSION 确认之后，是因为前置检查阶段 VERSION 还可能为空，
+# 早拼会得到 "repo:v" 这种残缺 tag，被 build-upk.mjs 的 isBrokenRef 拒绝。
+if [ "$HAS_UPK" = "1" ]; then
+    if [ -z "$UPK_IMAGE_REF" ]; then
+        if [ -z "$FPK_DOCKERHUB_REPO" ]; then
+            FPK_DOCKERHUB_REPO="${DOCKERHUB_REPO:-$DEFAULT_IMAGE_NAME}"
+        fi
+        UPK_IMAGE_REF="${FPK_DOCKERHUB_REPO}:v${VERSION}"
+    fi
+    info "upk 镜像地址: ${C_GREEN}${UPK_IMAGE_REF}${C_RESET}（构建号: ${UPK_BUILD_NO}）"
 fi
 
 # -------------------- 同步 package.json 的 version --------------------
