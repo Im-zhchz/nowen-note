@@ -103,6 +103,25 @@ Android 可直接从 [Releases](https://github.com/cropflre/nowen-note/releases)
 - 隐私策略：[docs/PRIVACY.md](./docs/PRIVACY.md)
 - OpenAPI：运行后访问 `/api/openapi.json`
 
+## 常见问题
+
+### macOS 首次打开报错 / 无法启动 / "ERR_DLOPEN_FAILED"
+
+由于本应用未做 Apple 公证（notarization），系统会把 dmg 里下载来的 `.app`
+打上 quarantine 隔离属性，导致内部的 `better-sqlite3` 原生模块加载失败、
+后端启动卡住 30 秒后报"后端启动超时"。
+
+终端执行一行命令解除隔离即可（路径换成你实际拖过去的位置）：
+
+```bash
+sudo xattr -dr com.apple.quarantine "/Applications/Nowen Note.app"
+# 或
+sudo xattr -dr com.apple.quarantine ~/Downloads/Nowen\ Note.app
+```
+
+执行后双击重新打开即可。Apple Silicon 用户若用了 x64 版本，需要 Rosetta 2
+（系统会自动提示安装）。
+
 ## 问题反馈
 
 QQ 群：`1093473044`
