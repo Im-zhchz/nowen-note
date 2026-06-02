@@ -848,14 +848,15 @@ function FontSizePopover({ editor, iconSize = 15, compact = false }: FontSizePop
   // 点击外部关闭（同时考虑按钮和弹层两个区域）
   useEffect(() => {
     if (!open) return;
-    const onDocDown = (e: MouseEvent) => {
+    const onInteract = (e: MouseEvent) => {
       const t = e.target as Node;
       if (ref.current?.contains(t)) return;
       if (popRef.current?.contains(t)) return;
+      if ((t as Element)?.closest?.('[data-popover]')) return;
       setOpen(false);
     };
-    document.addEventListener("mousedown", onDocDown);
-    return () => document.removeEventListener("mousedown", onDocDown);
+    document.addEventListener("mousedown", onInteract, true);
+    return () => document.removeEventListener("mousedown", onInteract, true);
   }, [open]);
 
   const apply = (size: string) => {
@@ -899,6 +900,7 @@ function FontSizePopover({ editor, iconSize = 15, compact = false }: FontSizePop
           ref={popRef}
           style={{ position: "fixed", top: pos.top, left: pos.left }}
           className="z-[100] w-52 p-2 rounded-lg shadow-lg bg-app-elevated border border-app-border"
+          data-popover=""
           onMouseDown={(e) => e.preventDefault()}
         >
           <div className="text-[11px] text-tx-tertiary px-1 pb-1">预设</div>
@@ -1007,25 +1009,24 @@ function ColorPopover({ editor, iconSize = 15, compact = false }: ColorPopoverPr
 
   useEffect(() => {
     if (!open) return;
-    const onDocDown = (e: MouseEvent) => {
+    const onInteract = (e: MouseEvent) => {
       const t = e.target as Node;
       if (ref.current?.contains(t)) return;
       if (popRef.current?.contains(t)) return;
+      if ((t as Element)?.closest?.('[data-popover]')) return;
       setOpen(false);
     };
-    document.addEventListener("mousedown", onDocDown);
-    return () => document.removeEventListener("mousedown", onDocDown);
+    document.addEventListener("mousedown", onInteract, true);
+    return () => document.removeEventListener("mousedown", onInteract, true);
   }, [open]);
 
   const applyColor = (c: string) => {
     if (tab === "fg") editor.chain().focus().setColor(c).run();
     else editor.chain().focus().setHighlight({ color: c }).run();
-    setOpen(false);
   };
   const clearColor = () => {
     if (tab === "fg") editor.chain().focus().unsetColor().run();
     else editor.chain().focus().unsetHighlight().run();
-    setOpen(false);
   };
 
   const swatches = tab === "fg" ? COLOR_PRESETS : HIGHLIGHT_PRESETS;
@@ -1061,6 +1062,7 @@ function ColorPopover({ editor, iconSize = 15, compact = false }: ColorPopoverPr
           ref={popRef}
           style={{ position: "fixed", top: pos.top, left: pos.left }}
           className="z-[100] w-56 p-2 rounded-lg shadow-lg bg-app-elevated border border-app-border"
+          data-popover=""
           onMouseDown={(e) => e.preventDefault()}
         >
           {/* Tab */}
@@ -1106,16 +1108,19 @@ function ColorPopover({ editor, iconSize = 15, compact = false }: ColorPopoverPr
           </div>
           {/* 自定义颜色 */}
           <div className="flex items-center gap-2 mt-2">
-            <label className="flex items-center gap-1.5 px-2 py-1 text-xs rounded border border-app-border hover:bg-app-hover cursor-pointer">
+            <button
+              type="button"
+              onClick={() => { const el = document.querySelector('input[type="color"]'); el?.click(); }}
+              className="flex items-center gap-1.5 px-2 py-1 text-xs rounded border border-app-border hover:bg-app-hover"
+            >
               <input
                 type="color"
                 value={current || (tab === "fg" ? "#ef4444" : "#fef9c3")}
                 onChange={(e) => applyColor(e.target.value)}
-                onMouseDown={(e) => e.stopPropagation()}
-                className="w-4 h-4 p-0 border-0 bg-transparent cursor-pointer"
+                className="sr-only"
               />
-              <span className="text-tx-secondary">自定义</span>
-            </label>
+              <Palette size={12} className="text-tx-secondary" />
+            </button>
             <button
               type="button"
               onClick={clearColor}
@@ -2621,6 +2626,9 @@ export default forwardRef<NoteEditorHandle, TiptapEditorProps>(function TiptapEd
       // 延迟一帧关闭，避免点击气泡菜单按钮时因 blur 而菜单消失
       requestAnimationFrame(() => {
         if (!editor.view.hasFocus()) {
+        // 如果焦点移到了弹窗内（如字号/颜色选择器），不关闭气泡菜单
+          const ae = document.activeElement;
+          if (ae && ae !== document.body && (ae as Element).closest?.('[data-popover]')) return;
           setBubble(b => b.open ? { ...b, open: false } : b);
           setImageBubble(b => b.open ? { ...b, open: false } : b);
           // 只关 caret 触发的链接气泡；hover 气泡不依赖编辑器 focus
