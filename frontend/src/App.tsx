@@ -1,10 +1,11 @@
-﻿import React, { useState, useEffect, useRef, useCallback } from "react";
+import React, { useState, useEffect, useRef, useCallback } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { Menu, X } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import Sidebar from "@/components/Sidebar";
 import NavRail from "@/components/NavRail";
 import { useRailMode } from "@/hooks/useRailMode";
+import NoteList from "@/components/NoteList";
 import EditorPane from "@/components/EditorPane";
 import TaskCenter from "@/components/TaskCenter";
 import MindMapCenter from "@/components/MindMapEditor";
@@ -16,7 +17,7 @@ import LoginPage from "@/components/LoginPage";
 import QuickLoginGate from "@/components/QuickLoginGate";
 import QuickLoginEnrollDialog from "@/components/QuickLoginEnrollDialog";
 import WhatsNewModal, { useWhatsNew } from "@/components/WhatsNewModal";
-import { AppProvider, useApp, useAppActions, MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH, DEFAULT_SIDEBAR_WIDTH } from "@/store/AppContext";
+import { AppProvider, useApp, useAppActions, MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH, DEFAULT_SIDEBAR_WIDTH, MIN_NOTELIST_WIDTH, MAX_NOTELIST_WIDTH, DEFAULT_NOTELIST_WIDTH } from "@/store/AppContext";
 import { ThemeProvider } from "@/components/ThemeProvider";
 import { SiteSettingsProvider, useSiteSettings } from "@/hooks/useSiteSettings";
 import { UserPreferencesProvider, useUserPreferences } from "@/hooks/useUserPreferences";
@@ -197,6 +198,52 @@ function SidebarResizeHandle() {
   );
 }
 
+function NoteListResizeHandle() {
+  const { state } = useApp();
+  const actions = useAppActions();
+  const isDragging = useRef(false);
+  const startX = useRef(0);
+  const startWidth = useRef(0);
+
+  const handleMouseDown = useCallback((e: React.MouseEvent) => {
+    e.preventDefault();
+    isDragging.current = true;
+    startX.current = e.clientX;
+    startWidth.current = state.noteListWidth;
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+
+    const handleMouseMove = (ev: MouseEvent) => {
+      if (!isDragging.current) return;
+      const newWidth = startWidth.current + (ev.clientX - startX.current);
+      actions.setNoteListWidth(Math.max(MIN_NOTELIST_WIDTH, Math.min(MAX_NOTELIST_WIDTH, newWidth)));
+    };
+
+    const handleMouseUp = () => {
+      isDragging.current = false;
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+      window.removeEventListener("mousemove", handleMouseMove);
+      window.removeEventListener("mouseup", handleMouseUp);
+    };
+
+    window.addEventListener("mousemove", handleMouseMove);
+    window.addEventListener("mouseup", handleMouseUp);
+  }, [state.noteListWidth, actions]);
+
+  if (state.noteListCollapsed) return null;
+
+  return (
+    <div
+      onMouseDown={handleMouseDown}
+      onDoubleClick={() => actions.setNoteListWidth(DEFAULT_NOTELIST_WIDTH)}
+      className="hidden md:flex w-1 cursor-col-resize items-center justify-center hover:bg-accent-primary/30 active:bg-accent-primary/50 transition-colors shrink-0 group"
+    >
+      <div className="w-[2px] h-8 rounded-full bg-transparent group-hover:bg-accent-primary/60 transition-colors" />
+    </div>
+  );
+}
+
 
 /**
  * P3: 侧边栏边缘滑动手势 Hook
@@ -288,6 +335,7 @@ function AppLayout() {
   const { state } = useApp();
   const actions = useAppActions();
   const { t } = useTranslation();
+  const { prefs: userPrefs } = useUserPreferences();
   // v16 P3 后续：Rail 视觉模式三档（icon / label / hidden）。
   // 约束：主侧栏折叠时强制显示 Rail（即便偏好是 hidden），
   // 否则用户会陷入"既无 Rail 又无主侧栏"的死局，找不到任何导航入口。
@@ -298,6 +346,8 @@ function AppLayout() {
   const isAIChatView = state.viewMode === "ai-chat";
   const isDiaryView = state.viewMode === "diary";
   const isFilesView = state.viewMode === "files";
+  const isRegularNoteBrowser = state.viewMode === "all" || state.viewMode === "notebook";
+  const showDesktopNoteList = !state.noteListCollapsed && !(userPrefs.showNotesInNotebookTree && isRegularNoteBrowser);
 
   /**
    * Cmd-K 全局搜索面板开关
@@ -350,7 +400,6 @@ function AppLayout() {
   // AppContext.activeNote，而 AppContext 是在 AuthGate → AppProvider 之后才挂的，
   // useSiteSettings 是分享页/登录页等更外层场景也会用到的更基础 Provider。
   const { siteConfig } = useSiteSettings();
-  const { prefs: userPrefs } = useUserPreferences();
   useEffect(() => {
     const baseTitle = siteConfig.title || "nowen-note";
     if (userPrefs.noteTitleAsAppTitle) {
@@ -567,6 +616,25 @@ function AppLayout() {
         </div>
       ) : (
         <div className="flex-1 flex relative overflow-hidden">
+          {/* 移动端列表页继续复用 NoteList；树形目录开关作用在侧边栏的笔记本目录。 */}
+          <div className={`
+            md:hidden flex-col shrink-0 h-full w-full
+            ${state.mobileView === "list" ? "flex" : "hidden"}
+          `}>
+            <NoteList />
+          </div>
+
+          {/* 桌面端：开启目录内联笔记时，普通浏览隐藏中间 NoteList，避免和 Sidebar 重复。 */}
+          {showDesktopNoteList && (
+            <div
+              className="hidden md:flex flex-col shrink-0 h-full"
+              style={{ width: `${state.noteListWidth}px` }}
+            >
+              <NoteList />
+            </div>
+          )}
+
+          {showDesktopNoteList && <NoteListResizeHandle />}
 
           {/* 编辑器 — 移动端全屏覆盖 */}
           <div className={`

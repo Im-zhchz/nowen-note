@@ -1,12 +1,13 @@
 import React, { useState, useEffect, useMemo, useRef, useCallback } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import {
-  BookOpen, Plus, Star, Trash2, Search, ChevronRight, FileText,
+  BookOpen, Plus, Star, Trash2, Search, ChevronRight,
   ChevronDown, ListTodo,
   Settings, LogOut, FilePlus, FolderPlus, Edit2, X, BrainCircuit,
   Sparkles, NotebookPen, Smile, GripVertical,
   FolderInput, Check, Home, Download, FolderOpen,
-  Columns2, Columns3, FileType2, Link2,
+  Columns2, Columns3, FileType2, Link2, FileText,
+  Pin, PinOff, StarOff, Lock, Unlock,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -18,10 +19,11 @@ import WorkspaceSwitcher from "@/components/WorkspaceSwitcher";
 import { useContextMenu } from "@/hooks/useContextMenu";
 import { useApp, useAppActions } from "@/store/AppContext";
 import { useSiteSettings } from "@/hooks/useSiteSettings";
+import { useUserPreferences } from "@/hooks/useUserPreferences";
 import { useRailMode, nextRailMode } from "@/hooks/useRailMode";
 import { api, broadcastLogout, getCurrentWorkspace } from "@/lib/api";
 import { exportNotebook } from "@/lib/exportService";
-import { Notebook, NoteListItem, ViewMode, WorkspaceFeatures } from "@/types";
+import { Note, Notebook, NoteListItem, ViewMode, WorkspaceFeatures } from "@/types";
 import { cn } from "@/lib/utils";
 import { useTranslation } from "react-i18next";
 import { toast } from "@/lib/toast";
@@ -379,11 +381,99 @@ function MoveNotebookModal({
 
 
 
+function noteToListItem(note: Note): NoteListItem {
+  return {
+    id: note.id,
+    userId: note.userId,
+    notebookId: note.notebookId,
+    workspaceId: note.workspaceId,
+    title: note.title,
+    contentText: note.contentText || "",
+    isPinned: note.isPinned || 0,
+    isFavorite: note.isFavorite || 0,
+    isLocked: note.isLocked || 0,
+    isArchived: note.isArchived || 0,
+    isTrashed: note.isTrashed || 0,
+    version: note.version || 1,
+    sortOrder: note.sortOrder || 0,
+    createdAt: note.createdAt,
+    updatedAt: note.updatedAt,
+  } as NoteListItem;
+}
+
+function noteTimeLabel(updatedAt: string): string {
+  const d = new Date(updatedAt);
+  const diff = Date.now() - d.getTime();
+  if (diff < 60_000) return "刚刚";
+  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}分钟前`;
+  if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)}小时前`;
+  if (diff < 604_800_000) return `${Math.floor(diff / 86_400_000)}天前`;
+  return d.toLocaleDateString();
+}
+
+function SidebarNoteItem({
+  note,
+  depth,
+  active,
+  onSelect,
+  onContextMenu,
+  onDragStart,
+  onDragEnd,
+}: {
+  note: NoteListItem;
+  depth: number;
+  active: boolean;
+  onSelect: (id: string) => void;
+  onContextMenu: (e: React.MouseEvent, id: string) => void;
+  onDragStart?: (e: React.DragEvent, id: string) => void;
+  onDragEnd?: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      draggable
+      onClick={() => onSelect(note.id)}
+      onContextMenu={(e) => onContextMenu(e, note.id)}
+      onDragStart={(e) => onDragStart?.(e, note.id)}
+      onDragEnd={() => onDragEnd?.()}
+      className={cn(
+        "relative w-full flex items-center gap-2 pr-2 py-1 rounded-md text-left text-xs transition-colors min-w-0 cursor-grab active:cursor-grabbing",
+        active
+          ? "bg-app-active text-tx-primary"
+          : "text-tx-secondary hover:bg-app-hover hover:text-tx-primary"
+      )}
+      style={{ paddingLeft: `${depth * 28 + 42}px` }}
+    >
+      {depth > 0 && (
+        <span
+          className="absolute top-1/2 h-0.5 bg-tx-tertiary/35 pointer-events-none"
+          style={{ left: `${(depth - 1) * 28 + 35}px`, width: "22px" }}
+        />
+      )}
+      <span
+        className={cn(
+          "absolute top-2 bottom-2 w-0.5 rounded-full pointer-events-none",
+          active ? "bg-accent-primary" : "bg-tx-tertiary/35"
+        )}
+        style={{ left: `${depth * 28 + 31}px` }}
+      />
+      <FileText size={13} className={cn("shrink-0", active ? "text-accent-primary" : "text-tx-tertiary")} />
+      <span className="flex-1 min-w-0">
+        <span className="block truncate leading-tight">{note.title || "无标题笔记"}</span>
+        <span className="block text-[10px] text-tx-tertiary truncate leading-tight mt-0.5">{noteTimeLabel(note.updatedAt)}</span>
+      </span>
+    </button>
+  );
+}
+
 function NotebookItem({
   notebook, depth, onSelect, selectedId, onToggle, onContextMenu, onLongPress,
   editingId, editValue, onEditChange, onEditSubmit, onEditCancel,
   onIconChange,
   draggable, onDragStart, onDragOver, onDragEnd, onDrop, dragOverId, dragOverZone,
+  noteDragOverId,
+  showNotes, notesByNotebookId, loadingNotebookIds, activeNoteId, onSelectNote, onNoteContextMenu,
+  onNoteDragStart, onNoteDragOver, onNoteDragEnd, onNoteDrop, onCreateNote,
 }: {
   notebook: Notebook; depth: number; onSelect: (id: string) => void;
   selectedId: string | null; onToggle: (id: string) => void;
@@ -404,13 +494,30 @@ function NotebookItem({
   onDrop?: (e: React.DragEvent, id: string) => void;
   dragOverId?: string | null;
   dragOverZone?: "before" | "inside" | null;
+  noteDragOverId?: string | null;
+  showNotes?: boolean;
+  notesByNotebookId?: Map<string, NoteListItem[]>;
+  loadingNotebookIds?: Set<string>;
+  activeNoteId?: string | null;
+  onSelectNote?: (id: string) => void;
+  onNoteContextMenu?: (e: React.MouseEvent, id: string) => void;
+  onNoteDragStart?: (e: React.DragEvent, id: string) => void;
+  onNoteDragOver?: (e: React.DragEvent, notebookId: string) => void;
+  onNoteDragEnd?: () => void;
+  onNoteDrop?: (e: React.DragEvent, notebookId: string) => void;
+  onCreateNote?: (notebookId: string) => void;
 }) {
   const { t } = useTranslation();
   const isSelected = selectedId === notebook.id;
   const hasChildren = notebook.children && notebook.children.length > 0;
+  const notes = notesByNotebookId?.get(notebook.id) || [];
+  const notesLoading = !!loadingNotebookIds?.has(notebook.id);
+  const hasNotes = showNotes && (notesLoading || (notes?.length ?? 0) > 0 || (notebook.noteCount ?? 0) > 0);
+  const hasExpandableContent = hasChildren || hasNotes;
   const isExpanded = notebook.isExpanded === 1;
   const isEditing = editingId === notebook.id;
   const isDragOver = dragOverId === notebook.id;
+  const isNoteDragOver = noteDragOverId === notebook.id;
   const showBeforeIndicator = isDragOver && dragOverZone === "before";
   const showInsideIndicator = isDragOver && dragOverZone === "inside";
   const inputRef = useRef<HTMLInputElement>(null);
@@ -454,19 +561,20 @@ function NotebookItem({
       {showBeforeIndicator && (
         <div
           className="h-0.5 bg-accent-primary rounded-full mx-2 my-0.5 pointer-events-none"
-          style={{ marginLeft: `${depth * 16 + 16}px` }}
+          style={{ marginLeft: `${depth * 28 + 16}px` }}
         />
       )}
       <motion.div
         initial={{ opacity: 0, x: -8 }}
         animate={{ opacity: 1, x: 0 }}
         className={cn(
-          "flex items-center gap-2 px-2 py-1.5 rounded-md cursor-pointer text-sm group transition-colors min-w-0",
-          isSelected ? "bg-app-active text-tx-primary" : "text-tx-secondary hover:bg-app-hover hover:text-tx-primary",
+          "relative flex items-center gap-2 px-2 py-1.5 rounded-md cursor-pointer text-sm group transition-colors min-w-0",
+          isSelected ? "bg-app-active text-tx-primary font-medium" : "text-tx-secondary hover:bg-app-hover hover:text-tx-primary",
           // inside 放置指示：显著的内边框 + 背景高亮，让用户清楚"将作为子项放入"
-          showInsideIndicator && "outline outline-2 outline-accent-primary bg-accent-primary/15"
+          showInsideIndicator && "outline outline-2 outline-accent-primary bg-accent-primary/15",
+          isNoteDragOver && "outline outline-2 outline-accent-primary bg-accent-primary/10"
         )}
-        style={{ paddingLeft: `${depth * 16 + 8}px` }}
+        style={{ paddingLeft: `${depth === 0 ? 8 : depth * 28 + 20}px` }}
         onClick={() => onSelect(notebook.id)}
         onContextMenu={(e) => onContextMenu(e, notebook.id)}
         onTouchStart={(e) => {
@@ -502,14 +610,36 @@ function NotebookItem({
         // 原样透传到底层 DOM 的 ondragstart/ondragover 等（HTML5 DnD）。
         // 因此用 `as any` 绕过 TS 的手势签名约束，运行时行为与原生 DnD 一致。
         onDragStart={((e: React.DragEvent) => { e.stopPropagation(); onDragStart?.(e, notebook.id); }) as any}
-        onDragOver={((e: React.DragEvent) => { e.preventDefault(); e.stopPropagation(); onDragOver?.(e, notebook.id); }) as any}
+        onDragOver={((e: React.DragEvent) => {
+          e.preventDefault();
+          e.stopPropagation();
+          if (e.dataTransfer.types.includes("application/x-nowen-note")) {
+            onNoteDragOver?.(e, notebook.id);
+          } else {
+            onDragOver?.(e, notebook.id);
+          }
+        }) as any}
         onDragEnd={() => onDragEnd?.()}
-        onDrop={(e: React.DragEvent) => { e.preventDefault(); e.stopPropagation(); onDrop?.(e, notebook.id); }}
+        onDrop={(e: React.DragEvent) => {
+          e.preventDefault();
+          e.stopPropagation();
+          if (e.dataTransfer.types.includes("application/x-nowen-note")) {
+            onNoteDrop?.(e, notebook.id);
+          } else {
+            onDrop?.(e, notebook.id);
+          }
+        }}
       >
+        {depth > 0 && (
+          <span
+            className="absolute top-1/2 h-0.5 bg-tx-tertiary/35 pointer-events-none"
+            style={{ left: `${(depth - 1) * 28 + 35}px`, width: "14px" }}
+          />
+        )}
         {draggable && (
           <GripVertical size={12} className="text-tx-tertiary opacity-0 group-hover:opacity-60 transition-opacity shrink-0 cursor-grab active:cursor-grabbing" />
         )}
-        {hasChildren ? (
+        {hasExpandableContent ? (
           <button
             onClick={(e) => { e.stopPropagation(); onToggle(notebook.id); }}
             className="p-0.5 rounded hover:bg-app-border transition-colors"
@@ -556,17 +686,35 @@ function NotebookItem({
             {notebook.noteCount !== undefined && notebook.noteCount > 0 && (
               <span className="text-[10px] text-tx-tertiary tabular-nums shrink-0">{notebook.noteCount}</span>
             )}
+            {showNotes && onCreateNote && (
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onCreateNote(notebook.id);
+                }}
+                className="w-5 h-5 shrink-0 flex items-center justify-center rounded text-tx-tertiary hover:text-accent-primary hover:bg-app-hover transition-colors opacity-0 group-hover:opacity-100"
+                title={t("sidebar.newNote")}
+              >
+                <Plus size={12} />
+              </button>
+            )}
           </>
         )}
       </motion.div>
       <AnimatePresence>
-        {hasChildren && isExpanded && (
+        {hasExpandableContent && isExpanded && (
           <motion.div
             initial={{ height: 0, opacity: 0 }}
             animate={{ height: "auto", opacity: 1 }}
             exit={{ height: 0, opacity: 0 }}
             transition={{ duration: 0.2 }}
+            className="relative"
           >
+            <span
+              className="absolute top-1 bottom-1 w-0.5 rounded-full bg-tx-tertiary/35 pointer-events-none"
+              style={{ left: `${depth * 28 + 35}px` }}
+            />
             {notebook.children!.map((child) => (
               <NotebookItem
                 key={child.id}
@@ -589,162 +737,36 @@ function NotebookItem({
                 onDragEnd={onDragEnd}
                 onDrop={onDrop}
                 dragOverId={dragOverId}
-                                dragOverZone={dragOverZone}
-                notes={notes}
+                dragOverZone={dragOverZone}
+                noteDragOverId={noteDragOverId}
+                showNotes={showNotes}
+                notesByNotebookId={notesByNotebookId}
+                loadingNotebookIds={loadingNotebookIds}
                 activeNoteId={activeNoteId}
+                onSelectNote={onSelectNote}
+                onNoteContextMenu={onNoteContextMenu}
+                onNoteDragStart={onNoteDragStart}
+                onNoteDragOver={onNoteDragOver}
+                onNoteDragEnd={onNoteDragEnd}
+                onNoteDrop={onNoteDrop}
                 onCreateNote={onCreateNote}
-                onDeleteNote={onDeleteNote}
-                onRenameNote={onRenameNote}
-                onToggleFavorite={onToggleFavorite}
-                onTogglePin={onTogglePin}
               />
             ))}
-            {/* Inline notes for this notebook */}
-            {notes && notes.length > 0 && (
-              <div className="space-y-0.5">
-                {notes.map((note) => (
-                  <NoteNoteItem
-                    key={note.id}
-                    note={note}
-                    depth={depth + 1}
-                    isActive={activeNoteId === note.id}
-                    onSelect={(noteId) => {
-                      import("@/lib/api").then(({ api }) => {
-                        api.getNote(noteId).then((fullNote) => {
-                          window.dispatchEvent(new CustomEvent("nowen:open-note", { detail: { noteId, note: fullNote } }));
-                        });
-                      });
-                    }}
-                    onDelete={(noteId) => onDeleteNote?.(noteId)}
-                    onRename={(noteId, newTitle) => onRenameNote?.(noteId, newTitle)}
-                    onToggleFavorite={(noteId) => onToggleFavorite?.(noteId)}
-                    onTogglePin={(noteId) => onTogglePin?.(noteId)}
-                  />
-                ))}
-              </div>
-            )}
-            {/* Create note button */}
-            {onCreateNote && (
-              <button
-                className="w-full flex items-center gap-1.5 py-1 text-[11px] text-tx-tertiary hover:text-accent-primary transition-colors"
-                style={{ paddingLeft: `${(depth + 1) * 16 + 28}px` }}
-                onClick={(e) => { e.stopPropagation(); onCreateNote(notebook.id); }}
-              >
-                <Plus size={12} />
-                <span>{"\u65b0\u5efa\u7b14\u8bb0"}</span>
-              </button>
-            )}
+            {showNotes && notes?.map((note) => (
+              <SidebarNoteItem
+                key={note.id}
+                note={note}
+                depth={depth + 1}
+                active={activeNoteId === note.id}
+                onSelect={onSelectNote || (() => {})}
+                onContextMenu={onNoteContextMenu || (() => {})}
+                onDragStart={onNoteDragStart}
+                onDragEnd={onNoteDragEnd}
+              />
+            ))}
           </motion.div>
         )}
       </AnimatePresence>
-    </>
-  );
-}
-}
-
-/** Inline note item - rendered inside expanded notebook tree */
-function NoteNoteItem({
-  note, depth, isActive, onSelect, onDelete, onRename, onToggleFavorite, onTogglePin,
-}: {
-  note: NoteListItem; depth: number; isActive: boolean;
-  onSelect: (noteId: string) => void;
-  onDelete: (noteId: string) => void;
-  onRename: (noteId: string, newTitle: string) => void;
-  onToggleFavorite: (noteId: string) => void;
-  onTogglePin: (noteId: string) => void;
-}) {
-  const { t } = useTranslation();
-  const [isEditing, setIsEditing] = useState(false);
-  const [editValue, setEditValue] = useState(note.title);
-  const inputRef = useRef<HTMLInputElement>(null);
-  const [showMenu, setShowMenu] = useState(false);
-  const [menuPos, setMenuPos] = useState({ x: 0, y: 0 });
-  const menuRef = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    if (isEditing && inputRef.current) { inputRef.current.focus(); inputRef.current.select(); }
-  }, [isEditing]);
-
-  useEffect(() => {
-    if (!showMenu) return;
-    const handler = (e: MouseEvent) => {
-      if (menuRef.current && !menuRef.current.contains(e.target as Node)) setShowMenu(false);
-    };
-    document.addEventListener("mousedown", handler);
-    return () => document.removeEventListener("mousedown", handler);
-  }, [showMenu]);
-
-  const timeAgo = useMemo(() => {
-    const d = new Date(note.updatedAt);
-    const diff = Date.now() - d.getTime();
-    if (diff < 60000) return "\u521a\u521a";
-    if (diff < 3600000) return ${Math.floor(diff / 60000)}\u5206\u949f\u524d;
-    if (diff < 86400000) return ${Math.floor(diff / 3600000)}\u5c0f\u65f6\u524d;
-    if (diff < 604800000) return ${Math.floor(diff / 86400000)}\u5929\u524d;
-    return d.toLocaleDateString();
-  }, [note.updatedAt]);
-
-  return (
-    <>
-      <div
-        className={cn(
-          "flex items-center gap-1.5 py-1 pr-1 rounded-md cursor-pointer text-xs group transition-colors min-w-0",
-          isActive ? "bg-app-active text-tx-primary" : "text-tx-secondary hover:bg-app-hover hover:text-tx-primary",
-        )}
-        style={{ paddingLeft: `${depth * 16 + 28}px` }}
-        onClick={() => onSelect(note.id)}
-        onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); setMenuPos({ x: e.clientX, y: e.clientY }); setShowMenu(true); }}
-      >
-        <FileText size={13} className={cn("shrink-0", isActive ? "text-accent-primary" : "text-tx-tertiary")} />
-        {isEditing ? (
-          <input
-            ref={inputRef}
-            value={editValue}
-            onChange={(e) => setEditValue(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter") { onRename(note.id, editValue); setIsEditing(false); }
-              if (e.key === "Escape") { setIsEditing(false); setEditValue(note.title); }
-            }}
-            onBlur={() => { onRename(note.id, editValue); setIsEditing(false); }}
-            className="flex-1 text-xs bg-transparent border border-accent-primary/50 rounded px-1 py-0 outline-none min-w-0"
-            onClick={(e) => e.stopPropagation()}
-          />
-        ) : (
-          <div className="flex-1 min-w-0 flex flex-col">
-            <span className="truncate leading-tight">{note.title}</span>
-            <span className="text-[10px] text-tx-tertiary truncate leading-tight">{timeAgo}</span>
-          </div>
-        )}
-        <div className="shrink-0 flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
-          {note.isPinned === 1 && <span className="text-[10px]">{String.fromCodePoint(0x1F4CC)}</span>}
-          {note.isFavorite === 1 && <span className="text-[10px]">{String.fromCodePoint(0x2B50)}</span>}
-        </div>
-      </div>
-      {showMenu && (
-        <div
-          ref={menuRef}
-          className="fixed z-[60] bg-app-elevated border border-app-border rounded-lg shadow-xl py-1 min-w-[160px]"
-          style={{ top: menuPos.y, left: menuPos.x }}
-        >
-          <button className="w-full px-3 py-1.5 text-xs text-left hover:bg-app-hover flex items-center gap-2"
-            onClick={() => { setShowMenu(false); onTogglePin(note.id); }}>
-            {note.isPinned ? "\u53d6\u6d88\u7f6e\u9876" : String.fromCodePoint(0x1F4CC) + " \u7f6e\u9876"}
-          </button>
-          <button className="w-full px-3 py-1.5 text-xs text-left hover:bg-app-hover flex items-center gap-2"
-            onClick={() => { setShowMenu(false); onToggleFavorite(note.id); }}>
-            {note.isFavorite ? "\u53d6\u6d88\u6536\u85cf" : String.fromCodePoint(0x2B50) + " \u6536\u85cf"}
-          </button>
-          <button className="w-full px-3 py-1.5 text-xs text-left hover:bg-app-hover flex items-center gap-2"
-            onClick={() => { setShowMenu(false); setIsEditing(true); setEditValue(note.title); }}>
-            <Edit2 size={12} /> {"\u91cd\u547d\u540d"}
-          </button>
-          <div className="my-1 border-t border-app-border/50" />
-          <button className="w-full px-3 py-1.5 text-xs text-left hover:bg-app-hover flex items-center gap-2 text-accent-danger"
-            onClick={() => { setShowMenu(false); onDelete(note.id); }}>
-            <Trash2 size={12} /> {"\u5220\u9664"}
-          </button>
-        </div>
-      )}
     </>
   );
 }
@@ -771,6 +793,8 @@ export default function Sidebar({ variant = "mobile" }: { variant?: "desktop" | 
   const { siteConfig } = useSiteSettings();
   const isDesktop = variant === "desktop";
   const { t } = useTranslation();
+  const { prefs: userPrefs } = useUserPreferences();
+  const showNotesInNotebookTree = userPrefs.showNotesInNotebookTree;
   // v16 P3 后续：Rail 三档视觉模式（icon / label / hidden），仅桌面变体使用。
   // 入口约定：Sidebar Header 那个按钮 = 循环切换到下一档，tooltip 提示下一档是什么。
   // 约束（在 App.tsx 实施）：sidebarCollapsed=true 时即便 mode=hidden 也强制显示 Rail，
@@ -843,180 +867,6 @@ export default function Sidebar({ variant = "mobile" }: { variant?: "desktop" | 
     });
   }, []);
 
-  // ===== Inline notes: lazy-load when notebook expands =====
-
-  const [notebookNotes, setNotebookNotes] = useState<Map<string, NoteListItem[]>>(new Map());
-
-  const [noteLoading, setNoteLoading] = useState<Set<string>>(new Set());
-
-
-
-  const loadNotesForNotebook = useCallback(async (notebookId: string) => {
-
-    if (notebookNotes.has(notebookId) || noteLoading.has(notebookId)) return;
-
-    setNoteLoading((prev) => new Set(prev).add(notebookId));
-
-    try {
-
-      const notes = await api.getNotes({ notebookId }) as NoteListItem[];
-
-      setNotebookNotes((prev) => new Map(prev).set(notebookId, notes));
-
-    } catch (err) {
-
-      console.error("Failed to load notes:", notebookId, err);
-
-    } finally {
-
-      setNoteLoading((prev) => { const n = new Set(prev); n.delete(notebookId); return n; });
-
-    }
-
-  }, [notebookNotes, noteLoading]);
-
-
-
-  const handleCreateNote = useCallback(async (notebookId: string) => {
-
-    try {
-
-      const note = await api.createNote({ notebookId, title: t("common.untitledNote") });
-
-      actions.setActiveNote(note);
-
-      setNotebookNotes((prev) => {
-
-        const next = new Map(prev);
-
-        const existing = next.get(notebookId) || [];
-
-        next.set(notebookId, [...existing, { id: note.id, userId: note.userId, title: note.title, contentText: note.contentText || "", notebookId: note.notebookId, isPinned: note.isPinned || 0, isFavorite: note.isFavorite || 0, isLocked: note.isLocked || 0, isArchived: note.isArchived || 0, isTrashed: note.isTrashed || 0, version: note.version || 1, sortOrder: note.sortOrder || 0, updatedAt: note.updatedAt, createdAt: note.createdAt } as NoteListItem]);
-
-        return next;
-
-      });
-
-      actions.refreshNotebooks();
-
-    } catch (err) { console.error("Failed to create note:", err); }
-
-  }, [actions, t]);
-
-
-
-  const handleDeleteNote = useCallback(async (noteId: string, notebookId: string) => {
-
-    try {
-
-      await api.deleteNote(noteId);
-
-      setNotebookNotes((prev) => { const next = new Map(prev); next.set(notebookId, (next.get(notebookId) || []).filter((n) => n.id !== noteId)); return next; });
-
-      actions.refreshNotebooks();
-
-    } catch (err) { console.error("Failed to delete note:", err); }
-
-  }, [actions]);
-
-
-
-  const handleRenameNote = useCallback(async (noteId: string, notebookId: string, newTitle: string) => {
-
-    if (!newTitle.trim()) return;
-
-    try {
-
-      await api.updateNote(noteId, { title: newTitle.trim() });
-
-      setNotebookNotes((prev) => { const next = new Map(prev); next.set(notebookId, (next.get(notebookId) || []).map((n) => n.id === noteId ? { ...n, title: newTitle.trim() } : n)); return next; });
-
-      if (state.activeNote?.id === noteId) actions.setActiveNote({ ...state.activeNote!, title: newTitle.trim() });
-
-    } catch (err) { console.error("Failed to rename note:", err); }
-
-  }, [state.activeNote, actions]);
-
-
-
-  const handleToggleFavorite = useCallback(async (noteId: string, notebookId: string) => {
-
-    try {
-
-      const notes = notebookNotes.get(notebookId) || [];
-
-      const note = notes.find((n) => n.id === noteId);
-
-      if (!note) return;
-
-      const newVal = note.isFavorite ? 0 : 1;
-
-      await api.updateNote(noteId, { isFavorite: newVal } as any);
-
-      setNotebookNotes((prev) => { const next = new Map(prev); next.set(notebookId, (next.get(notebookId) || []).map((n) => n.id === noteId ? { ...n, isFavorite: newVal } : n)); return next; });
-
-    } catch (err) { console.error("Failed to toggle favorite:", err); }
-
-  }, [notebookNotes]);
-
-
-
-  const handleTogglePin = useCallback(async (noteId: string, notebookId: string) => {
-
-    try {
-
-      const notes = notebookNotes.get(notebookId) || [];
-
-      const note = notes.find((n) => n.id === noteId);
-
-      if (!note) return;
-
-      const newVal = note.isPinned ? 0 : 1;
-
-      await api.updateNote(noteId, { isPinned: newVal } as any);
-
-      setNotebookNotes((prev) => { const next = new Map(prev); next.set(notebookId, (next.get(notebookId) || []).map((n) => n.id === noteId ? { ...n, isPinned: newVal } : n)); return next; });
-
-    } catch (err) { console.error("Failed to toggle pin:", err); }
-
-  }, [notebookNotes]);
-
-
-
-  useEffect(() => {
-
-    state.notebooks.forEach((nb) => { if (nb.isExpanded === 1) loadNotesForNotebook(nb.id); });
-
-  }, [state.notebooks, loadNotesForNotebook]);
-
-
-
-  // Listen for nowen:open-note to open note in editor
-
-  useEffect(() => {
-
-    const handler = (e: Event) => {
-
-      const detail = (e as CustomEvent).detail;
-
-      if (detail?.note) {
-
-        actions.setActiveNote(detail.note);
-
-        actions.setMobileView("editor");
-
-      }
-
-    };
-
-    window.addEventListener("nowen:open-note", handler);
-
-    return () => window.removeEventListener("nowen:open-note", handler);
-
-  }, [actions]);
-
-
-
   // 笔记本右键菜单项。
   //
   // "导出为 Markdown" 的可见性：
@@ -1049,6 +899,51 @@ export default function Sidebar({ variant = "mobile" }: { variant?: "desktop" | 
 
   // 右键菜单（桌面）/ 长按菜单（移动端共用同一份 state）
   const { menu, menuRef, openMenu, openMenuAt, closeMenu } = useContextMenu();
+  const [notesByNotebookId, setNotesByNotebookId] = useState<Map<string, NoteListItem[]>>(new Map());
+  const [loadingNotebookIds, setLoadingNotebookIds] = useState<Set<string>>(new Set());
+  const notesByNotebookIdRef = useRef(notesByNotebookId);
+  const loadingNotebookIdsRef = useRef(loadingNotebookIds);
+
+  const getCachedNote = useCallback((noteId: string | null): NoteListItem | null => {
+    if (!noteId) return null;
+    for (const notes of notesByNotebookId.values()) {
+      const found = notes.find((note) => note.id === noteId);
+      if (found) return found;
+    }
+    return state.notes.find((note) => note.id === noteId) || null;
+  }, [notesByNotebookId, state.notes]);
+
+  const noteMenuItems: ContextMenuItem[] = useMemo(() => {
+    const note = getCachedNote(menu.targetId);
+    if (!note) return [];
+    return [
+      { id: "open", label: t("common.open", { defaultValue: "打开" }), icon: <FileText size={14} /> },
+      { id: "sep0", label: "", separator: true },
+      {
+        id: "toggle_pin",
+        label: note.isPinned === 1 ? t("noteList.unpin") || "取消置顶" : t("noteList.pin") || "置顶",
+        icon: note.isPinned === 1 ? <PinOff size={14} /> : <Pin size={14} />,
+      },
+      {
+        id: "toggle_fav",
+        label: note.isFavorite === 1 ? t("noteList.unfavorite") || "取消收藏" : t("noteList.favorite") || "收藏",
+        icon: note.isFavorite === 1 ? <StarOff size={14} /> : <Star size={14} />,
+      },
+      {
+        id: "toggle_lock",
+        label: note.isLocked === 1 ? t("noteList.unlock") || "解锁" : t("noteList.lock") || "锁定",
+        icon: note.isLocked === 1 ? <Unlock size={14} /> : <Lock size={14} />,
+      },
+      { id: "sep1", label: "", separator: true },
+      {
+        id: "trash",
+        label: t("noteList.moveToTrash") || "移到回收站",
+        icon: <Trash2 size={14} />,
+        danger: true,
+        disabled: note.isLocked === 1,
+      },
+    ];
+  }, [getCachedNote, menu.targetId, t]);
 
   // 重命名状态
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -1074,6 +969,8 @@ export default function Sidebar({ variant = "mobile" }: { variant?: "desktop" | 
   const [dragNbId, setDragNbId] = useState<string | null>(null);
   const [dragOverNbId, setDragOverNbId] = useState<string | null>(null);
   const [dragOverNbZone, setDragOverNbZone] = useState<"before" | "inside" | null>(null);
+  const [dragNoteId, setDragNoteId] = useState<string | null>(null);
+  const [dragOverNoteNotebookId, setDragOverNoteNotebookId] = useState<string | null>(null);
 
   // 标签颜色选择浮层状态（通过右键 / 长按触发）
   const [tagColorPopover, setTagColorPopover] = useState<{
@@ -1088,6 +985,69 @@ export default function Sidebar({ variant = "mobile" }: { variant?: "desktop" | 
   const tagLongPressFired = useRef(false);
 
   const tree = useMemo(() => buildTree(state.notebooks), [state.notebooks]);
+
+  useEffect(() => {
+    notesByNotebookIdRef.current = notesByNotebookId;
+  }, [notesByNotebookId]);
+
+  useEffect(() => {
+    loadingNotebookIdsRef.current = loadingNotebookIds;
+  }, [loadingNotebookIds]);
+
+  const loadNotesForNotebook = useCallback(async (notebookId: string, force = false) => {
+    if (!showNotesInNotebookTree) return;
+    if (!force && notesByNotebookIdRef.current.has(notebookId)) return;
+    if (loadingNotebookIdsRef.current.has(notebookId)) return;
+
+    setLoadingNotebookIds((prev) => new Set(prev).add(notebookId));
+    try {
+      const notes = await api.getNotes({ notebookId }) as NoteListItem[];
+      setNotesByNotebookId((prev) => new Map(prev).set(notebookId, notes));
+    } catch (err) {
+      console.error("Failed to load notebook notes:", err);
+      toast.error(t("noteList.loadFailed") || "加载笔记失败");
+    } finally {
+      setLoadingNotebookIds((prev) => {
+        const next = new Set(prev);
+        next.delete(notebookId);
+        return next;
+      });
+    }
+  }, [showNotesInNotebookTree, t]);
+
+  useEffect(() => {
+    if (showNotesInNotebookTree) return;
+    setNotesByNotebookId(new Map());
+    setLoadingNotebookIds(new Set());
+  }, [showNotesInNotebookTree]);
+
+  useEffect(() => {
+    if (!showNotesInNotebookTree) return;
+    state.notebooks.forEach((notebook) => {
+      if (notebook.isExpanded === 1) void loadNotesForNotebook(notebook.id);
+    });
+  }, [loadNotesForNotebook, showNotesInNotebookTree, state.notebooks]);
+
+  useEffect(() => {
+    if (!showNotesInNotebookTree) return;
+    state.notebooks.forEach((notebook) => {
+      if (notebook.isExpanded === 1 && notesByNotebookIdRef.current.has(notebook.id)) {
+        void loadNotesForNotebook(notebook.id, true);
+      }
+    });
+  }, [loadNotesForNotebook, showNotesInNotebookTree, state.notesRefreshToken]);
+
+  useEffect(() => {
+    if (!showNotesInNotebookTree || !state.activeNote) return;
+    const active = state.activeNote;
+    setNotesByNotebookId((prev) => {
+      const notes = prev.get(active.notebookId);
+      if (!notes) return prev;
+      const next = new Map(prev);
+      next.set(active.notebookId, notes.map((note) => note.id === active.id ? { ...note, ...noteToListItem(active) } : note));
+      return next;
+    });
+  }, [showNotesInNotebookTree, state.activeNote]);
 
   useEffect(() => {
     const loadScopedData = () => {
@@ -1113,6 +1073,8 @@ export default function Sidebar({ variant = "mobile" }: { variant?: "desktop" | 
       // 清空选中状态避免跨空间残留
       actions.setSelectedNotebook(null);
       actions.setViewMode("all");
+      setNotesByNotebookId(new Map());
+      setLoadingNotebookIds(new Set());
       loadScopedData();
       loadFeatures();
       // 触发 NoteList 重新拉取
@@ -1155,6 +1117,8 @@ export default function Sidebar({ variant = "mobile" }: { variant?: "desktop" | 
   // 笔记本拖拽：按鼠标垂直位置区分"before"（同级排到之前）与"inside"（设为子项）
   const handleNbDragStart = useCallback((e: React.DragEvent, id: string) => {
     setDragNbId(id);
+    setDragNoteId(null);
+    setDragOverNoteNotebookId(null);
     e.dataTransfer.effectAllowed = "move";
     e.dataTransfer.setData("text/plain", id);
   }, []);
@@ -1162,6 +1126,11 @@ export default function Sidebar({ variant = "mobile" }: { variant?: "desktop" | 
   const handleNbDragOver = useCallback((e: React.DragEvent, id: string) => {
     e.preventDefault();
     e.dataTransfer.dropEffect = "move";
+    if (!dragNbId) {
+      setDragOverNbId(null);
+      setDragOverNbZone(null);
+      return;
+    }
     if (id === dragNbId) {
       setDragOverNbId(null);
       setDragOverNbZone(null);
@@ -1267,21 +1236,256 @@ export default function Sidebar({ variant = "mobile" }: { variant?: "desktop" | 
     }
   }, [dragNbId, dragOverNbZone, isDescendant, state.notebooks, actions]);
 
+  const handleSidebarNoteDragStart = useCallback((e: React.DragEvent, noteId: string) => {
+    e.stopPropagation();
+    setDragNoteId(noteId);
+    setDragOverNoteNotebookId(null);
+    setDragNbId(null);
+    setDragOverNbId(null);
+    setDragOverNbZone(null);
+    e.dataTransfer.effectAllowed = "move";
+    e.dataTransfer.setData("application/x-nowen-note", noteId);
+    e.dataTransfer.setData("text/plain", noteId);
+  }, []);
+
+  const handleSidebarNoteDragOver = useCallback((e: React.DragEvent, notebookId: string) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const noteId = e.dataTransfer.getData("application/x-nowen-note") || dragNoteId;
+    const note = getCachedNote(noteId);
+    if (!note || note.notebookId === notebookId || note.isLocked === 1) {
+      e.dataTransfer.dropEffect = "none";
+      setDragOverNoteNotebookId(null);
+      return;
+    }
+    e.dataTransfer.dropEffect = "move";
+    setDragOverNoteNotebookId(notebookId);
+  }, [dragNoteId, getCachedNote]);
+
+  const handleSidebarNoteDragEnd = useCallback(() => {
+    setDragNoteId(null);
+    setDragOverNoteNotebookId(null);
+  }, []);
+
+  const handleSidebarNoteDrop = useCallback(async (e: React.DragEvent, targetNotebookId: string) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const noteId = e.dataTransfer.getData("application/x-nowen-note") || dragNoteId;
+    setDragNoteId(null);
+    setDragOverNoteNotebookId(null);
+    if (!noteId) return;
+
+    const note = getCachedNote(noteId);
+    if (!note || note.notebookId === targetNotebookId) return;
+    if (note.isLocked === 1) {
+      toast.warning(t("common.noteLockedCannotEdit") || t("editor.lockedBanner") || "笔记已锁定");
+      return;
+    }
+
+    const fromNotebookId = note.notebookId;
+    const movedNote = { ...note, notebookId: targetNotebookId };
+    setNotesByNotebookId((prev) => {
+      const next = new Map(prev);
+      const sourceNotes = next.get(fromNotebookId);
+      if (sourceNotes) {
+        next.set(fromNotebookId, sourceNotes.filter((item) => item.id !== noteId));
+      }
+      const targetNotes = next.get(targetNotebookId);
+      if (targetNotes) {
+        next.set(targetNotebookId, [movedNote, ...targetNotes.filter((item) => item.id !== noteId)]);
+      }
+      return next;
+    });
+    actions.updateNoteInList({ id: noteId, notebookId: targetNotebookId });
+    if (state.activeNote?.id === noteId) {
+      actions.setActiveNote({ ...state.activeNote, notebookId: targetNotebookId });
+      actions.setSelectedNotebook(targetNotebookId);
+    }
+
+    try {
+      await api.updateNote(noteId, { notebookId: targetNotebookId } as any);
+      actions.refreshNotebooks();
+      actions.refreshNotes();
+      void loadNotesForNotebook(targetNotebookId, true);
+    } catch (err: any) {
+      console.error("Failed to move note:", err);
+      toast.error(err?.message || t("common.operationFailed") || "移动笔记失败");
+      actions.refreshNotes();
+      actions.refreshNotebooks();
+      void loadNotesForNotebook(fromNotebookId, true);
+      void loadNotesForNotebook(targetNotebookId, true);
+    }
+  }, [
+    actions,
+    dragNoteId,
+    getCachedNote,
+    loadNotesForNotebook,
+    state.activeNote,
+    t,
+  ]);
+
   const handleNotebookSelect = (id: string) => {
     actions.setSelectedNotebook(id);
     actions.setViewMode("notebook");
+    if (showNotesInNotebookTree) {
+      const nb = state.notebooks.find((n) => n.id === id);
+      if (nb && nb.isExpanded !== 1) {
+        api.updateNotebook(id, { isExpanded: 1 } as any).catch(console.error);
+        actions.setNotebooks(
+          state.notebooks.map((n) => n.id === id ? { ...n, isExpanded: 1 } : n)
+        );
+      }
+      void loadNotesForNotebook(id);
+    }
     actions.setMobileSidebar(false);
   };
 
   const handleToggle = (id: string) => {
     const nb = state.notebooks.find((n) => n.id === id);
     if (nb) {
-      api.updateNotebook(id, { isExpanded: nb.isExpanded === 1 ? 0 : 1 } as any).catch(console.error);
+      const nextExpanded = nb.isExpanded === 1 ? 0 : 1;
+      api.updateNotebook(id, { isExpanded: nextExpanded } as any).catch(console.error);
       actions.setNotebooks(
-        state.notebooks.map((n) => n.id === id ? { ...n, isExpanded: n.isExpanded === 1 ? 0 : 1 } : n)
+        state.notebooks.map((n) => n.id === id ? { ...n, isExpanded: nextExpanded } : n)
       );
+      if (nextExpanded === 1) void loadNotesForNotebook(id);
     }
   };
+
+  const handleSelectSidebarNote = useCallback(async (noteId: string) => {
+    try {
+      const note = await api.getNote(noteId);
+      actions.setActiveNote(note);
+      actions.setSelectedNotebook(note.notebookId);
+      actions.setSelectedTag(null);
+      actions.setViewMode("notebook");
+      actions.setMobileView("editor");
+      actions.setMobileSidebar(false);
+    } catch (err: any) {
+      console.error("Failed to open note:", err);
+      toast.error(err?.message || t("noteList.loadFailed") || "打开笔记失败");
+    }
+  }, [actions, t]);
+
+  const updateCachedNote = useCallback((noteId: string, patch: Partial<NoteListItem>) => {
+    setNotesByNotebookId((prev) => {
+      let changed = false;
+      const next = new Map(prev);
+      for (const [notebookId, notes] of prev.entries()) {
+        if (!notes.some((note) => note.id === noteId)) continue;
+        next.set(notebookId, notes.map((note) => note.id === noteId ? { ...note, ...patch } : note));
+        changed = true;
+      }
+      return changed ? next : prev;
+    });
+    actions.updateNoteInList({ id: noteId, ...patch });
+  }, [actions]);
+
+  const removeCachedNote = useCallback((noteId: string) => {
+    setNotesByNotebookId((prev) => {
+      let changed = false;
+      const next = new Map(prev);
+      for (const [notebookId, notes] of prev.entries()) {
+        if (!notes.some((note) => note.id === noteId)) continue;
+        next.set(notebookId, notes.filter((note) => note.id !== noteId));
+        changed = true;
+      }
+      return changed ? next : prev;
+    });
+    actions.removeNoteFromList(noteId);
+  }, [actions]);
+
+  const handleSidebarNoteMenuAction = useCallback(async (actionId: string) => {
+    const targetId = menu.targetId;
+    const targetNote = getCachedNote(targetId);
+    closeMenu();
+    if (!targetId || !targetNote) return;
+
+    try {
+      switch (actionId) {
+        case "open": {
+          await handleSelectSidebarNote(targetId);
+          break;
+        }
+        case "toggle_pin": {
+          const next = targetNote.isPinned === 1 ? 0 : 1;
+          await api.updateNote(targetId, { isPinned: next } as any);
+          updateCachedNote(targetId, { isPinned: next });
+          if (state.activeNote?.id === targetId) {
+            actions.setActiveNote({ ...state.activeNote, isPinned: next });
+          }
+          break;
+        }
+        case "toggle_fav": {
+          const next = targetNote.isFavorite === 1 ? 0 : 1;
+          await api.updateNote(targetId, { isFavorite: next } as any);
+          updateCachedNote(targetId, { isFavorite: next });
+          if (state.activeNote?.id === targetId) {
+            actions.setActiveNote({ ...state.activeNote, isFavorite: next });
+          }
+          break;
+        }
+        case "toggle_lock": {
+          const next = targetNote.isLocked === 1 ? 0 : 1;
+          await api.updateNote(targetId, { isLocked: next } as any);
+          updateCachedNote(targetId, { isLocked: next });
+          if (state.activeNote?.id === targetId) {
+            actions.setActiveNote({ ...state.activeNote, isLocked: next });
+          }
+          break;
+        }
+        case "trash": {
+          if (targetNote.isLocked === 1) {
+            toast.warning(t("common.noteLockedCannotEdit") || t("editor.lockedBanner") || "笔记已锁定");
+            break;
+          }
+          if (state.activeNote?.id === targetId) actions.setActiveNote(null);
+          removeCachedNote(targetId);
+          await api.updateNote(targetId, { isTrashed: 1 } as any);
+          actions.refreshNotebooks();
+          actions.refreshNotes();
+          break;
+        }
+      }
+    } catch (err: any) {
+      console.error("Sidebar note menu action failed:", err);
+      toast.error(err?.message || t("common.operationFailed") || "操作失败");
+      actions.refreshNotes();
+      actions.refreshNotebooks();
+    }
+  }, [
+    actions,
+    closeMenu,
+    getCachedNote,
+    handleSelectSidebarNote,
+    menu.targetId,
+    removeCachedNote,
+    state.activeNote,
+    t,
+    updateCachedNote,
+  ]);
+
+  const handleCreateSidebarNote = useCallback(async (notebookId: string) => {
+    try {
+      const note = await api.createNote({ notebookId, title: t("common.untitledNote") });
+      actions.setActiveNote(note);
+      actions.setSelectedNotebook(notebookId);
+      actions.setSelectedTag(null);
+      actions.setViewMode("notebook");
+      actions.setMobileView("editor");
+      setNotesByNotebookId((prev) => {
+        const next = new Map(prev);
+        const existing = next.get(notebookId) || [];
+        next.set(notebookId, [noteToListItem(note), ...existing]);
+        return next;
+      });
+      actions.refreshNotebooks();
+      actions.refreshNotes();
+    } catch (err: any) {
+      console.error("Failed to create note:", err);
+      toast.error(err?.message || t("noteList.createFailed") || "新建笔记失败");
+    }
+  }, [actions, t]);
 
   const handleCreateNotebook = async () => {
     const nb = await api.createNotebook({ name: t('common.newNotebook'), icon: "📒" });
@@ -1839,13 +2043,18 @@ export default function Sidebar({ variant = "mobile" }: { variant?: "desktop" | 
               onDrop={handleNbDrop}
               dragOverId={dragOverNbId}
               dragOverZone={dragOverNbZone}
-              notes={notebookNotes.get(nb.id)}
-              activeNoteId={state.activeNote?.id}
-              onCreateNote={handleCreateNote}
-              onDeleteNote={(noteId) => handleDeleteNote(noteId, nb.id)}
-              onRenameNote={(noteId, newTitle) => handleRenameNote(noteId, nb.id, newTitle)}
-              onToggleFavorite={(noteId) => handleToggleFavorite(noteId, nb.id)}
-              onTogglePin={(noteId) => handleTogglePin(noteId, nb.id)}
+              noteDragOverId={dragOverNoteNotebookId}
+              showNotes={showNotesInNotebookTree}
+              notesByNotebookId={notesByNotebookId}
+              loadingNotebookIds={loadingNotebookIds}
+              activeNoteId={state.activeNote?.id ?? null}
+              onSelectNote={handleSelectSidebarNote}
+              onNoteContextMenu={(e, id) => openMenu(e, id, "note")}
+              onNoteDragStart={handleSidebarNoteDragStart}
+              onNoteDragOver={handleSidebarNoteDragOver}
+              onNoteDragEnd={handleSidebarNoteDragEnd}
+              onNoteDrop={handleSidebarNoteDrop}
+              onCreateNote={handleCreateSidebarNote}
             />
           ))}
         </div>
@@ -2015,6 +2224,17 @@ export default function Sidebar({ variant = "mobile" }: { variant?: "desktop" | 
         items={notebookMenuItems}
         onAction={handleMenuAction}
         header={state.notebooks.find((nb) => nb.id === menu.targetId)?.name}
+      />
+
+      {/* Inline note Context Menu */}
+      <ContextMenu
+        isOpen={menu.isOpen && menu.targetType === "note"}
+        x={menu.x}
+        y={menu.y}
+        menuRef={menuRef}
+        items={noteMenuItems}
+        onAction={handleSidebarNoteMenuAction}
+        header={getCachedNote(menu.targetId)?.title || t("noteList.untitled") || "无标题笔记"}
       />
 
       {/* 右键菜单触发的图标选择器 */}

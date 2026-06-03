@@ -43,6 +43,8 @@ export interface UserPreferences {
   /** 进入任意笔记时是否默认进入"视图层只读"。默认 false。
    *  注意：这不会修改笔记自身的 isLocked 字段，只影响本会话该笔记的编辑权限。 */
   lockOnOpen: boolean;
+  /** 笔记本目录是否在展开节点下显示直属笔记。默认 false。 */
+  showNotesInNotebookTree: boolean;
   /** 阅读密度（cozy/compact）。默认 cozy，即与历史一致的宽松排版。 */
   readingDensity: ReadingDensity;
 }
@@ -51,6 +53,7 @@ const DEFAULT_PREFS: UserPreferences = {
   noteTitleAsAppTitle: false,
   outlineDefaultOpen: false,
   lockOnOpen: false,
+  showNotesInNotebookTree: false,
   readingDensity: "cozy",
 };
 
@@ -70,6 +73,9 @@ function readFromStorage(): UserPreferences {
       lockOnOpen: typeof parsed.lockOnOpen === "boolean"
         ? parsed.lockOnOpen
         : DEFAULT_PREFS.lockOnOpen,
+      showNotesInNotebookTree: typeof parsed.showNotesInNotebookTree === "boolean"
+        ? parsed.showNotesInNotebookTree
+        : DEFAULT_PREFS.showNotesInNotebookTree,
       readingDensity: parsed.readingDensity === "compact" || parsed.readingDensity === "cozy"
         ? parsed.readingDensity
         : DEFAULT_PREFS.readingDensity,

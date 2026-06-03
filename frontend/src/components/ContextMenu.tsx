@@ -28,10 +28,15 @@ export default function ContextMenu({
 
   // 同步内部 ref 到外部 menuRef
   useEffect(() => {
-    if (menuRef && "current" in menuRef) {
-      (menuRef as React.MutableRefObject<HTMLDivElement | null>).current = internalRef.current;
-    }
-  });
+    if (!isOpen || !menuRef || !("current" in menuRef)) return;
+    const externalRef = menuRef as React.MutableRefObject<HTMLDivElement | null>;
+    externalRef.current = internalRef.current;
+    return () => {
+      if (externalRef.current === internalRef.current) {
+        externalRef.current = null;
+      }
+    };
+  }, [isOpen, menuRef]);
 
   // 位置边界修正：防止菜单超出屏幕
   useEffect(() => {
@@ -94,7 +99,8 @@ export default function ContextMenu({
           <button
             key={item.id}
             disabled={item.disabled}
-            onClick={(e) => {
+            onMouseDown={(e) => {
+              e.preventDefault();
               e.stopPropagation();
               if (!item.disabled) onAction(item.id);
             }}

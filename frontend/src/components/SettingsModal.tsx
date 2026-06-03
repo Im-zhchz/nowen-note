@@ -759,6 +759,11 @@ function SwitchesPanel() {
       label: t('settings.prefLockOnOpen'),
       hint: t('settings.prefLockOnOpenHint'),
     },
+    {
+      key: "showNotesInNotebookTree" as const,
+      label: t('settings.prefShowNotesInNotebookTree'),
+      hint: t('settings.prefShowNotesInNotebookTreeHint'),
+    },
   ];
 
   return (
