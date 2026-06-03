@@ -593,15 +593,15 @@ function NotebookItem({
                 onDragEnd={onDragEnd}
                 onDrop={onDrop}
                 dragOverId={dragOverId}
-                dragOverZone={dragOverZone}
-              />
                 notes={notes}
+                dragOverZone={dragOverZone}
                 activeNoteId={activeNoteId}
                 onCreateNote={onCreateNote}
                 onDeleteNote={onDeleteNote}
                 onRenameNote={onRenameNote}
                 onToggleFavorite={onToggleFavorite}
                 onTogglePin={onTogglePin}
+              />
             ))}
             {/* 该笔记本直属的笔记列表 */}
             {notes && notes.length > 0 && (
