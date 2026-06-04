@@ -1,6 +1,11 @@
 {
-  "generatedAt": "2026-06-03T09:36:34.577Z",
+  "generatedAt": "2026-06-04T01:52:19.400Z",
   "entries": [
+    {
+      "version": "1.1.15",
+      "date": "2026-06-04",
+      "body": "### 📌 杂项\n\n- 优化同步引擎和网络状态检测 (a2e6fbd)\n- 修复macOS Electron侧边栏拖拽区域CSS (07545f2)"
+    },
     {
       "version": "1.1.14",
       "date": "2026-06-03",
@@ -45,11 +50,6 @@
       "version": "1.1.6",
       "date": "2026-05-26",
       "body": "### ✨ 新增\n\n- **release**: 将绿联 .upk 从一键全量(选项5)中移除，独立到选项10 (78bbdf6)\n- **notes**: 支持客户端生成的 UUID 作为笔记 ID（离线创建） (c8d8961)\n- **login**: 登录页支持桌面端跳过登录直接用本地 (21c9183)\n- **migration**: 本地→云端账号一键迁移（D-2/D-3 + 回滚） (f61a6a9)\n- **local-mode**: 本地模式离线读 + 同步引擎 + localStore (660489a)\n- **desktop**: Electron 桌面端框架 + 内嵌后端启动 (762e6b0)\n- **attachment-preview**: 视频/音频按扩展名兜底 + 抽屉打开时隐藏链接气泡 (33d6c61)\n- **editor-mobile**: 移动端顶栏改 iOS 风双行结构 + 桌面面包屑末段截断修复 (235db1f)\n- **frontend**: add video embed extension and rich-text video URL support (b8e3493)\n- **editor**: auto-convert '- [ ] ' / '- [x] ' to task list (5c9a916)\n- **login**: add demo mode banner with one-click credential fill (0a0c271)\n- **auth**: 新增体验账号(isDemo) 机制 (8e0ab8a)\n- **url-import**: 公众号文章一键导入笔记 (d6c7c17)\n\n### 🐛 修复\n\n- **release**: multi 模式 upk 打包前 buildx --load 各架构镜像 (7cceed0)\n- **editor**: TiptapEditor 桌面端样式/行为微调 (7b72d7d)\n- **mac-build**: 单架构构建 + .node 魔数 arch 校验，修复 Intel Mac ERR_DLOPEN_FAILED (54a9c90)\n- **release**: defer UPK_IMAGE_REF assembly until VERSION is finalized (80390c9)\n- **upk**: 改进多架构镜像查找逻辑，支持 DOCKERHUB_REPO 环境变量 (cc57a7f)\n- **VideoExtension**: 修正 NodeView props 类型为 ReactNodeViewProps，修复 tsc 报错 (1083377)\n- 绿联nas 构建包 (eb15be2)\n- **clipper**: split footer build for markdown branch to preserve source link (45402e8)\n- **update-notifier**: move useCallback before early return to fix hook order (63f2624)\n\n### 📝 文档\n\n- **readme**: 补 macOS 首次打开 ERR_DLOPEN_FAILED 的 xattr 解隔离指引 (bf108cd)\n- **readme**: sync features and changelog with Unreleased (e301e93)\n\n### 📦 构建\n\n- **upk**: 新增绿联 NAS 应用包(.upk) 打包流程 (967d00d)\n\n### 🔧 其他\n\n- **clipper**: release v0.1.3 (5d70c08)"
-    },
-    {
-      "version": "1.1.5",
-      "date": "2026-05-21",
-      "body": "### ✨ 新增\n\n- **attachments**: 附件预览抽屉 + 本笔记附件目录面板 (df2e06f)\n- **editor**: 搜索替换面板 / docx 自研解析与导入 / 字号弹层优化等 (3a37905)\n- **about**: 新增'作者感言'板块及阅读弹窗 (82e872d)\n\n### 📝 文档\n\n- **readme**: add Author's Note link in header (6e5d863)"
     }
   ]
 }

@@ -134,6 +134,13 @@ If this project helps you, feel free to scan the QR code and buy the author a co
 
 > 最近 5 个版本的更新内容，完整历史见 [CHANGELOG.md](./CHANGELOG.md)。
 
+### v1.1.15 - 2026-06-04
+
+### 📌 杂项
+
+- 优化同步引擎和网络状态检测 (a2e6fbd)
+- 修复macOS Electron侧边栏拖拽区域CSS (07545f2)
+
 ### v1.1.14 - 2026-06-03
 
 ### ✨ 新增
@@ -189,24 +196,5 @@ If this project helps you, feel free to scan the QR code and buy the author a co
 ### ✨ 新增
 
 - **editor**: 表格交互优化 - 网格选择器与行高丝滑拖拽 (f92168e)
-
-### v1.1.10 - 2026-05-29
-
-### ✨ 新增
-
-- **prefs**: 新增阅读密度偏好（宽松/紧凑） (3d94607)
-- **mobile**: 搜索按钮上提到笔记标题栏 (e0f047c)
-- **editor**: 表格新增行高可拖拽功能 (c5c2461)
-- 新增客户端下载面板 + Gitee Release 镜像同步 (93a6117)
-
-### 🐛 修复
-
-- **download**: 修复 DownloadPanel icon 类型 TS2322 编译错误 (ced169b)
-- **editor**: 收紧图片上下间距 (29ccead)
-- **upk**: use host network for ugreen package (68065b9)
-
-### 🔧 其他
-
-- **upk**: update zh-CN display name (bcd55ee)
 
 <!-- CHANGELOG:END -->
