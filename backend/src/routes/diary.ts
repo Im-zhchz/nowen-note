@@ -778,7 +778,7 @@ export async function handleDownloadDiaryImage(c: Context): Promise<Response> {
   if (!buffer) {
     return c.json({ error: "image file missing" }, 404);
   }
-  return new Response(buffer, {
+  return new Response(new Uint8Array(buffer), {
     headers: {
       "Content-Type": row.mimeType || "application/octet-stream",
       "Cache-Control": "public, max-age=31536000, immutable",
@@ -787,7 +787,7 @@ export async function handleDownloadDiaryImage(c: Context): Promise<Response> {
 }
 
 // ===========================================================================
-// 孤儿清理：进程启动时跑一次 + 每 6 小时跑一次
+// 孤儿清理// 孤儿清理：进程启动时跑一次 + 每 6 小时跑一次
 //   清理超过 ORPHAN_TTL_MS 仍未绑定 diaryId 的悬空附件（DB 行 + 磁盘文件）。
 //   这里用 setInterval 而不是 cron，单进程部署够用；多进程部署只会有一个把活干掉，
 //   重复执行也是幂等的（已删的找不到行就跳过），无副作用。

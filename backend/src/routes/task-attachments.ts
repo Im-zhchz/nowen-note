@@ -72,7 +72,7 @@ export async function handleDownloadTaskAttachment(c: Context): Promise<Response
   if (!buffer) {
     return c.json({ error: "attachment file missing" }, 404);
   }
-  return new Response(buffer, {
+  return new Response(new Uint8Array(buffer), {
     headers: {
       "Content-Type": row.mimeType || "application/octet-stream",
       "Cache-Control": "public, max-age=31536000, immutable",
