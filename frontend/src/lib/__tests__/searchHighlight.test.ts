@@ -1,16 +1,32 @@
 import { describe, expect, it } from "vitest";
-import { highlightText, splitSearchTerms, stripSearchMarks } from "@/lib/searchHighlight";
+import {
+  highlightText,
+  sanitizeSearchHtml,
+  splitSearchTerms,
+  stripSearchMarks,
+} from "@/lib/searchHighlight";
+
+const client = "\u5ba2\u6237\u7aef";
+const install = "\u5b89\u88c5";
 
 describe("searchHighlight", () => {
-  it("splits Chinese text into searchable character terms", () => {
-    expect(splitSearchTerms("客户端安装")).toEqual(["客", "户", "端", "安", "装"]);
+  it("keeps contiguous Chinese text as a phrase term", () => {
+    expect(splitSearchTerms(`${client}${install}`)).toEqual([`${client}${install}`]);
   });
 
-  it("highlights Chinese matches in plain text", () => {
-    expect(highlightText("windows客户端安装后", "客户端")).toContain('<mark class="search-result-highlight">客</mark>');
+  it("highlights Chinese phrase matches in plain text", () => {
+    expect(highlightText(`windows${client}${install}`, client)).toContain(
+      `<mark class="search-result-highlight">${client}</mark>`,
+    );
   });
 
-  it("strips backend snippet marks before frontend highlighting", () => {
-    expect(stripSearchMarks("windows<mark>客户端</mark>安装")).toBe("windows客户端安装");
+  it("strips backend snippet marks for plain text fallback", () => {
+    expect(stripSearchMarks(`windows<mark>${client}</mark>${install}`)).toBe(`windows${client}${install}`);
+  });
+
+  it("keeps only mark tags in backend search html", () => {
+    expect(sanitizeSearchHtml(`<img src=x onerror=alert(1)>a<mark class="x">${client}</mark>`)).toBe(
+      `a<mark>${client}</mark>`,
+    );
   });
 });

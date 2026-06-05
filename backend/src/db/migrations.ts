@@ -1224,6 +1224,19 @@ export const MIGRATIONS: Migration[] = [
       }
     },
   },
+
+  // --------------------------------------------------------------------------
+  // v16: rebuild notes FTS index once
+  // --------------------------------------------------------------------------
+  // 老库可能在 notes_fts/trigger 创建前已经有存量笔记，或历史触发器异常导致
+  // FTS 缺行。重建一次让全文搜索覆盖全部现有 notes。
+  {
+    version: 16,
+    name: "notes-fts-rebuild",
+    up: (db) => {
+      db.prepare("INSERT INTO notes_fts(notes_fts) VALUES('rebuild')").run();
+    },
+  },
 ];
 
 /** 当前代码已知的最高 schema 版本（== MIGRATIONS 里 max(version)）。 */

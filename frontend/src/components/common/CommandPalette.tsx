@@ -27,28 +27,13 @@ import { createPortal } from "react-dom";
 import { Search as SearchIcon, FileText, Loader2 } from "lucide-react";
 import { useAppActions } from "@/store/AppContext";
 import { api } from "@/lib/api";
+import { highlightTextNode, sanitizeSearchHtml } from "@/lib/searchHighlight";
 import type { SearchResult } from "@/types";
 
 export interface CommandPaletteProps {
   /** 由外部控制开合；App 层一个 useState 即可 */
   open: boolean;
   onClose: () => void;
-}
-
-/** 极简高亮：把命中词用 <mark> 包裹。只做首个不区分大小写的匹配，避免 XSS 做纯字符串分段。 */
-function highlight(text: string, query: string): React.ReactNode {
-  if (!query.trim()) return text;
-  const i = text.toLowerCase().indexOf(query.toLowerCase());
-  if (i < 0) return text;
-  return (
-    <>
-      {text.slice(0, i)}
-      <mark className="bg-amber-200/60 dark:bg-amber-400/30 text-inherit rounded px-0.5">
-        {text.slice(i, i + query.length)}
-      </mark>
-      {text.slice(i + query.length)}
-    </>
-  );
 }
 
 export default function CommandPalette({ open, onClose }: CommandPaletteProps) {
@@ -237,6 +222,7 @@ export default function CommandPalette({ open, onClose }: CommandPaletteProps) {
             )}
             {results.map((r, idx) => {
               const isActive = idx === activeIdx;
+              const snippetHtml = r.snippetHtml || r.snippet;
               return (
                 <button
                   key={r.id}
@@ -251,13 +237,18 @@ export default function CommandPalette({ open, onClose }: CommandPaletteProps) {
                 >
                   <FileText size={16} className="mt-0.5 text-tx-tertiary shrink-0" />
                   <div className="min-w-0 flex-1">
-                    <div className="text-sm text-tx-primary truncate">
-                      {highlight(r.title || "(无标题)", query)}
+                    <div className="text-sm text-tx-primary truncate search-result-html">
+                      {r.titleHtml ? (
+                        <span dangerouslySetInnerHTML={{ __html: sanitizeSearchHtml(r.titleHtml) }} />
+                      ) : (
+                        highlightTextNode(r.title || "(无标题)", query)
+                      )}
                     </div>
-                    {r.snippet && (
-                      <div className="text-xs text-tx-tertiary truncate mt-0.5">
-                        {highlight(r.snippet, query)}
-                      </div>
+                    {snippetHtml && (
+                      <div
+                        className="text-xs text-tx-tertiary truncate mt-0.5 search-result-html"
+                        dangerouslySetInnerHTML={{ __html: sanitizeSearchHtml(snippetHtml) }}
+                      />
                     )}
                   </div>
                 </button>

@@ -1025,7 +1025,12 @@ export const api = {
   },
 
   // Search
-  search: (q: string) => request<SearchResult[]>(`/search?q=${encodeURIComponent(q)}`),
+  search: (q: string) => {
+    const params = new URLSearchParams();
+    params.set("q", q);
+    params.set("workspaceId", getCurrentWorkspace());
+    return request<SearchResult[]>(`/search?${params.toString()}`);
+  },
 
   // Tasks
   // Y3: 自动注入当前工作区——personal 不带，workspace 带 ?workspaceId=<uuid>。

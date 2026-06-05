@@ -15,7 +15,7 @@ import { haptic } from "@/hooks/useCapacitor";
 import { toast } from "@/lib/toast";
 import { exportSingleNote, exportSingleNoteAsPDF, exportSingleNoteAsImage } from "@/lib/exportService";
 import { realtime } from "@/lib/realtime"
-import { highlightText, stripSearchMarks } from "@/lib/searchHighlight";
+import { highlightTextNode, sanitizeSearchHtml, stripSearchMarks } from "@/lib/searchHighlight";
 // "导入 Word 文档" 走 dynamic import（见 createNoteInNotebook），减少首屏 bundle 体积。
 
 /* ===== 排序模式 ===== */
@@ -1023,11 +1023,16 @@ const NoteCard = React.memo(function NoteCard({
   cardRef?: (el: HTMLDivElement | null) => void;
   searchQuery?: string;
 }) {
-  // 预览文本：取正文前 100 字，并把所有空白序列（含 \n、\r、\t、连续空格）
+  // 预览文本：普通列表取正文前 100 字；搜索结果使用后端 snippet，不能再截断。
   // 压成单个空格。否则 markdown 多段落正文里的换行会被 <p> 当作空白渲染，
   // 配合 line-clamp-2 + break-words 出现"每句被切到独立一行"的错觉
   // （短标题时不明显，因为预览整体行数少；长标题挤占空间后尤为严重）。
-  const preview = (note.contentText?.slice(0, 100) || "").replace(/\s+/g, " ").trim();
+  const isSearchResult = !!searchQuery;
+  const preview = (
+    isSearchResult
+      ? (note.snippetHtml || note.contentText || "")
+      : (note.contentText?.slice(0, 100) || "")
+  ).replace(/\s+/g, " ").trim();
   const { t } = useTranslation();
   const wordCount = note.contentText?.length || 0;
   // 工作区视图下笔记可能由不同成员创建，需要在卡片底部展示创建者；
@@ -1100,11 +1105,13 @@ const NoteCard = React.memo(function NoteCard({
             // 和 CJK/英文/空格混排都稳定，并自带省略号。
             // break-all：兜底——遇到极长不可断词（连续超长英文/无空格 URL）也强制裁断，
             // 不让一行的"内容宽度"超过容器，导致 flex 容器再被撑变形。
-            "text-sm font-medium line-clamp-1 break-all flex-1 min-w-0",
+            "note-card-title text-sm font-medium line-clamp-1 break-all flex-1 min-w-0",
             isActive ? "text-tx-primary" : "text-tx-secondary group-hover:text-tx-primary"
           )}>
-            {searchQuery ? (
-              <span dangerouslySetInnerHTML={{ __html: highlightText(note.title || t('common.untitledNote'), searchQuery) }} />
+            {searchQuery && note.titleHtml ? (
+              <span dangerouslySetInnerHTML={{ __html: sanitizeSearchHtml(note.titleHtml) }} />
+            ) : searchQuery ? (
+              <span>{highlightTextNode(note.title || t('common.untitledNote'), searchQuery)}</span>
             ) : (
               note.title || t('common.untitledNote')
             )}
@@ -1125,7 +1132,7 @@ const NoteCard = React.memo(function NoteCard({
             - overflow-wrap-anywhere 避免极长 URL 撑破容器。 */}
         {preview && (
           searchQuery ? (
-            <p className="note-card-preview text-xs text-tx-tertiary mt-1.5 line-clamp-2 leading-relaxed break-words [overflow-wrap:anywhere]" dangerouslySetInnerHTML={{ __html: highlightText(preview, searchQuery) }} />
+            <p className="note-card-preview text-xs text-tx-tertiary mt-1.5 line-clamp-2 leading-relaxed break-words [overflow-wrap:anywhere]" dangerouslySetInnerHTML={{ __html: sanitizeSearchHtml(preview) }} />
           ) : (
             <p className="text-xs text-tx-tertiary mt-1.5 line-clamp-2 leading-relaxed break-words [overflow-wrap:anywhere]">{preview}</p>
           )
@@ -1383,11 +1390,13 @@ export default function NoteList() {
       const results = await api.search(state.searchQuery);
       notes = results.map((r) => ({
         id: r.id,
-        userId: "",
+        userId: r.userId || "",
         notebookId: r.notebookId,
-        workspaceId: null,
+        workspaceId: r.workspaceId ?? null,
         title: r.title,
-        contentText: stripSearchMarks(r.snippet),
+        contentText: stripSearchMarks(r.snippetHtml || r.snippet),
+        titleHtml: r.titleHtml,
+        snippetHtml: r.snippetHtml || r.snippet,
         isPinned: r.isPinned,
         isFavorite: r.isFavorite,
         isArchived: 0,

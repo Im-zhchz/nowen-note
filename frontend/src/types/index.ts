@@ -176,6 +176,8 @@ export interface NoteListItem {
    * null/undefined 表示用户已被删除或后端老版本未带该字段。
    */
   creatorName?: string | null;
+  titleHtml?: string;
+  snippetHtml?: string;
 }
 
 export interface Tag {
@@ -195,6 +197,10 @@ export interface SearchResult {
   isFavorite: number;
   isPinned: number;
   snippet: string;
+  titleHtml?: string;
+  snippetHtml?: string;
+  userId?: string;
+  workspaceId?: string | null;
 }
 
 export type ViewMode = "notebook" | "favorites" | "trash" | "all" | "search" | "tasks" | "tag" | "mindmaps" | "ai-chat" | "diary" | "files";

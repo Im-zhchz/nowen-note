@@ -1118,6 +1118,8 @@ body.density-compact {
 .dark .search-result-highlight {
   background: rgba(250, 204, 21, 0.25);
 }
+.search-result-html mark,
+.note-card-title mark,
 .note-card-preview mark {
   background: rgba(250, 204, 21, 0.35);
   color: inherit;
