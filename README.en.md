@@ -134,6 +134,24 @@ If this project helps you, feel free to scan the QR code and buy the author a co
 
 > 最近 5 个版本的更新内容，完整历史见 [CHANGELOG.md](./CHANGELOG.md)。
 
+### v1.1.16 - 2026-06-05
+
+### ✨ 新增
+
+- 全面增强搜索功能和用户体验 (524cf8c)
+- 增强搜索体验和侧边栏布局管理 (14b61c2)
+- 增强附件对象存储功能和搜索高亮显示 (7ce7d53)
+
+### 🐛 修复
+
+- 修复 TypeScript 编译错误 - Buffer 类型兼容性 (ff2f4b5)
+- 全面优化版本恢复功能和编辑器状态管理 (85783d1)
+- 优化侧边栏布局计算和滚动性能 (5e49465)
+
+### 📌 杂项
+
+- 实现对象存储支持和同步中心功能 (d576ec1)
+
 ### v1.1.15 - 2026-06-04
 
 ### 📌 杂项
@@ -190,11 +208,5 @@ If this project helps you, feel free to scan the QR code and buy the author a co
 ### 📌 杂项
 
 - Update README.md (4b9a660)
-
-### v1.1.11 - 2026-05-29
-
-### ✨ 新增
-
-- **editor**: 表格交互优化 - 网格选择器与行高丝滑拖拽 (f92168e)
 
 <!-- CHANGELOG:END -->
