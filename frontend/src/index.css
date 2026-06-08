@@ -162,6 +162,15 @@ html[data-native="ios"] {
   --safe-area-top: max(env(safe-area-inset-top, 0px), 20px);
   --safe-area-bottom: max(env(safe-area-inset-bottom, 0px), 16px);
 }
+/* HarmonyOS ArkWeb WebView: safe-area padding
+ * ArkWeb基于Chromium，支持env(safe-area-inset-*)，
+ * 但鸿蒙状态栏高度因设备而异，用min兜底。
+ * --harmony-status-bar-height 由ArkTS通过CSS变量注入。
+ */
+html[data-native="harmony"] {
+  --safe-area-top: max(var(--harmony-status-bar-height, 0px), 32px);
+  --safe-area-bottom: max(var(--harmony-nav-bar-height, 0px), 16px);
+}
 
 body {
   background: var(--color-bg);

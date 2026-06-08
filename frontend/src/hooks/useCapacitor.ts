@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+﻿﻿import { useEffect, useRef } from "react";
 import { Capacitor } from "@capacitor/core";
 import { App as CapApp } from "@capacitor/app";
 import { SplashScreen } from "@capacitor/splash-screen";
@@ -9,6 +9,16 @@ import { Haptics, ImpactStyle, NotificationType } from "@capacitor/haptics";
 /** 判断是否运行在原生平台（Android / iOS） */
 export function isNativePlatform(): boolean {
   return Capacitor.isNativePlatform();
+}
+/** 检测是否在鸿蒙 ArkWeb WebView 环境中 */
+function isHarmonyWebView(): boolean {
+  if (typeof navigator === "undefined") return false;
+  return navigator.userAgent.includes("HarmonyOS") || !!(window as any).__HARMONY__;
+}
+
+/** 判断是否在鸿蒙 ArkWeb WebView 环境中 */
+export function isHarmonyOS(): boolean {
+  return isHarmonyWebView();
 }
 
 // ---------------------------------------------------------------------------
@@ -22,6 +32,10 @@ if (typeof document !== "undefined") {
     const platform = Capacitor.getPlatform(); // "android" | "ios" | "web"
     if (platform === "android" || platform === "ios") {
       document.documentElement.setAttribute("data-native", platform);
+    }
+    // HarmonyOS ArkWeb WebView
+    if (isHarmonyWebView()) {
+      document.documentElement.setAttribute("data-native", "harmony");
     }
   } catch {
     /* 非浏览器环境忽略 */
@@ -47,6 +61,8 @@ export function useBackButton({
   const lastBackPress = useRef(0);
 
   useEffect(() => {
+    // HarmonyOS: back button handled by ArkTS WebViewPage.onBackPress()
+    if (isHarmonyWebView()) return;
     if (!isNativePlatform()) return;
 
     const handler = CapApp.addListener("backButton", ({ canGoBack }) => {
@@ -95,6 +111,11 @@ export function hideSplashScreen() {
  */
 export function useStatusBarSync() {
   useEffect(() => {
+    // HarmonyOS: only set data-native, skip Capacitor plugins
+    if (isHarmonyWebView()) {
+      document.documentElement.setAttribute("data-native", "harmony");
+      return;
+    }
     if (!isNativePlatform()) return;
 
     // 标注当前原生平台：CSS 里根据 html[data-native="android"] 切换 --safe-area-top
@@ -208,6 +229,8 @@ export function useStatusBarSync() {
  */
 export function useKeyboardLayout() {
   useEffect(() => {
+    // HarmonyOS: keyboard handled by ArkTS layer
+    if (isHarmonyWebView()) return;
     if (!isNativePlatform()) return;
 
     // 键盘弹出策略（重要 —— 别再回退到旧版做法）
