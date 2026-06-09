@@ -432,6 +432,7 @@ function SidebarNoteItem({
   onContextMenu,
   onDragStart,
   onDragEnd,
+  constrainWidth = false,
 }: {
   note: NoteListItem;
   depth: number;
@@ -440,6 +441,7 @@ function SidebarNoteItem({
   onContextMenu: (e: React.MouseEvent, id: string) => void;
   onDragStart?: (e: React.DragEvent, id: string) => void;
   onDragEnd?: () => void;
+  constrainWidth?: boolean;
 }) {
   return (
     <button
@@ -450,12 +452,16 @@ function SidebarNoteItem({
       onDragStart={(e) => onDragStart?.(e, note.id)}
       onDragEnd={() => onDragEnd?.()}
       className={cn(
-        "relative flex items-center gap-2 pr-2 py-1 rounded-md text-left text-xs transition-colors w-max min-w-full cursor-grab active:cursor-grabbing",
+        "relative flex items-center gap-1 pr-2 py-1 rounded-md text-left text-xs transition-colors cursor-grab active:cursor-grabbing",
+        constrainWidth ? "w-full min-w-0" : "w-max min-w-full",
         active
           ? "bg-app-active text-tx-primary"
           : "text-tx-secondary hover:bg-app-hover hover:text-tx-primary"
       )}
-      style={{ paddingLeft: `${depth * SIDEBAR_TREE_INDENT + 42}px`, minWidth: `${sidebarTreeRowMinWidth(depth)}px` }}
+      style={{
+        paddingLeft: `${depth * SIDEBAR_TREE_INDENT + 42}px`,
+        minWidth: constrainWidth ? undefined : `${sidebarTreeRowMinWidth(depth)}px`,
+      }}
     >
       {depth > 0 && (
         <span
@@ -487,6 +493,7 @@ function NotebookItem({
   noteDragOverId,
   showNotes, notesByNotebookId, loadingNotebookIds, activeNoteId, onSelectNote, onNoteContextMenu,
   onNoteDragStart, onNoteDragOver, onNoteDragEnd, onNoteDrop, onCreateNote,
+  constrainWidth = false,
 }: {
   notebook: Notebook; depth: number; onSelect: (id: string) => void;
   selectedId: string | null; onToggle: (id: string) => void;
@@ -519,6 +526,7 @@ function NotebookItem({
   onNoteDragEnd?: () => void;
   onNoteDrop?: (e: React.DragEvent, notebookId: string) => void;
   onCreateNote?: (notebookId: string) => void;
+  constrainWidth?: boolean;
 }) {
   const { t } = useTranslation();
   const isSelected = selectedId === notebook.id;
@@ -581,7 +589,8 @@ function NotebookItem({
         initial={{ opacity: 0, x: -8 }}
         animate={{ opacity: 1, x: 0 }}
         className={cn(
-          "relative flex items-center gap-2 px-2 py-1.5 rounded-md cursor-pointer text-sm group transition-colors w-max min-w-full",
+          "relative flex items-center gap-1 px-2 py-1.5 rounded-md cursor-pointer text-sm group transition-colors",
+          constrainWidth ? "w-full min-w-0" : "w-max min-w-full",
           isSelected ? "bg-app-active text-tx-primary font-medium" : "text-tx-secondary hover:bg-app-hover hover:text-tx-primary",
           // inside 放置指示：显著的内边框 + 背景高亮，让用户清楚"将作为子项放入"
           showInsideIndicator && "outline outline-2 outline-accent-primary bg-accent-primary/15",
@@ -589,7 +598,7 @@ function NotebookItem({
         )}
         style={{
           paddingLeft: `${depth === 0 ? 8 : depth * SIDEBAR_TREE_INDENT + 20}px`,
-          minWidth: `${sidebarTreeRowMinWidth(depth)}px`,
+          minWidth: constrainWidth ? undefined : `${sidebarTreeRowMinWidth(depth)}px`,
         }}
         onClick={() => onSelect(notebook.id)}
         onContextMenu={(e) => onContextMenu(e, notebook.id)}
@@ -663,7 +672,7 @@ function NotebookItem({
             {isExpanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
           </button>
         ) : (
-          <span className="w-5" />
+          <span className="w-4" />
         )}
         <button
           ref={iconRef}
@@ -698,10 +707,12 @@ function NotebookItem({
           />
         ) : (
           <>
-            <span className="flex-1 min-w-0 truncate">{notebook.name}</span>
-            {notebook.noteCount !== undefined && notebook.noteCount > 0 && (
-              <span className="w-9 text-right text-[10px] text-tx-tertiary tabular-nums shrink-0">{notebook.noteCount}</span>
-            )}
+            <span className="flex-1 min-w-0 flex items-baseline gap-1">
+              <span className="min-w-0 truncate">{notebook.name}</span>
+              {notebook.noteCount !== undefined && notebook.noteCount > 0 && (
+                <span className="text-[10px] text-tx-tertiary tabular-nums shrink-0">{notebook.noteCount}</span>
+              )}
+            </span>
             {showNotes && onCreateNote && (
               <button
                 type="button"
@@ -766,6 +777,7 @@ function NotebookItem({
                 onNoteDragEnd={onNoteDragEnd}
                 onNoteDrop={onNoteDrop}
                 onCreateNote={onCreateNote}
+                constrainWidth={constrainWidth}
               />
             ))}
             {showNotes && notes?.map((note) => (
@@ -778,6 +790,7 @@ function NotebookItem({
                 onContextMenu={onNoteContextMenu || (() => {})}
                 onDragStart={onNoteDragStart}
                 onDragEnd={onNoteDragEnd}
+                constrainWidth={constrainWidth}
               />
             ))}
           </motion.div>
@@ -808,6 +821,7 @@ export default function Sidebar({ variant = "mobile" }: { variant?: "desktop" | 
   const actions = useAppActions();
   const { siteConfig } = useSiteSettings();
   const isDesktop = variant === "desktop";
+  const constrainNotebookTreeWidth = variant === "mobile";
   const { t } = useTranslation();
   const { prefs: userPrefs } = useUserPreferences();
   const showNotesInNotebookTree = userPrefs.showNotesInNotebookTree;
@@ -1346,7 +1360,6 @@ export default function Sidebar({ variant = "mobile" }: { variant?: "desktop" | 
       }
       void loadNotesForNotebook(id);
     }
-    actions.setMobileSidebar(false);
   };
 
   const handleToggle = (id: string) => {
@@ -1372,7 +1385,6 @@ export default function Sidebar({ variant = "mobile" }: { variant?: "desktop" | 
       actions.setSelectedTag(null);
       actions.setViewMode("notebook");
       actions.setMobileView("editor");
-      actions.setMobileSidebar(false);
     } catch (err: any) {
       console.error("Failed to open note:", err);
       toast.error(err?.message || t("noteList.loadFailed") || "打开笔记失败");
@@ -2014,8 +2026,20 @@ export default function Sidebar({ variant = "mobile" }: { variant?: "desktop" | 
             transition={{ duration: 0.2 }}
             className="flex-1 min-h-0 flex flex-col"
           >
-            <div className="flex-1 min-h-0 px-1 overflow-auto overscroll-contain">
-              <div className="space-y-0.5 pb-3 w-max min-w-full pr-2" style={{ minWidth: `${notebookTreeMinWidth}px` }}>
+            <div
+              className={cn(
+                "flex-1 min-h-0 px-1 overscroll-contain",
+                constrainNotebookTreeWidth ? "overflow-y-auto overflow-x-hidden" : "overflow-auto"
+              )}
+              data-swipe-blocker="notebook-tree-scroll"
+            >
+              <div
+                className={cn(
+                  "space-y-0.5 pb-3 pr-2",
+                  constrainNotebookTreeWidth ? "w-full min-w-0" : "w-max min-w-full"
+                )}
+                style={{ minWidth: constrainNotebookTreeWidth ? undefined : `${notebookTreeMinWidth}px` }}
+              >
                 {tree.map((nb) => (
                   <NotebookItem
                     key={nb.id}
@@ -2051,6 +2075,7 @@ export default function Sidebar({ variant = "mobile" }: { variant?: "desktop" | 
                     onNoteDragEnd={handleSidebarNoteDragEnd}
                     onNoteDrop={handleSidebarNoteDrop}
                     onCreateNote={handleCreateSidebarNote}
+                    constrainWidth={constrainNotebookTreeWidth}
                   />
                 ))}
               </div>
@@ -2111,7 +2136,6 @@ export default function Sidebar({ variant = "mobile" }: { variant?: "desktop" | 
                           actions.setSelectedTag(tag.id);
                           actions.setSelectedNotebook(null);
                           actions.setViewMode("tag");
-                          actions.setMobileSidebar(false);
                         }}
                         onContextMenu={(e) => {
                           e.preventDefault();
