@@ -154,6 +154,22 @@ QQ 群：`1093473044`
 
 > 最近 5 个版本的更新内容，完整历史见 [CHANGELOG.md](./CHANGELOG.md)。
 
+### v1.1.18 - 2026-06-09
+
+### ✨ 新增
+
+- 更新Android组件和Tiptap编辑器功能 (c489050)
+- 增强Tiptap编辑器功能并优化用户体验 (ce05f9e)
+- 添加鸿蒙ArkWeb原生应用项目 (f63e84f)
+- 添加鸿蒙ArkWeb WebView原生适配支持 (f6d4923)
+
+### 🐛 修复
+
+- 移动端Sidebar约束宽度防溢出，移除选择时自动关闭侧边栏的逻辑 (03bb588)
+- 移除NavRail点击导航项后自动关闭移动端侧边栏的逻辑 (a429f1a)
+- 移动端侧边栏遮罩区分点击/滑动，禁用手势关闭侧边栏，添加overflow-hidden防溢出 (948e447)
+- 优化Android WebView选择菜单处理，使用委托模式替代直接返回null (fa20e06)
+
 ### v1.1.17 - 2026-06-08
 
 ### ♻️ 重构
@@ -209,13 +225,5 @@ QQ 群：`1093473044`
 ### 📌 杂项
 
 - 优化用户体验和编辑器功能 (f671a3d)
-
-### v1.1.13 - 2026-06-02
-
-### 🐛 修复
-
-- restrict color-mix focus fallback to form elements only (f9e58ec)
-- Backspace at line start now correctly decreases indent (Office-like behavior) (aadc88a)
-- add CSS fallbacks for older Android WebViews (Xiaomi 8 black screen) (aa9a2fd)
 
 <!-- CHANGELOG:END -->
