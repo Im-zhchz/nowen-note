@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect, useCallback } from "react";
+﻿import React, { useState, useRef, useEffect, useCallback } from "react";
 import {
   Bot, Send, Trash2, X, Loader2, FileText, Sparkles, User,
   BookOpen, Database, MessageCircleQuestion, ArrowRight,
@@ -12,6 +12,7 @@ import remarkGfm from "remark-gfm";
 import { api } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { useApp } from "@/store/AppContext";
 
 // AI 知识库引用。v8 起区分 note / attachment：
 //   - note：点击跳转到笔记（onNavigateToNote）
@@ -84,6 +85,12 @@ export default function AIChatPanel({ onClose, onNavigateToNote }: {
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameDraft, setRenameDraft] = useState("");
+
+  // 知识库范围
+  const { state: appState } = useApp();
+  const [nbScope, setNbScope] = useState<"all" | "notebook">("all");
+  const [nbScopeId, setNbScopeId] = useState<string>("");
+  const [nbIncludeChildren, setNbIncludeChildren] = useState(true);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
@@ -335,7 +342,8 @@ export default function AIChatPanel({ onClose, onNavigateToNote }: {
               ? { ...m, references: refs }
               : m
           ));
-        }
+        },
+        nbScope === "notebook" ? { notebookId: nbScopeId, includeChildren: nbIncludeChildren } : undefined
       );
     } catch (err: any) {
       finalContent = err.message || t("ai.requestFailed");
@@ -1016,6 +1024,36 @@ export default function AIChatPanel({ onClose, onNavigateToNote }: {
         </div>
       </ScrollArea>
 
+
+      {/* 知识库范围选择器 */}
+      <div className="px-4 pt-2 pb-0 flex items-center gap-2 text-xs">
+        <span className="text-tx-tertiary shrink-0">{t("aiChat.knowledgeScope") || "知识库范围"}：</span>
+        <select
+          value={nbScope === "all" ? "all" : nbScopeId}
+          onChange={(e) => {
+            const v = e.target.value;
+            if (v === "all") { setNbScope("all"); setNbScopeId(""); }
+            else { setNbScope("notebook"); setNbScopeId(v); }
+          }}
+          className="flex-1 min-w-0 px-2 py-1 bg-app-bg border border-app-border rounded-lg text-tx-primary focus:ring-1 focus:ring-accent-primary/40 outline-none"
+        >
+          <option value="all">{t("aiChat.scopeAll") || "当前空间"}</option>
+          {appState.notebooks.map(nb => (
+            <option key={nb.id} value={nb.id}>{nb.name}</option>
+          ))}
+        </select>
+        {nbScope === "notebook" && (
+          <label className="flex items-center gap-1 shrink-0 cursor-pointer select-none">
+            <input
+              type="checkbox"
+              checked={nbIncludeChildren}
+              onChange={(e) => setNbIncludeChildren(e.target.checked)}
+              className="rounded accent-accent-primary"
+            />
+            <span className="text-tx-tertiary">{t("aiChat.includeChildren") || "含子笔记本"}</span>
+          </label>
+        )}
+      </div>
       {/* Input */}
       <div className="px-4 py-3 border-t border-app-border bg-app-surface/30">
         <div className="flex gap-2 items-end">
