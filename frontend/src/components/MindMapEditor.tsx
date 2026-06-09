@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import {
   BrainCircuit, Plus, Trash2, Edit2,
-  ZoomIn, ZoomOut, Maximize2, Minimize2,
+  ZoomIn, ZoomOut, Maximize2, Minimize2, Scan,
   Loader2, Check, Map, Menu, PanelLeftClose, Image, FileImage, FileDown, MoreHorizontal,
   User as UserIcon
 } from "lucide-react";
@@ -1267,7 +1267,7 @@ export default function MindMapCenter() {
                   className="p-1.5 rounded-md hover:bg-app-hover text-tx-secondary transition-colors"
                   title={t("mindMap.fitView")}
                 >
-                  <Maximize2 size={16} />
+                  <Scan size={16} />
                 </button>
                 <div className="w-px h-4 bg-app-border mx-0.5" />
                 <button
